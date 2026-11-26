@@ -645,22 +645,22 @@ only.
       probe test, the table layer accepts a 5,000-byte indexed value. The
       commit then fails with `500 internal: corrupt data: key too long`. The
       database stays readable. The server logs a false corruption message.
-- [ ] [untriaged · Tenant isolation] **Remove tombstones that slow scans of the
-      system database.** A deleted row stays in the LSM tree as a tombstone,
-      and each later scan of its range steps over it. No compaction trigger
-      looks at tombstone density. A tenant can repeat create and delete
-      requests to make its own metadata scans slower on the lease holder for
-      the system database. In a probe test, 80,000 created and deleted API keys
-      made `DeleteApiKeys` for that user take 7.4 ms instead of 0.02 ms. The
-      slowdown stayed after 30 minutes idle. `Txn::cost` counts only live
-      entries, so `metadata_command_cost_does_not_grow_with_stored_data` does
-      not see this cost. The reaper's scan of expired sessions has the same
-      cause across all tenants.
-- [ ] [untriaged · Tenant isolation] **Limit API keys and sessions for each
-      user.** `create_key` in `api/account.rs` and `MetaCmd::CreateApiKey`
-      check no count, and each sign-in adds a session. One tenant can grow the
-      shared system database without a limit, which breaks the SPEC §1 goal
-      "Each tenant has a limit for each resource". Account deletion runs in
-      batches of `PAGE_MAX` rows under one request deadline of at most 10 s, so
-      an account with many keys or sessions can end with
-      `outcome_unknown: true`. The user must retry to finish it. Not measured.
+- [ ] [untriaged · Tenant isolation] **Compact tombstones that slow scans of
+      the system database.** Compaction triggers do not check tombstone
+      density. Deleted rows remain in the LSM tree as tombstones. Later range
+      scans must step over those tombstones. A tenant can repeat create and
+      delete calls to slow its metadata scans on the system-DB lease holder.
+      In a probe test, creating and deleting 80,000 API keys raised batch key
+      deletion time from 0.02 ms to 7.4 ms. That slowdown remained after 30 idle
+      minutes. `Txn::cost` counts only live entries, so the metadata cost test
+      does not detect tombstone scans. Expired-session reaper scans hit the
+      same slowdown across all tenants.
+- [ ] [untriaged · Tenant isolation] **Limit API keys and sessions per user.**
+      A tenant can create unlimited API keys and sessions in the shared system
+      database. This breaks the SPEC §1 goal "Each tenant has a limit for each
+      resource". `MetaCmd::CreateApiKey` and `create_key` in `api/account.rs`
+      do not cap key counts. Each sign-in also adds a session without a cap.
+      Account deletion deletes at most `PAGE_MAX` rows per batch under a single
+      10 s request deadline. An account with many keys or sessions can time out
+      with `outcome_unknown: true`. The user must then retry deletion. Not
+      measured.

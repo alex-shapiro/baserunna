@@ -1,4 +1,4 @@
-//! Tests that the cost of each metadata command does not grow with the amount of stored data.
+//! Tests that each metadata command has a fixed maximum read and write cost.
 
 use super::tests::{engine, rt, session};
 use super::*;
@@ -8,11 +8,13 @@ use baserunna_storage::engine::{Consistency, Db, EngineConfig, Isolation, TxnCos
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-/// Length limits from SPEC §8 for emails and API key names.
+/// Maximum lengths from SPEC §8 for email addresses and API key names.
 const EMAIL_MAX: usize = 254;
 const API_KEY_NAME_MAX: usize = 100;
 const NOW_MS: i64 = 1_000;
-/// Most entries that one command reads and writes: `PAGE_MAX` rows of at most 16 entries each.
+/// Maximum total entries that a command may read and write.
+///
+/// Allows 16 store entries per row across `PAGE_MAX` rows.
 const COMMAND_ENTRIES_MAX: usize = 16 * PAGE_MAX;
 const LIVE_UNTIL_MS: i64 = 1 << 50;
 
@@ -24,31 +26,31 @@ async fn begin(db: &Arc<Db>) -> Txn {
     db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap()
 }
 
-/// Commits `cmds` in transactions of a few hundred commands each.
+/// Commits `cmds` in batches of 200 commands per transaction.
 async fn apply_all(db: &Arc<Db>, cmds: Vec<MetaCmd>) {
     for chunk in cmds.chunks(200) {
-        let mut t = begin(db).await;
+        let mut txn = begin(db).await;
         for cmd in chunk {
-            apply(&mut t, &BlobResolver { db }, cmd, NOW_MS).await.unwrap_or_else(|e| panic!("{cmd:?}: {e}"));
+            apply(&mut txn, &BlobResolver { db }, cmd, NOW_MS).await.unwrap_or_else(|e| panic!("{cmd:?}: {e}"));
         }
-        db.commit(t.into_request()).await.unwrap();
+        db.commit(txn.into_request()).await.unwrap();
     }
 }
 
-/// Runs `cmd` in a transaction that does not commit, and returns its answer and cost.
-async fn measure(db: &Arc<Db>, cmd: &MetaCmd) -> (Json, TxnCost) {
-    let mut t = begin(db).await;
-    let answer = apply(&mut t, &BlobResolver { db }, cmd, NOW_MS).await.unwrap_or_else(|e| panic!("{cmd:?}: {e}"));
-    (answer, t.cost())
+/// Runs `cmd` without committing and returns its response and [`TxnCost`].
+async fn measure_cmd(db: &Arc<Db>, cmd: &MetaCmd) -> (Json, TxnCost) {
+    let mut txn = begin(db).await;
+    let answer = apply(&mut txn, &BlobResolver { db }, cmd, NOW_MS).await.unwrap_or_else(|e| panic!("{cmd:?}: {e}"));
+    (answer, txn.cost())
 }
 
-/// Returns an email address of the maximum length for `user_id`.
-fn long_email(user_id: &str) -> String {
+/// Returns a maximum-length email address for `user_id`.
+fn max_length_email(user_id: &str) -> String {
     let domain = "x".repeat(EMAIL_MAX - user_id.len() - 4);
     format!("{user_id}@{domain}.io")
 }
 
-fn long_name(prefix: &str, i: usize, len: usize) -> String {
+fn padded_name(prefix: &str, i: usize, len: usize) -> String {
     let head = format!("{prefix}{i}-");
     format!("{head}{}", "a".repeat(len - head.len()))
 }
@@ -56,7 +58,7 @@ fn long_name(prefix: &str, i: usize, len: usize) -> String {
 fn signup_cmd(env: &baserunna_util::env::Env, id: &str) -> MetaCmd {
     MetaCmd::Signup {
         id: id.into(),
-        email: long_email(id),
+        email: max_length_email(id),
         password_hash: Some(crate::auth::hash_password(env, "password", 1)),
         policy: SignupPolicy::Open,
         bootstrap_admin: false,
@@ -67,8 +69,8 @@ fn token_hash(user_id: &str, i: usize) -> String {
     crate::auth::fingerprint(&format!("{user_id}/{i}")).repeat(4)
 }
 
-fn sessions(user_id: &str, n: usize, expires_at: i64) -> Vec<MetaCmd> {
-    (0..n)
+fn sessions(user_id: &str, count: usize, expires_at: i64) -> Vec<MetaCmd> {
+    (0..count)
         .map(|i| {
             let mut cmd = session(&token_hash(user_id, i), user_id, expires_at);
             if let MetaCmd::CreateSession { client, .. } = &mut cmd {
@@ -83,7 +85,7 @@ fn api_key(user_id: &str, i: usize) -> ApiKey {
     ApiKey {
         id: format!("key-{user_id}-{i}"),
         user_id: user_id.into(),
-        name: long_name("key", i, API_KEY_NAME_MAX),
+        name: padded_name("key", i, API_KEY_NAME_MAX),
         secret_hash: token_hash("secret", i),
         db_id: None,
         read_only: false,
@@ -96,13 +98,13 @@ fn node(id: &str) -> NodeRecord {
     NodeRecord { id: id.into(), addr: format!("http://{id}.example:8080"), started_at: 1, heartbeat_at: NOW_MS }
 }
 
-/// Fills every per-owner limit and every listing that a command can scan.
+/// Populates every per-owner limit and paginated listing to test worst-case command costs.
 ///
-/// - The user `victim` has `PAGE_MAX - 1` sessions and API keys and the maximum number of memberships.
-/// - The user `partner` owns every organization of `victim`.
-/// - The user `dbowner` has the maximum number of personal databases.
-/// - The organization `org-big` has the maximum number of members. The site administrator `admin` is not a member.
-/// - The user `m0` has more than `PAGE_MAX` sessions.
+/// - User `victim` has `PAGE_MAX - 1` sessions, `PAGE_MAX - 1` API keys, and the maximum number of memberships.
+/// - User `partner` owns all of `victim`'s organizations.
+/// - User `dbowner` owns the maximum number of personal databases.
+/// - Organization `org-big` has the maximum number of members. Site administrator `admin` is not a member.
+/// - User `m0` has more than `PAGE_MAX` active sessions.
 /// - Other users have more than `PAGE_MAX` expired sessions.
 async fn fill_limits(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeConfig) {
     let member_ids: Vec<String> = (0..cfg.max_members_per_org - 2).map(|i| format!("m{i}")).collect();
@@ -112,31 +114,31 @@ async fn fill_limits(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeCon
     }
     cmds.push(MetaCmd::CreateOrg {
         id: "org-big".into(),
-        name: long_name("big", 0, ORG_NAME_MAX),
+        name: padded_name("big", 0, ORG_NAME_MAX),
         actor: "partner".into(),
         max_orgs: cfg.max_orgs_per_user,
     });
-    let add = |org_id: &str, actor: &str, user_id: &str, role: Role| MetaCmd::AddMember {
+    let add_member = |org_id: &str, actor: &str, user_id: &str, role: Role| MetaCmd::AddMember {
         org_id: org_id.into(),
         actor: actor.into(),
-        email: long_email(user_id),
+        email: max_length_email(user_id),
         role,
         limits: member_limits(cfg),
     };
-    cmds.push(add("org-big", "admin", "victim", Role::Owner));
+    cmds.push(add_member("org-big", "admin", "victim", Role::Owner));
     for id in &member_ids {
-        cmds.push(add("org-big", "admin", id, Role::Reader));
+        cmds.push(add_member("org-big", "admin", id, Role::Reader));
     }
     for i in 0..cfg.max_orgs_per_user - 1 {
         let id = format!("org-p{i}");
-        let name = long_name("p", i, ORG_NAME_MAX);
+        let name = padded_name("p", i, ORG_NAME_MAX);
         cmds.push(MetaCmd::CreateOrg {
             id: id.clone(),
             name,
             actor: "partner".into(),
             max_orgs: cfg.max_orgs_per_user,
         });
-        cmds.push(add(&id, "partner", "victim", Role::Owner));
+        cmds.push(add_member(&id, "partner", "victim", Role::Owner));
     }
     cmds.extend(sessions("victim", PAGE_MAX - 1, LIVE_UNTIL_MS));
     cmds.extend(sessions("m0", PAGE_MAX + 1, LIVE_UNTIL_MS));
@@ -148,7 +150,7 @@ async fn fill_limits(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeCon
         id: format!("db-dbowner-{i}"),
         owner_id: "dbowner".into(),
         actor: "dbowner".into(),
-        name: long_name("db", i, 63),
+        name: padded_name("db", i, 63),
         max_dbs: cfg.max_dbs_per_owner,
     };
     cmds.push(create_db(cfg.max_dbs_per_owner));
@@ -158,11 +160,11 @@ async fn fill_limits(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeCon
         ["node-a", "node-b", "node-c"].map(|id| MetaCmd::Heartbeat { node: node(id), dead_after_ms: 3_600_000 }),
     );
     apply_all(db, cmds).await;
-    let mut t = begin(db).await;
-    check_integrity(&mut t).await.unwrap();
+    let mut txn = begin(db).await;
+    check_integrity(&mut txn).await.unwrap();
 }
 
-/// Returns one command of each kind, each aimed at the largest state that `fill_limits` creates.
+/// Returns a worst-case instance of every [`MetaCmd`] variant against the state from [`fill_limits`].
 fn worst_case_commands(
     env: &baserunna_util::env::Env,
     cfg: &NodeConfig,
@@ -176,7 +178,7 @@ fn worst_case_commands(
         MetaCmd::GoogleLogin {
             new_id: "googler".into(),
             sub: "1".repeat(255),
-            email: long_email("googler"),
+            email: max_length_email("googler"),
             email_verified: true,
             policy: SignupPolicy::Open,
         },
@@ -187,7 +189,7 @@ fn worst_case_commands(
             keep_session: Some(victim_session.clone()),
             verify_email: true,
         },
-        MetaCmd::VerifyEmail { user_id: "victim".into(), email: long_email("victim") },
+        MetaCmd::VerifyEmail { user_id: "victim".into(), email: max_length_email("victim") },
         MetaCmd::SetDisabled { actor: "admin".into(), user_id: "victim".into(), disabled: true },
         sessions("victim", PAGE_MAX + 1, LIVE_UNTIL_MS).pop().unwrap(),
         MetaCmd::DeleteSession { token_hash: victim_session.clone() },
@@ -199,7 +201,7 @@ fn worst_case_commands(
             id: "db-shared".into(),
             owner_id: "org-p0".into(),
             actor: "victim".into(),
-            name: long_name("shared", 0, 63),
+            name: padded_name("shared", 0, 63),
             max_dbs: cfg.max_dbs_per_owner,
         },
         MetaCmd::DeleteDb { id: "db-dbowner-0".into() },
@@ -213,7 +215,7 @@ fn worst_case_commands(
         MetaCmd::Leave { id: "node-a".into() },
         MetaCmd::CreateOrg {
             id: "org-new".into(),
-            name: long_name("new", 0, ORG_NAME_MAX),
+            name: padded_name("new", 0, ORG_NAME_MAX),
             actor: "admin".into(),
             max_orgs: cfg.max_orgs_per_user,
         },
@@ -221,7 +223,7 @@ fn worst_case_commands(
         MetaCmd::AddMember {
             org_id: "org-p0".into(),
             actor: "partner".into(),
-            email: long_email("m1"),
+            email: max_length_email("m1"),
             role: Role::Admin,
             limits: member_limits(cfg),
         },
@@ -235,9 +237,8 @@ fn worst_case_commands(
     ]
 }
 
-/// Adds data that no per-owner limit caps: other tenants, sessions, API keys, organizations, and deleted
-/// databases. Every capped count in `fill_limits` stays at its cap.
-async fn grow_unlimited(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeConfig) {
+/// Adds uncapped tenant data while keeping every capped count from [`fill_limits`] unchanged.
+async fn add_uncapped_data(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeConfig) {
     let mut cmds = sessions("m0", 2 * PAGE_MAX, LIVE_UNTIL_MS).split_off(PAGE_MAX + 1);
     for i in 0..cfg.max_members_per_org {
         let id = format!("o{i}");
@@ -255,44 +256,48 @@ async fn grow_unlimited(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &Node
                 id: format!("db-{id}-{name}"),
                 owner_id: id.clone(),
                 actor: id.clone(),
-                name: long_name(name, i, 63),
+                name: padded_name(name, i, 63),
                 max_dbs: cfg.max_dbs_per_owner,
             });
         }
         cmds.push(MetaCmd::DeleteDb { id: format!("db-{id}-gone") });
         cmds.push(MetaCmd::CreateOrg {
             id: format!("org-{id}"),
-            name: long_name("o", i, ORG_NAME_MAX),
+            name: padded_name("o", i, ORG_NAME_MAX),
             actor: id.clone(),
             max_orgs: cfg.max_orgs_per_user,
         });
     }
     apply_all(db, cmds).await;
-    let mut t = begin(db).await;
-    check_integrity(&mut t).await.unwrap();
+    let mut txn = begin(db).await;
+    check_integrity(&mut txn).await.unwrap();
 }
 
 async fn table_rows(db: &Arc<Db>) -> BTreeMap<String, usize> {
-    let mut t = begin(db).await;
+    let mut txn = begin(db).await;
     let mut rows = BTreeMap::new();
     for def in tables() {
         let name = def["name"].as_str().unwrap();
-        rows.insert(name.to_string(), query_all::<Json>(&mut t, name, Query::default()).await.unwrap().len());
+        rows.insert(name.to_string(), query_all::<Json>(&mut txn, name, Query::default()).await.unwrap().len());
     }
     rows
 }
 
-/// Runs each command in `worst_case_commands` without a commit, and returns the cost of each.
-async fn measure_all(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeConfig) -> Vec<(&'static str, TxnCost)> {
+/// Measures [`TxnCost`] for every command from [`worst_case_commands`] without committing.
+async fn measure_all_commands(
+    db: &Arc<Db>,
+    env: &baserunna_util::env::Env,
+    cfg: &NodeConfig,
+) -> Vec<(&'static str, TxnCost)> {
     let victim = get_user(&mut begin(db).await, "victim").await.unwrap().unwrap();
     let mut costs = Vec::new();
     for cmd in worst_case_commands(env, cfg, victim.password_hash) {
-        costs.push((cmd.name(), measure(db, &cmd).await.1));
+        costs.push((cmd.name(), measure_cmd(db, &cmd).await.1));
     }
     costs
 }
 
-/// Field length limits bound the bytes in each entry, so the test compares entry counts.
+/// Compares entry counts before and after adding uncapped data. Field length limits bound bytes per entry.
 #[test]
 fn metadata_command_cost_does_not_grow_with_stored_data() {
     rt().block_on(async {
@@ -301,15 +306,19 @@ fn metadata_command_cost_does_not_grow_with_stored_data() {
         db.open(true).await.unwrap();
         let cfg = NodeConfig::default();
         fill_limits(&db, &env, &cfg).await;
-        let (rows_before, costs_before) = (table_rows(&db).await, measure_all(&db, &env, &cfg).await);
-        grow_unlimited(&db, &env, &cfg).await;
-        let (rows_after, costs_after) = (table_rows(&db).await, measure_all(&db, &env, &cfg).await);
+        let (rows_before, costs_before) = (table_rows(&db).await, measure_all_commands(&db, &env, &cfg).await);
+        add_uncapped_data(&db, &env, &cfg).await;
+        let (rows_after, costs_after) = (table_rows(&db).await, measure_all_commands(&db, &env, &cfg).await);
         for (table, before) in &rows_before {
-            let grows = !["nodes", "config"].contains(&table.as_str());
-            assert_eq!(rows_after[table] > *before, grows, "{table}: {before} rows, then {}", rows_after[table]);
+            let should_grow = !["nodes", "config"].contains(&table.as_str());
+            assert_eq!(rows_after[table] > *before, should_grow, "{table}: {before} rows, then {}", rows_after[table]);
         }
         let measured: BTreeSet<&str> = costs_before.iter().map(|(name, _)| *name).collect();
-        assert_eq!(measured, BTreeSet::from_iter(MetaCmd::NAMES.iter().copied()), "every metadata command is measured");
+        assert_eq!(
+            measured,
+            BTreeSet::from_iter(MetaCmd::NAMES.iter().copied()),
+            "missing metadata commands from worst_case_commands"
+        );
         let mut report = format!("rows before: {rows_before:?}\nrows after: {rows_after:?}\n");
         let mut failures = Vec::new();
         for ((name, before), (_, after)) in costs_before.iter().zip(&costs_after) {
@@ -326,17 +335,19 @@ fn metadata_command_cost_does_not_grow_with_stored_data() {
     });
 }
 
-/// Runs `cmd` until its answer reports that no rows remain, and returns the number of runs.
-/// Checks integrity after each run, because a node can stop between runs.
-async fn run_until_done(db: &Arc<Db>, cmd: &MetaCmd) -> usize {
-    for runs in 1.. {
-        let mut t = begin(db).await;
-        let answer = apply(&mut t, &BlobResolver { db }, cmd, NOW_MS).await.unwrap_or_else(|e| panic!("{cmd:?}: {e}"));
-        db.commit(t.into_request()).await.unwrap();
-        let mut t = begin(db).await;
-        check_integrity(&mut t).await.unwrap_or_else(|e| panic!("after run {runs} of {cmd:?}: {e}"));
+/// Repeats `cmd` until `more` is `false` and returns the batch count.
+///
+/// Checks metadata integrity after each batch to simulate a node stopping between batches.
+async fn run_batches_until_done(db: &Arc<Db>, cmd: &MetaCmd) -> usize {
+    for batch_count in 1.. {
+        let mut txn = begin(db).await;
+        let answer =
+            apply(&mut txn, &BlobResolver { db }, cmd, NOW_MS).await.unwrap_or_else(|e| panic!("{cmd:?}: {e}"));
+        db.commit(txn.into_request()).await.unwrap();
+        let mut txn = begin(db).await;
+        check_integrity(&mut txn).await.unwrap_or_else(|e| panic!("after batch {batch_count} of {cmd:?}: {e}"));
         if answer["more"] == json!(false) {
-            return runs;
+            return batch_count;
         }
     }
     unreachable!()
@@ -352,26 +363,33 @@ fn batched_deletes_remove_owners_at_their_limits() {
         fill_limits(&db, &env, &cfg).await;
         let delete_org = MetaCmd::DeleteOrg { org_id: "org-big".into(), actor: "admin".into() };
         assert_eq!(
-            run_until_done(&db, &delete_org).await,
+            run_batches_until_done(&db, &delete_org).await,
             2,
             "a site administrator deletes 1,000 members in two batches"
         );
         for (user_id, batches) in [("victim", 3), ("dbowner", 2)] {
             let cmd = MetaCmd::DeleteUser { user_id: user_id.into() };
-            assert_eq!(run_until_done(&db, &cmd).await, batches, "{user_id}");
+            assert_eq!(run_batches_until_done(&db, &cmd).await, batches, "{user_id}");
         }
-        let mut t = begin(&db).await;
+        let mut txn = begin(&db).await;
         let partner = MetaCmd::DeleteUser { user_id: "partner".into() };
-        let refused = apply(&mut t, &BlobResolver { db: &db }, &partner, NOW_MS).await;
-        assert!(matches!(refused, Err(Error::PermissionDenied(_))), "partner is now the only owner: {refused:?}");
-        let mut t = begin(&db).await;
-        check_integrity(&mut t).await.unwrap();
+        let partner_delete_result = apply(&mut txn, &BlobResolver { db: &db }, &partner, NOW_MS).await;
+        assert!(
+            matches!(partner_delete_result, Err(Error::PermissionDenied(_))),
+            "partner is now the only owner: {partner_delete_result:?}"
+        );
+        let mut txn = begin(&db).await;
+        check_integrity(&mut txn).await.unwrap();
         for user_id in ["victim", "dbowner"] {
-            assert_eq!(get_user(&mut t, user_id).await.unwrap(), None, "{user_id}");
+            assert_eq!(get_user(&mut txn, user_id).await.unwrap(), None, "{user_id}");
         }
-        assert_eq!(org::get_org(&mut t, "org-big").await.unwrap(), None);
-        assert_eq!(dbs_page(&mut t, "dbowner", 10, None).await.unwrap().items, vec![]);
-        let deleted = list_deleted_dbs(&mut t).await.unwrap();
-        assert_eq!(deleted.len(), cfg.max_dbs_per_owner + 1, "every database waits for its storage purge");
+        assert_eq!(org::get_org(&mut txn, "org-big").await.unwrap(), None);
+        assert_eq!(dbs_page(&mut txn, "dbowner", 10, None).await.unwrap().items, vec![]);
+        let deleted = list_deleted_dbs(&mut txn).await.unwrap();
+        assert_eq!(
+            deleted.len(),
+            cfg.max_dbs_per_owner + 1,
+            "metadata tracks every deleted database for storage purge"
+        );
     });
 }

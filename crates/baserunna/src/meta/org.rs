@@ -194,22 +194,22 @@ pub(super) async fn delete_org(w: &mut Write<'_, '_>, org_id: &str, actor: &str)
     if count(w.txn, Count::Dbs, org_id).await? > 0 {
         return Err(Error::PermissionDenied("delete the organization's databases first".into()));
     }
-    let p: Page<Member> = page(w.txn, "org_members", q_eq(None, vec![json!(org_id)]), PAGE_MAX, None).await?;
-    let more = p.next_cursor.is_some();
+    let member_page: Page<Member> = page(w.txn, "org_members", q_eq(None, vec![json!(org_id)]), PAGE_MAX, None).await?;
+    let has_more = member_page.next_cursor.is_some();
     let mut deleted = 0;
-    for m in p.items {
-        // Until the last batch, the actor keeps its role and the organization keeps an owner.
-        let last_owner = m.role == Role::Owner && count(w.txn, Count::Owners, org_id).await? <= 1;
-        if more && (m.user_id == actor || last_owner) {
+    for member in member_page.items {
+        // Keep the actor and at least one owner until the final batch.
+        let is_last_owner = member.role == Role::Owner && count(w.txn, Count::Owners, org_id).await? <= 1;
+        if has_more && (member.user_id == actor || is_last_owner) {
             continue;
         }
-        change_membership(w, org_id, &m.user_id, Some(m.role), None).await?;
+        change_membership(w, org_id, &member.user_id, Some(member.role), None).await?;
         deleted += 1;
     }
-    if !more {
+    if !has_more {
         table::delete(w.txn, "orgs", &json!(org_id)).await?;
     }
-    Ok(Batch { deleted, more })
+    Ok(Batch { deleted, more: has_more })
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

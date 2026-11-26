@@ -1243,10 +1243,10 @@ impl Node {
         Ok(hash == current)
     }
 
-    /// Deletes organization `org_id` and its memberships for `p`.
-    pub async fn delete_org(&self, p: &Principal, org_id: &str) -> Result<()> {
+    /// Deletes organization `org_id` and all of its memberships.
+    pub async fn delete_org(&self, principal: &Principal, org_id: &str) -> Result<()> {
         loop {
-            let cmd = MetaCmd::DeleteOrg { org_id: org_id.to_string(), actor: p.user.id.clone() };
+            let cmd = MetaCmd::DeleteOrg { org_id: org_id.to_string(), actor: principal.user.id.clone() };
             if !self.run_meta_as::<Batch>(cmd).await?.more {
                 return Ok(());
             }
@@ -1260,8 +1260,8 @@ impl Node {
         self.reauthenticate(&user, password).await?;
         loop {
             let deletion: UserDeletion = self.run_meta_as(MetaCmd::DeleteUser { user_id: user.id.clone() }).await?;
-            // Mark each database manifest deleted so nodes with cached handles stop serving it immediately.
-            for id in deletion.dbs {
+            // Mark each database manifest deleted so cached handles stop serving it at once.
+            for id in deletion.deleted_db_ids {
                 let db = self.engine.db(&id);
                 if db.open(false).await.is_ok()
                     && let Err(e) = db.mark_deleted().await

@@ -123,9 +123,9 @@ scale, not isolation.
 
 - [x] Set a length limit on every field in a metadata command, including the
       Google `sub` field.
-- [x] Test that every metadata command reads and writes at most a fixed number
-      of rows and bytes. Delete the rows of a user or an organization in
-      batches of `PAGE_MAX` rows.
+- [x] Test that each metadata command reads and writes at most a fixed number
+      of entries and bytes. Delete user and organization rows in batches of
+      `PAGE_MAX` rows.
 - [ ] Add a fair queue to the lease holder for the system database before it
       runs each command. Queue authenticated requests by account and
       unauthenticated requests by client IP address.

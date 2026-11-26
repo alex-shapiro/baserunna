@@ -104,7 +104,7 @@ impl WriteSet {
     }
 }
 
-/// Entries and bytes that a transaction read from its snapshot and staged for writing.
+/// Counts of snapshot reads and staged writes for a [`Txn`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TxnCost {
     pub entries_read: usize,
@@ -279,7 +279,7 @@ impl Txn {
         self.writes.is_empty()
     }
 
-    /// Returns the entries and bytes that this transaction has read from its snapshot and staged for writing.
+    /// Returns the snapshot read and staged write counts for this transaction.
     pub fn cost(&self) -> TxnCost {
         TxnCost {
             entries_read: self.entries_read,
@@ -289,9 +289,9 @@ impl Txn {
         }
     }
 
-    fn count_read(&mut self, e: &super::types::Entry) {
+    fn count_entry_read(&mut self, entry: &super::types::Entry) {
         self.entries_read += 1;
-        self.entry_bytes_read += e.size();
+        self.entry_bytes_read += entry.size();
     }
 
     fn masked(&self, k: &[u8]) -> bool {
@@ -317,7 +317,7 @@ impl Txn {
         }
         let found = self.snapshot.get(key, self.read_time).await?;
         if let Some(e) = &found {
-            self.count_read(e);
+            self.count_entry_read(e);
             self.read_expiry = earliest(self.read_expiry, e.expires);
         }
         Ok(found.map(Txn::stored))
@@ -370,7 +370,7 @@ impl Txn {
             };
             let mut merged: BTreeMap<Bytes, ReadValue> = BTreeMap::new();
             for e in snap {
-                self.count_read(&e);
+                self.count_entry_read(&e);
                 if self.writes.puts.contains_key(&e.key) || self.masked(&e.key) {
                     continue;
                 }

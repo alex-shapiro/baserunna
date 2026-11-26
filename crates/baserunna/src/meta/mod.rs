@@ -416,10 +416,11 @@ pub enum MetaCmd {
     DeleteDb {
         id: String,
     },
-    /// Deletes up to `PAGE_MAX` of a user's API keys, memberships, personal
-    /// databases, and sessions, then the user if none remain. Rejects deletion of
-    /// the last enabled administrator or the sole owner of an organization.
-    /// Returns [`UserDeletion`].
+    /// Deletes up to `PAGE_MAX` rows owned by `user_id` and returns [`UserDeletion`].
+    ///
+    /// Deletes API keys, memberships, personal databases, and sessions in that
+    /// order, then deletes the user row in the final batch. Rejects deletion
+    /// of the last enabled administrator or the only owner of an organization.
     DeleteUser {
         user_id: String,
     },
@@ -447,8 +448,10 @@ pub enum MetaCmd {
         actor: String,
         max_orgs: usize,
     },
-    /// Deletes up to `PAGE_MAX` members of an organization that has no
-    /// databases, then the organization if no other members remain. Returns [`Batch`].
+    /// Deletes up to `PAGE_MAX` members of an empty organization and returns [`Batch`].
+    ///
+    /// Rejects organizations that still own databases. Deletes the
+    /// organization row in the final batch.
     DeleteOrg {
         org_id: String,
         actor: String,
@@ -475,11 +478,11 @@ pub enum MetaCmd {
     },
 }
 
-/// Defines [`MetaCmd::name`] and [`MetaCmd::NAMES`] from one exhaustive list of variants.
+/// Defines [`MetaCmd::name`] and [`MetaCmd::NAMES`] from a single exhaustive variant list.
 macro_rules! meta_cmd_names {
     ($($variant:ident => $name:literal,)*) => {
         impl MetaCmd {
-            /// Names of all metadata commands.
+            /// All metadata command names.
             pub const NAMES: &[&str] = &[$($name),*];
 
             pub fn name(&self) -> &'static str {
@@ -563,9 +566,9 @@ pub struct Batch {
 /// Result of [`MetaCmd::DeleteUser`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserDeletion {
-    /// Personal databases whose metadata this batch deleted and whose storage the caller must mark deleted.
-    pub dbs: Vec<String>,
-    /// Whether rows remain, so that the caller must run the command again.
+    /// IDs of personal databases deleted in this batch. The caller must mark their storage deleted.
+    pub deleted_db_ids: Vec<String>,
+    /// True if more rows remain and the caller must run [`MetaCmd::DeleteUser`] again.
     pub more: bool,
 }
 
@@ -1031,38 +1034,48 @@ async fn delete_user(w: &mut Write<'_, '_>, user_id: &str) -> Result<UserDeletio
             )));
         }
     }
-    let mut left = baserunna_api::PAGE_MAX;
-    for k in take_rows::<ApiKey>(w.txn, "api_keys", by_user(user_id), &mut left).await? {
+    let mut remaining = baserunna_api::PAGE_MAX;
+    for k in take_rows::<ApiKey>(w.txn, "api_keys", by_user(user_id), &mut remaining).await? {
         table::delete(w.txn, "api_keys", &json!(k.id)).await?;
     }
-    for m in take_rows::<org::Member>(w.txn, "org_members", by_user(user_id), &mut left).await? {
+    for m in take_rows::<org::Member>(w.txn, "org_members", by_user(user_id), &mut remaining).await? {
         org::change_membership(w, &m.org_id, user_id, Some(m.role), None).await?;
     }
-    let mut dbs = Vec::new();
-    for d in
-        take_rows::<DbRecord>(w.txn, "databases", q_eq(Some("by_owner_name"), vec![json!(user_id)]), &mut left).await?
+    let mut deleted_db_ids = Vec::new();
+    for d in take_rows::<DbRecord>(
+        w.txn,
+        "databases",
+        q_eq(Some("by_owner_name"), vec![json!(user_id)]),
+        &mut remaining,
+    )
+    .await?
     {
-        dbs.push(d.id.clone());
+        deleted_db_ids.push(d.id.clone());
         delete_db(w, d).await?;
     }
-    // Sessions go last, so the caller can retry a stopped deletion without signing in again.
-    for s in take_rows::<Session>(w.txn, "sessions", by_user(user_id), &mut left).await? {
+    // Delete sessions last so the caller can retry a stopped deletion without signing in again.
+    for s in take_rows::<Session>(w.txn, "sessions", by_user(user_id), &mut remaining).await? {
         table::delete(w.txn, "sessions", &json!(s.token_hash)).await?;
     }
-    if left == 0 {
-        return Ok(UserDeletion { dbs, more: true });
+    if remaining == 0 {
+        return Ok(UserDeletion { deleted_db_ids, more: true });
     }
     table::delete(w.txn, "users", &json!(user_id)).await?;
-    Ok(UserDeletion { dbs, more: false })
+    Ok(UserDeletion { deleted_db_ids, more: false })
 }
 
-/// Reads up to `left` rows of `q` and subtracts the number of rows read from `left`.
-async fn take_rows<T: DeserializeOwned>(txn: &mut Txn, t: &str, q: Query, left: &mut usize) -> Result<Vec<T>> {
-    if *left == 0 {
+/// Reads up to `remaining` rows from `table` and subtracts the count from `remaining`.
+async fn take_rows<T: DeserializeOwned>(
+    txn: &mut Txn,
+    table: &str,
+    query: Query,
+    remaining: &mut usize,
+) -> Result<Vec<T>> {
+    if *remaining == 0 {
         return Ok(Vec::new());
     }
-    let rows = page(txn, t, q, *left, None).await?.items;
-    *left -= rows.len();
+    let rows = page(txn, table, query, *remaining, None).await?.items;
+    *remaining -= rows.len();
     Ok(rows)
 }
 

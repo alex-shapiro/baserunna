@@ -198,7 +198,7 @@ pub(super) async fn delete_org(w: &mut Write<'_, '_>, org_id: &str, actor: &str)
     let has_more = member_page.next_cursor.is_some();
     let mut deleted = 0;
     for member in member_page.items {
-        // Keep the actor and at least one owner until the final batch.
+        // Keep the actor and at least one owner until the last batch.
         let is_last_owner = member.role == Role::Owner && count(w.txn, Count::Owners, org_id).await? <= 1;
         if has_more && (member.user_id == actor || is_last_owner) {
             continue;

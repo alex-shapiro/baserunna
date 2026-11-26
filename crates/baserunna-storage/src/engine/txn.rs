@@ -104,7 +104,7 @@ impl WriteSet {
     }
 }
 
-/// Counts of snapshot reads and staged writes for a [`Txn`].
+/// Entry and byte counts for snapshot reads and staged writes in a [`Txn`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TxnCost {
     pub entries_read: usize,
@@ -279,7 +279,7 @@ impl Txn {
         self.writes.is_empty()
     }
 
-    /// Returns the snapshot read and staged write counts for this transaction.
+    /// Returns the entry and byte counts for snapshot reads and staged writes in this transaction.
     pub fn cost(&self) -> TxnCost {
         TxnCost {
             entries_read: self.entries_read,

@@ -1137,10 +1137,10 @@ The client address in a session must parse as an IP address. If a trusted
 proxy sends an entry in `X-Forwarded-For` that is not an IP address, the node
 uses the peer address.
 
-Each metadata command scans a limited set of rows. A multi-row delete command
-removes at most `PAGE_MAX` rows per call. The node repeats the command until
-it removes all target rows. This rule applies to session revocation, account
-deletion, and organization deletion. Two commands use other limits:
+Each metadata command reads and writes a limited set of rows. A multi-row delete
+command removes at most `PAGE_MAX` rows per call. The node repeats the command
+until it removes all target rows. This rule applies to session revocation,
+account deletion, and organization deletion. Two commands use other limits:
 
 - `delete_user` reads every membership of the user. It checks whether the user
   is the only owner of an organization. A user can join organizations up to the
@@ -1212,22 +1212,23 @@ recreate a purged database.
   their sessions and revoke one, or all but the current one.
 - **Account self-service** requires a signed-in session, not an API key.
 
-  Before changing a password, the node checks the current password. The node
+  To change a password, the node first checks the current password. The node
   counts failed checks toward the account's sign-in backoff. The node writes
   the new hash only if the stored hash still matches the checked hash. This
   check prevents two concurrent changes from succeeding. The node also ends all
   other sessions for the account.
 
-  Before deleting an account, the node checks the password. It then removes the
+  To delete an account, the node first checks the password. It then removes the
   user's API keys, memberships, databases, and sessions in that order. Each
   system-DB transaction deletes at most `PAGE_MAX` rows. The last transaction
   deletes the user row. The node marks each removed database manifest as
-  deleted. It purges that storage later, as in `DELETE /v1/dbs/{db}`. The node
-  rejects deletion for the last enabled administrator and for the only owner of
-  an organization. The node checks these rules in each transaction. If the user
-  has fewer than `PAGE_MAX` sessions, the caller's session stays valid until
-  the final batch. If a node stops during deletion, the user can retry with
-  that session.
+  deleted. It purges that storage later, as in `DELETE /v1/dbs/{db}`.
+
+  In each transaction, the node rejects deletion if the user is the last enabled
+  administrator or the only owner of an organization. If the user has fewer than
+  `PAGE_MAX` sessions, the caller's session stays valid until the last
+  transaction. If a node stops during deletion, the user can retry with that
+  session.
 
   Administrators disable and re-enable accounts.
 - **Mailed links** (when the node has a mailer, §12): sign-up and
@@ -1282,13 +1283,14 @@ recreate a purged database.
 
   An owner can delete an organization only after removing all its databases.
   This rule prevents orphan databases. The node deletes members in transactions
-  of at most `PAGE_MAX` rows each. It keeps the caller's membership and at
-  least one owner until the last transaction.
+  of at most `PAGE_MAX` rows each. Each intermediate transaction keeps the
+  caller's membership and at least one owner. The last transaction deletes the
+  remaining members and the organization row.
 
   An organization name has 1 to 39 characters from `[a-z0-9_-]`. It starts with
   a letter or digit. Clients address an organization's database as `org.name`.
-  If a user is outside an organization, the node returns `404` for that
-  organization and its databases.
+  For a caller without access to an organization, the node returns `404` for
+  that organization and its databases.
 
 - **Authorization**: each request on a database resolves the caller's role
   there: owner of their own databases, their membership role in an

@@ -13,7 +13,7 @@ const EMAIL_MAX: usize = 254;
 /// Maximum API key name length from SPEC §8.
 const API_KEY_NAME_MAX: usize = 100;
 const NOW_MS: i64 = 1_000;
-/// Maximum entries a command can read and write.
+/// Maximum total entries a command can read and write.
 ///
 /// Allows 16 store entries per row across `PAGE_MAX` rows.
 const COMMAND_ENTRIES_MAX: usize = 16 * PAGE_MAX;
@@ -165,7 +165,7 @@ async fn fill_limits(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeCon
     check_integrity(&mut txn).await.unwrap();
 }
 
-/// Returns a worst-case instance of every [`MetaCmd`] variant against the state from [`fill_limits`].
+/// Builds a worst-case command for each [`MetaCmd`] variant using the state from [`fill_limits`].
 fn worst_case_commands(
     env: &baserunna_util::env::Env,
     cfg: &NodeConfig,
@@ -238,7 +238,7 @@ fn worst_case_commands(
     ]
 }
 
-/// Adds unlimited tenant data while keeping every limited count from [`fill_limits`] unchanged.
+/// Adds unlimited tenant data without changing the per-owner counts from [`fill_limits`].
 async fn add_unlimited_data(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeConfig) {
     let mut cmds = create_session_cmds("m0", 2 * PAGE_MAX, LIVE_SESSION_EXPIRES_MS).split_off(PAGE_MAX + 1);
     for i in 0..cfg.max_members_per_org {
@@ -298,7 +298,9 @@ async fn measure_all_commands(
     costs
 }
 
-/// Compares entry counts before and after adding unlimited data. Field length rules limit bytes per entry.
+/// Checks that metadata command entry counts stay constant and within limits as tenant data grows.
+///
+/// Field length rules limit the bytes in each entry.
 #[test]
 fn metadata_command_cost_stays_constant_with_stored_data() {
     rt().block_on(async {

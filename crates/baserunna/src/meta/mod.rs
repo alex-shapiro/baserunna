@@ -448,7 +448,7 @@ pub enum MetaCmd {
         actor: String,
         max_orgs: usize,
     },
-    /// Deletes up to `PAGE_MAX` members of an empty organization and returns [`Batch`].
+    /// Deletes up to `PAGE_MAX` members of `org_id` and returns [`Batch`].
     ///
     /// Rejects organizations that still own databases. Deletes the
     /// organization row in the final batch.

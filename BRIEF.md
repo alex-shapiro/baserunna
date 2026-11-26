@@ -18,21 +18,21 @@ queue then fails to isolate tenants.
 
 ## Request
 
-The request to add a test is right, but the plan text is partly wrong. It says
-that multi-row deletes already run in batches of `PAGE_MAX` rows. This applies
-to sessions and API keys. Two delete commands still run in a single
-transaction:
+The request to add a test is right. The plan text is partly wrong. It says
+that the node already runs multi-row deletes in batches of `PAGE_MAX` rows.
+That applied to sessions and API keys. Before this change, the node ran two
+delete commands in a single transaction:
 
-- `delete_user` deletes up to `max_dbs_per_owner` personal databases. The
-  default limit is 1,000. It also deletes up to `max_orgs_per_user`
+- `delete_user` deleted up to `max_dbs_per_owner` personal databases. The
+  default limit is 1,000. It also deleted up to `max_orgs_per_user`
   memberships. The default limit is 100.
-- `delete_org` deletes up to `max_members_per_org` memberships. The default
+- `delete_org` deleted up to `max_members_per_org` memberships. The default
   limit is 1,000.
 
 We chose to delete these rows in batches of `PAGE_MAX`. Every command then has
 a fixed maximum cost. Before this change, per-tenant limits set the maximum
 cost of these commands. SPEC §1 lets an administrator change per-tenant limits.
-Changing those limits also changes that maximum. A tenant reaches the maximum
+Changing those limits also changed that maximum. A tenant reached that maximum
 only after running a command for each row.
 
 ## Precedent
@@ -124,6 +124,6 @@ Round 3:
   invisible to users.
 - Reaper background work belongs to the system, not a tenant account: reported
   to the user for the fair queue item.
-- Correctness: found zero bugs.
+- Correctness: we found zero bugs.
 - Unlimited API keys and sessions per user: out of scope for this branch and
   logged in `TODO.md`.

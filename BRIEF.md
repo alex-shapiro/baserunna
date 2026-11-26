@@ -96,3 +96,11 @@ Round 2:
 - Design cleanups: moved the `delete_org` loop into `Node`, updated this brief, and rewrapped SPEC. Kept the byte counters because the test report prints them.
 - Design, outside question, record `Txn::cost` for each command in production: reported to the user. It is outside this branch.
 - Correctness, outside question, the simulator never runs a deletion of more than one batch: rejected. The integrity check after each batch covers every point where a node can stop between batches.
+
+Round 3:
+
+- Design 1, a new command is not measured: accepted with new evidence. A macro generates `MetaCmd::name` and `MetaCmd::NAMES` from one exhaustive list, and the test compares the measured names with `NAMES`. With the `leave` worst case removed, the test fails.
+- Design, merge `META_BATCH` and `PAGE_MAX`: rejected. Users do not notice it.
+- Design, outside question, the reaper's background work has no account to charge: reported to the user for the fair queue item.
+- Correctness: no bugs found.
+- Correctness, outside question, no per-user limit on API keys and sessions: real and outside this branch. Added to `TODO.md`.

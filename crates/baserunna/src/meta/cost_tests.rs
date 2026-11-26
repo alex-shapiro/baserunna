@@ -20,34 +20,6 @@ fn member_limits(cfg: &NodeConfig) -> MemberLimits {
     MemberLimits { max_members: cfg.max_members_per_org, max_orgs: cfg.max_orgs_per_user }
 }
 
-const COMMAND_NAMES: [&str; 25] = [
-    "migrate",
-    "ensure_config",
-    "signup",
-    "google_login",
-    "set_password",
-    "verify_email",
-    "set_disabled",
-    "create_session",
-    "delete_session",
-    "revoke_session",
-    "revoke_sessions",
-    "create_api_key",
-    "delete_api_key",
-    "create_db",
-    "delete_db",
-    "delete_user",
-    "purge_pass",
-    "expire_sessions",
-    "heartbeat",
-    "leave",
-    "create_org",
-    "delete_org",
-    "add_member",
-    "set_role",
-    "remove_member",
-];
-
 async fn begin(db: &Arc<Db>) -> Txn {
     db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap()
 }
@@ -337,7 +309,7 @@ fn metadata_command_cost_does_not_grow_with_stored_data() {
             assert_eq!(rows_after[table] > *before, grows, "{table}: {before} rows, then {}", rows_after[table]);
         }
         let measured: BTreeSet<&str> = costs_before.iter().map(|(name, _)| *name).collect();
-        assert_eq!(measured, BTreeSet::from(COMMAND_NAMES), "every metadata command is measured");
+        assert_eq!(measured, BTreeSet::from_iter(MetaCmd::NAMES.iter().copied()), "every metadata command is measured");
         let mut report = format!("rows before: {rows_before:?}\nrows after: {rows_after:?}\n");
         let mut failures = Vec::new();
         for ((name, before), (_, after)) in costs_before.iter().zip(&costs_after) {

@@ -475,36 +475,48 @@ pub enum MetaCmd {
     },
 }
 
-impl MetaCmd {
-    pub fn name(&self) -> &'static str {
-        match self {
-            MetaCmd::Migrate => "migrate",
-            MetaCmd::EnsureConfig { .. } => "ensure_config",
-            MetaCmd::Signup { .. } => "signup",
-            MetaCmd::GoogleLogin { .. } => "google_login",
-            MetaCmd::SetPassword { .. } => "set_password",
-            MetaCmd::VerifyEmail { .. } => "verify_email",
-            MetaCmd::SetDisabled { .. } => "set_disabled",
-            MetaCmd::CreateSession { .. } => "create_session",
-            MetaCmd::DeleteSession { .. } => "delete_session",
-            MetaCmd::RevokeSession { .. } => "revoke_session",
-            MetaCmd::RevokeSessions { .. } => "revoke_sessions",
-            MetaCmd::CreateApiKey { .. } => "create_api_key",
-            MetaCmd::DeleteApiKey { .. } => "delete_api_key",
-            MetaCmd::CreateDb { .. } => "create_db",
-            MetaCmd::DeleteDb { .. } => "delete_db",
-            MetaCmd::DeleteUser { .. } => "delete_user",
-            MetaCmd::PurgePass { .. } => "purge_pass",
-            MetaCmd::ExpireSessions { .. } => "expire_sessions",
-            MetaCmd::Heartbeat { .. } => "heartbeat",
-            MetaCmd::Leave { .. } => "leave",
-            MetaCmd::CreateOrg { .. } => "create_org",
-            MetaCmd::DeleteOrg { .. } => "delete_org",
-            MetaCmd::AddMember { .. } => "add_member",
-            MetaCmd::SetRole { .. } => "set_role",
-            MetaCmd::RemoveMember { .. } => "remove_member",
+/// Defines [`MetaCmd::name`] and [`MetaCmd::NAMES`] from one exhaustive list of variants.
+macro_rules! meta_cmd_names {
+    ($($variant:ident => $name:literal,)*) => {
+        impl MetaCmd {
+            /// Names of all metadata commands.
+            pub const NAMES: &[&str] = &[$($name),*];
+
+            pub fn name(&self) -> &'static str {
+                match self {
+                    $(MetaCmd::$variant { .. } => $name,)*
+                }
+            }
         }
-    }
+    };
+}
+
+meta_cmd_names! {
+    Migrate => "migrate",
+    EnsureConfig => "ensure_config",
+    Signup => "signup",
+    GoogleLogin => "google_login",
+    SetPassword => "set_password",
+    VerifyEmail => "verify_email",
+    SetDisabled => "set_disabled",
+    CreateSession => "create_session",
+    DeleteSession => "delete_session",
+    RevokeSession => "revoke_session",
+    RevokeSessions => "revoke_sessions",
+    CreateApiKey => "create_api_key",
+    DeleteApiKey => "delete_api_key",
+    CreateDb => "create_db",
+    DeleteDb => "delete_db",
+    DeleteUser => "delete_user",
+    PurgePass => "purge_pass",
+    ExpireSessions => "expire_sessions",
+    Heartbeat => "heartbeat",
+    Leave => "leave",
+    CreateOrg => "create_org",
+    DeleteOrg => "delete_org",
+    AddMember => "add_member",
+    SetRole => "set_role",
+    RemoveMember => "remove_member",
 }
 
 fn from_row<T: DeserializeOwned>(v: Json) -> Result<T> {

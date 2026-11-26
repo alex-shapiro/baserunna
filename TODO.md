@@ -656,3 +656,11 @@ only.
       entries, so `metadata_command_cost_does_not_grow_with_stored_data` does
       not see this cost. The reaper's scan of expired sessions has the same
       cause across all tenants.
+- [ ] [untriaged · Tenant isolation] **Limit API keys and sessions for each
+      user.** `create_key` in `api/account.rs` and `MetaCmd::CreateApiKey`
+      check no count, and each sign-in adds a session. One tenant can grow the
+      shared system database without a limit, which breaks the SPEC §1 goal
+      "Each tenant has a limit for each resource". Account deletion runs in
+      batches of `PAGE_MAX` rows under one request deadline of at most 10 s, so
+      an account with many keys or sessions can end with
+      `outcome_unknown: true`. The user must retry to finish it. Not measured.

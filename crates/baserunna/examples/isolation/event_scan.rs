@@ -1,6 +1,6 @@
 //! HTTP event scan benchmark.
 //!
-//! Inserts 1,000,000 events for 500,000 users across 10 days. Then runs 7 queries per round.
+//! Inserts 1,000,000 events for 500,000 users across 10 days. Runs 7 queries in each round.
 
 use crate::cgroup::NodeCgroup;
 use crate::http::{NodeApi, Owner};
@@ -49,7 +49,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     if values.is_empty() { 0.0 } else { values[values.len() / 2] }
 }
 
-/// Loads the event table and runs `rounds` query rounds. Returns timing results as JSON.
+/// Loads the event table and runs the query suite `rounds` times. Returns timing results as JSON.
 ///
 /// Counts failed warm-up and benchmark queries in `failed_queries`. Omits failed queries from
 /// medians.
@@ -62,7 +62,7 @@ pub async fn run(api: &NodeApi, owner: &Owner, cgroup: &NodeCgroup, rounds: usiz
             {"name": "event", "type": "string"}], "time_column": "time", "order_by": ["time"]}),
     )
     .await?;
-    let started = Instant::now();
+    let setup_started = Instant::now();
     let time_span_ms = 10 * DAY_MS;
     for batch_start in (0..EVENT_ROW_COUNT).step_by(100_000) {
         let rows: Vec<String> = (batch_start..EVENT_ROW_COUNT.min(batch_start + 100_000))
@@ -75,14 +75,14 @@ pub async fn run(api: &NodeApi, owner: &Owner, cgroup: &NodeCgroup, rounds: usiz
     }
     let mut part_count = api.part_count(token, db, "ev").await?;
     let mut stable_polls = 0;
-    while stable_polls < 5 && started.elapsed() < Duration::from_secs(60) {
+    while stable_polls < 5 && setup_started.elapsed() < Duration::from_secs(60) {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let current_part_count = api.part_count(token, db, "ev").await?;
         stable_polls = if current_part_count == part_count { stable_polls + 1 } else { 0 };
         part_count = current_part_count;
     }
     let table_info = api.table_info(token, db, "ev").await?;
-    let setup_s = started.elapsed().as_secs_f64();
+    let setup_s = setup_started.elapsed().as_secs_f64();
     let path = format!("/v1/dbs/{db}/events/ev/rows/query");
     let queries = benchmark_queries();
     let mut failures = Vec::new();

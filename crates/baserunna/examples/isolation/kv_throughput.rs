@@ -119,7 +119,7 @@ async fn setup(api: &NodeApi, node_url: &str) -> Result<Vec<DbKey>, String> {
         .collect()
 }
 
-/// Creates database `db` and retries if a concurrent creation conflicts.
+/// Creates database `db` and retries on a retryable conflict.
 async fn create_db_with_retries(api: &NodeApi, token: &str, db: &str) -> Result<(), String> {
     let body = json!({"name": db}).to_string();
     for _ in 0..50 {
@@ -137,7 +137,7 @@ const PHASE_WARMING: u8 = 0;
 const PHASE_MEASURING: u8 = 1;
 const PHASE_STOPPED: u8 = 2;
 
-/// Warms up `client_count` closed-loop clients. Then measures throughput for `measure_window`.
+/// Warms up `client_count` closed-loop clients. Measures throughput over `measure_window`.
 async fn measure(
     http: &LoadClient,
     keys: &Arc<Vec<DbKey>>,
@@ -163,11 +163,11 @@ async fn measure(
     tokio::time::sleep(warmup).await;
     let node_cpu_usec_before = cgroup.cpu_usage_usec();
     let client_cpu_secs_before = process_cpu_secs();
-    let started = Instant::now();
+    let measure_started = Instant::now();
     phase.store(PHASE_MEASURING, Relaxed);
     tokio::time::sleep(measure_window).await;
     phase.store(PHASE_STOPPED, Relaxed);
-    let seconds = started.elapsed().as_secs_f64();
+    let seconds = measure_started.elapsed().as_secs_f64();
     let node_cpu_usec = match (node_cpu_usec_before, cgroup.cpu_usage_usec()) {
         (Some(before), Some(after)) => Some(after.saturating_sub(before)),
         _ => None,
@@ -230,7 +230,7 @@ async fn client_loop(
         *request.method_mut() = if is_write { Method::PUT } else { Method::GET };
         *request.uri_mut() = key.uri.clone();
         request.headers_mut().insert(AUTHORIZATION, key.auth.clone());
-        let started = Instant::now();
+        let request_started = Instant::now();
         let failure = match http.request(request).await {
             Ok(response) => {
                 let status = response.status().as_u16();
@@ -246,7 +246,7 @@ async fn client_loop(
         if phase.load(Relaxed) != PHASE_MEASURING || phase_before != PHASE_MEASURING {
             continue;
         }
-        latencies_us.push(started.elapsed().as_micros() as u32);
+        latencies_us.push(request_started.elapsed().as_micros() as u32);
         if let Some(err) = failure {
             errors += 1;
             if error_samples.len() < 5 {
@@ -264,6 +264,6 @@ fn process_cpu_secs() -> f64 {
         libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr());
         usage.assume_init()
     };
-    let to_secs = |timeval: libc::timeval| timeval.tv_sec as f64 + timeval.tv_usec as f64 / 1e6;
-    to_secs(usage.ru_utime) + to_secs(usage.ru_stime)
+    let timeval_to_secs = |timeval: libc::timeval| timeval.tv_sec as f64 + timeval.tv_usec as f64 / 1e6;
+    timeval_to_secs(usage.ru_utime) + timeval_to_secs(usage.ru_stime)
 }

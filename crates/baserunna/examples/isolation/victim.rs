@@ -132,17 +132,21 @@ pub async fn run(api: Arc<NodeApi>, victim: Owner, stop: Arc<AtomicBool>, max_rp
     samples.extend(query_samples);
     let mut all_latencies_ms: Vec<f64> = samples.iter().map(|sample| sample.elapsed_ms).collect();
     all_latencies_ms.sort_by(f64::total_cmp);
-    let failed: Vec<&RequestSample> = samples.iter().filter(|sample| !sample.succeeded).collect();
+    let failed_samples: Vec<&RequestSample> = samples.iter().filter(|sample| !sample.succeeded).collect();
     VictimStats {
         requests: samples.len(),
-        failures: failed.len(),
+        failures: failed_samples.len(),
         p50_ms: percentile(&all_latencies_ms, 0.50),
         p99_ms: percentile(&all_latencies_ms, 0.99),
         max_ms: all_latencies_ms.last().copied().unwrap_or(0.0),
         event_queries: query_latencies_ms.len(),
         event_query_p99_ms: percentile(&query_latencies_ms, 0.99),
         seconds: started.elapsed().as_secs_f64(),
-        failure_samples: failed.iter().take(10).map(|sample| format!("{}: {}", sample.label, sample.detail)).collect(),
+        failure_samples: failed_samples
+            .iter()
+            .take(10)
+            .map(|sample| format!("{}: {}", sample.label, sample.detail))
+            .collect(),
     }
 }
 

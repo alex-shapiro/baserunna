@@ -1,7 +1,7 @@
 # Isolation baseline: `main` at `df5196d`
 
 `main` passes 1 of 8 workloads. Exhausted memory causes the kernel to stop the
-node in 5 attacks. Victim p99 latency increases by 14x to 51x in 2 attacks.
+node in 5 attacks. Victim p99 latency is 14x to 51x higher in 2 attacks.
 
 ## Setup
 

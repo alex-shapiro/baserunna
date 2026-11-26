@@ -3,8 +3,7 @@
 //! `BlobBody` in `api/body.rs` streams blob values chunk by chunk.
 //! For each chunk, `read_chunk` in `engine/blob.rs` fetches the chunk from object storage and
 //! buffers it in memory until the client reads it.
-//! Because the node does not limit concurrent chunk buffers, each active download uses an extra
-//! `blob_chunk_size` buffer in memory.
+//! The node buffers a `blob_chunk_size` chunk in memory for each active download.
 
 use super::{AttackContext, AttackOutcome, Round, Variant, Workload};
 use bytes::Bytes;
@@ -13,7 +12,7 @@ use reqwest::Method;
 use serde_json::{Value as Json, json};
 use std::time::{Duration, Instant};
 
-/// Blob size of three 8 MiB chunks, small enough to upload in a single 32 MiB PUT request.
+/// Three 8 MiB chunks. Fits inside a 32 MiB PUT request.
 const BLOB_BYTES: usize = 24 << 20;
 /// Concurrent attack clients. Together they buffer up to 1 GiB of 8 MiB chunks.
 const ATTACK_CLIENTS: usize = 128;

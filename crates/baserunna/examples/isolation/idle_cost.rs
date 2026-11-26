@@ -1,8 +1,8 @@
 //! Idle resource cost benchmark for 1,000 inactive owners.
 //!
-//! Creates 1,000 owners with a database each.
+//! Creates 1,000 owners, each with a database.
 //! Runs a read and a write on each database.
-//! Then measures cgroup memory, CPU, and process counts over a 30-second idle window.
+//! Measures cgroup memory, CPU, and process counts over a 30-second idle window.
 
 use crate::cgroup::{MemorySampler, NodeCgroup};
 use crate::http::NodeApi;
@@ -21,8 +21,8 @@ const MIB: f64 = (1 << 20) as f64;
 /// Runs the idle resource benchmark for 1,000 inactive owners and returns cgroup measurements.
 pub async fn run(api: &NodeApi, cgroup: &NodeCgroup) -> Result<Json, String> {
     let memory_before_setup_bytes = cgroup.memory_current_bytes();
-    let started = Instant::now();
-    let results: Vec<Result<(String, String), String>> = stream::iter(0..OWNER_COUNT)
+    let setup_started = Instant::now();
+    let owner_results: Vec<Result<(String, String), String>> = stream::iter(0..OWNER_COUNT)
         .map(|owner_index| async move {
             let owner = api.create_owner(&format!("idle{owner_index}@iso.test"), &format!("i{owner_index}")).await?;
             let path = format!("/v1/dbs/{}/kv/k0", owner.db);
@@ -32,12 +32,12 @@ pub async fn run(api: &NodeApi, cgroup: &NodeCgroup) -> Result<Json, String> {
         .buffer_unordered(SETUP_CONCURRENCY)
         .collect()
         .await;
-    let owners = results.into_iter().collect::<Result<Vec<_>, String>>()?;
-    let setup_s = started.elapsed().as_secs_f64();
+    let owners = owner_results.into_iter().collect::<Result<Vec<_>, String>>()?;
+    let setup_s = setup_started.elapsed().as_secs_f64();
     let memory_after_create_bytes = cgroup.memory_current_bytes();
 
     let touch_started = Instant::now();
-    let touches: Vec<Result<(), String>> = stream::iter(&owners)
+    let touch_results: Vec<Result<(), String>> = stream::iter(&owners)
         .map(|(token, path)| async move {
             api.send_expect(Method::GET, path, token, Bytes::new(), &[200]).await?;
             api.send_expect(Method::PUT, path, token, Bytes::from_static(b"value-01"), &[200]).await.map(|_| ())
@@ -45,11 +45,11 @@ pub async fn run(api: &NodeApi, cgroup: &NodeCgroup) -> Result<Json, String> {
         .buffer_unordered(SETUP_CONCURRENCY)
         .collect()
         .await;
-    touches.into_iter().collect::<Result<(), String>>()?;
+    touch_results.into_iter().collect::<Result<(), String>>()?;
     let touch_s = touch_started.elapsed().as_secs_f64();
 
     let memory_after_setup_bytes = cgroup.memory_current_bytes();
-    let counts_start = cgroup.subtree_counts();
+    let subtree_counts_start = cgroup.subtree_counts();
     let cpu_usec_start = cgroup.cpu_usage_usec();
     let sampler = MemorySampler::start_every(cgroup.clone(), SAMPLE_INTERVAL);
     let idle_started = Instant::now();
@@ -57,7 +57,7 @@ pub async fn run(api: &NodeApi, cgroup: &NodeCgroup) -> Result<Json, String> {
     let idle_s = idle_started.elapsed().as_secs_f64();
     let cpu_usec_end = cgroup.cpu_usage_usec();
     let memory = sampler.finish();
-    let counts_end = cgroup.subtree_counts();
+    let subtree_counts_end = cgroup.subtree_counts();
     let memory_end_bytes = cgroup.memory_current_bytes();
     let idle_cpu_usec = match (cpu_usec_start, cpu_usec_end) {
         (Some(before), Some(after)) => Some(after.saturating_sub(before)),
@@ -69,8 +69,8 @@ pub async fn run(api: &NodeApi, cgroup: &NodeCgroup) -> Result<Json, String> {
         "memory_after_setup_mib": bytes_to_mib(memory_after_setup_bytes),
         "memory_idle_end_mib": bytes_to_mib(memory_end_bytes),
         "idle_cpu_usec_per_s": idle_cpu_usec.map(|cpu| cpu as f64 / idle_s),
-        "processes_idle_start": counts_start.processes,
-        "processes_idle_end": counts_end.processes,
+        "processes_idle_start": subtree_counts_start.processes,
+        "processes_idle_end": subtree_counts_end.processes,
     });
     eprintln!("idle_cost: {summary}");
     Ok(json!({
@@ -83,7 +83,7 @@ pub async fn run(api: &NodeApi, cgroup: &NodeCgroup) -> Result<Json, String> {
         "memory_idle_end_bytes": memory_end_bytes,
         "idle_memory": memory,
         "idle_cpu_usage_usec": idle_cpu_usec,
-        "subtree_idle_start": counts_start,
-        "subtree_idle_end": counts_end,
+        "subtree_idle_start": subtree_counts_start,
+        "subtree_idle_end": subtree_counts_end,
     }))
 }

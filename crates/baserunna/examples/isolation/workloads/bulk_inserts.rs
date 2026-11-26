@@ -5,7 +5,7 @@
 //! - User event rows: 30 MiB. On `main`, the node used about 20 bytes of memory per body byte.
 //!
 //! The small variant sends a smaller insert for each shape. A healthy node must accept it.
-//! Setup also runs a 256 KiB probe per shape to record memory amplification.
+//! `prepare` also runs a 256 KiB probe for each shape to measure memory amplification.
 
 use super::{AttackContext, AttackOutcome, Round, Variant, Workload, concurrent_posts};
 use crate::cgroup::MemorySampler;

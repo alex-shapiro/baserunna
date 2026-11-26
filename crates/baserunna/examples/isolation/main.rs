@@ -12,10 +12,10 @@
 //! isolation --node ... --cgroup ... --workload idle_cost --out result.json
 //! ```
 //!
-//! Each isolation run records idle node memory before setup. It then runs three phases:
-//! - Phase A runs the victim alone.
-//! - Phase B runs the attacker alone and samples cgroup memory every 10 ms.
-//! - Phase C runs the attacker and victim together.
+//! Before setup, the harness records idle node memory. Next, the harness runs three phases:
+//! - Phase A: victim workload alone.
+//! - Phase B: attacker workload alone, with cgroup memory sampled every 10 ms.
+//! - Phase C: attacker and victim workloads together.
 //!
 //! The output JSON contains all measurements and pass-criterion verdicts.
 
@@ -134,22 +134,26 @@ fn is_zombie(pid: u32) -> bool {
 }
 
 fn attack_summary(outcome: &AttackOutcome, deadline: Duration) -> Json {
-    let dropped: Vec<&RequestRecord> = outcome.requests.iter().filter(|record| record.status.is_none()).collect();
-    let rejected: Vec<&RequestRecord> = outcome
+    let dropped_requests: Vec<&RequestRecord> =
+        outcome.requests.iter().filter(|record| record.status.is_none()).collect();
+    let rejected_requests: Vec<&RequestRecord> = outcome
         .requests
         .iter()
         .filter(|record| record.status.is_some_and(|code| code >= 400) && !record.expected)
         .collect();
-    let late: Vec<&RequestRecord> =
-        rejected.iter().copied().filter(|record| record.elapsed_ms > 2.0 * deadline.as_secs_f64() * 1000.0).collect();
+    let late_rejections: Vec<&RequestRecord> = rejected_requests
+        .iter()
+        .copied()
+        .filter(|record| record.elapsed_ms > 2.0 * deadline.as_secs_f64() * 1000.0)
+        .collect();
     json!({
         "requests": outcome.requests,
         "completed": outcome.completed,
         "notes": outcome.notes,
         "expected_responses": outcome.requests.iter().filter(|record| record.expected).count(),
-        "rejections": rejected.len(),
-        "late_rejections": late.len(),
-        "dropped_connections": dropped.len(),
+        "rejections": rejected_requests.len(),
+        "late_rejections": late_rejections.len(),
+        "dropped_connections": dropped_requests.len(),
         "unexpected_success_statuses": outcome.requests.iter().filter(|record| !record.expected && record.status.is_some_and(|code| code < 400)).count(),
     })
 }
@@ -215,49 +219,49 @@ async fn run(cli: &CliArgs, monitor: &NodeMonitor, report: &mut Json) -> Result<
         return Err("node stopped during setup".into());
     }
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let victim_task = tokio::spawn(victim::run(api.clone(), victim_owner.clone(), stop.clone(), cli.victim_rps));
+    let stop_victim = Arc::new(AtomicBool::new(false));
+    let victim_task = tokio::spawn(victim::run(api.clone(), victim_owner.clone(), stop_victim.clone(), cli.victim_rps));
     tokio::time::sleep(cli.victim_alone_duration).await;
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    stop_victim.store(true, std::sync::atomic::Ordering::Relaxed);
     let victim_alone = victim_task.await.map_err(|err| err.to_string())?;
     report["phase_a_victim_alone"] = json!(victim_alone);
 
     let sampler = MemorySampler::start(cli.cgroup.clone());
     let phase_b_started = Instant::now();
     let phase_b_result = workload.attack(&ctx, Round::Alone).await;
-    let memory = sampler.finish();
+    let phase_b_memory = sampler.finish();
     let phase_b_outcome = phase_b_result?;
     report["phase_b_attacker_alone"] = json!({
         "seconds": phase_b_started.elapsed().as_secs_f64(),
-        "memory": memory,
+        "memory": phase_b_memory,
         "attack": attack_summary(&phase_b_outcome, cli.request_deadline),
     });
 
     let mut phase_c_outcome = None;
     let mut victim_during_attack = None;
     if monitor.is_alive() && monitor.new_oom_kills() == 0 {
-        let stop = Arc::new(AtomicBool::new(false));
-        let victim_task = tokio::spawn(victim::run(api.clone(), victim_owner, stop.clone(), cli.victim_rps));
+        let stop_victim = Arc::new(AtomicBool::new(false));
+        let victim_task = tokio::spawn(victim::run(api.clone(), victim_owner, stop_victim.clone(), cli.victim_rps));
         let sampler = MemorySampler::start(cli.cgroup.clone());
         let phase_c_started = Instant::now();
         let phase_c_result = workload.attack(&ctx, Round::WithVictim).await;
         // Run the victim for at least 2 seconds so short attacks produce enough latency samples.
         tokio::time::sleep(Duration::from_secs(2).saturating_sub(phase_c_started.elapsed())).await;
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        stop_victim.store(true, std::sync::atomic::Ordering::Relaxed);
         let victim_stats = victim_task.await.map_err(|err| err.to_string())?;
-        let memory = sampler.finish();
-        let attack = phase_c_result?;
+        let phase_c_memory = sampler.finish();
+        let phase_c_attack = phase_c_result?;
         report["phase_c_attack_with_victim"] = json!({
             "seconds": phase_c_started.elapsed().as_secs_f64(),
-            "memory": memory,
+            "memory": phase_c_memory,
             "victim": victim_stats,
-            "attack": attack_summary(&attack, cli.request_deadline),
+            "attack": attack_summary(&phase_c_attack, cli.request_deadline),
         });
-        phase_c_outcome = Some(attack);
+        phase_c_outcome = Some(phase_c_attack);
         victim_during_attack = Some(victim_stats);
     }
     report["phase_b_growth_from_idle_mib"] =
-        json!(memory.peak_bytes.saturating_sub(idle_node_bytes) as f64 / MIB as f64);
+        json!(phase_b_memory.peak_bytes.saturating_sub(idle_node_bytes) as f64 / MIB as f64);
     report["conditions"] = evaluate_criteria(
         monitor,
         Some(&victim_alone),

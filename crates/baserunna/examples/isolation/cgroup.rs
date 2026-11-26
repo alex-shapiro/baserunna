@@ -19,7 +19,7 @@ impl NodeCgroup {
         self.read_file("memory.current")?.trim().parse().ok()
     }
 
-    /// Reads the integer value for `key` from a flat keyed cgroup file.
+    /// Reads the integer value for `key` from a `key value` cgroup file.
     fn read_keyed_u64(&self, file_name: &str, key: &str) -> Option<u64> {
         self.read_file(file_name)?
             .lines()

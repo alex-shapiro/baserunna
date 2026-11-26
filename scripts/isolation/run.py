@@ -5,7 +5,7 @@ Usage: python3 -I run.py <workload> <small|attack|-> <out.json> [node binary] [c
 Run this script inside a Linux VM with cgroup v2 and sudo access.
 We recorded baselines on a VM with 4 vCPUs and 8 GiB of memory.
 Do not compare results across VMs of different sizes.
-Each output file records the VM vCPU count, memory, and kernel version.
+The script writes the VM vCPU count, memory, and kernel version to each output file.
 
 Environment variables:
 - ISOLATION_TARGET_DIR: Cargo build directory. Default: $HOME/target-isolation.
@@ -123,7 +123,7 @@ def create_node_cgroup(cgroup_root, node_cgroup):
     (node_cgroup / "cgroup.subtree_control").write_text(CONTROLLERS)
 
 
-# Wait for a start byte on the pipe in argv[1]. Then exec the node binary.
+# Wait for a start byte on the pipe in argv[1], then run os.execv on the node binary.
 # If the parent exits early, os.read returns an empty byte string and the wrapper exits.
 WAIT_THEN_EXEC = """
 import os, sys
@@ -237,8 +237,8 @@ def main():
     if cgroup_root.exists():
         sys.exit(f"{cgroup_root} exists; another run is active or did not clean up")
     # Convert termination signals into normal exit so the finally block runs teardown.
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        signal.signal(sig, lambda *_: sys.exit(143))
+    for term_signal in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(term_signal, lambda *_: sys.exit(143))
 
     # Record other running nodes or Cargo builds in the VM without stopping them.
     busy_processes = subprocess.run(
@@ -294,7 +294,9 @@ def main():
         node_exit = None if node.poll() is None else exit_status(node.returncode)
         # Count only OOM kills in the `main` leaf as node crashes.
         # The kernel uses OOM kills in worker cgroups to stop tenant work.
-        oom_kills = keyed_value(node_cgroup / "main/memory.events.local", "oom_kill")
+        node_oom_kills = keyed_value(
+            node_cgroup / "main/memory.events.local", "oom_kill"
+        )
         subtree_oom_kills = keyed_value(node_cgroup / "memory.events", "oom_kill")
         try:
             peak_memory_bytes = int((node_cgroup / "memory.peak").read_text())
@@ -307,11 +309,11 @@ def main():
             result["vm"] = vm
             result["vm_busy"] = bool(busy_processes)
             result["vm_busy_processes"] = busy_processes
-            node_stopped = node_exit is not None or oom_kills > 0
+            node_stopped = node_exit is not None or node_oom_kills > 0
             result["run"] = {
                 "node_binary": str(node_bin),
                 "node_exit_status": node_exit,
-                "node_oom_kills": oom_kills,
+                "node_oom_kills": node_oom_kills,
                 "subtree_oom_kills": subtree_oom_kills,
                 "cgroup_memory_peak_bytes": peak_memory_bytes,
                 "memory_stat_end_bytes": memory_stat(node_cgroup),

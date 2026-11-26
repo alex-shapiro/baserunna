@@ -1,10 +1,10 @@
 //! Distinct-count query over a 60 KB string column.
 //!
-//! The attack variant inserts 8 days with 8 bulk inserts per day and queries all 8 days.
-//! The small variant inserts 1 day with 1 bulk insert of 500 rows, totaling 30 MB of strings.
+//! The attack variant loads 8 days with 8 bulk inserts per day, then queries all 8 days.
+//! The small variant loads 1 day with 1 bulk insert of 500 rows, or 30 MB of strings.
 //! On `main`, a full 8-insert day exceeds the 256 MiB node memory budget, so the node returns
 //! HTTP 413.
-//! Using 1 insert keeps the small variant within the budget so a healthy node completes it.
+//! A single bulk insert fits within that budget, so a healthy node completes the small variant.
 
 use super::{AttackContext, AttackOutcome, Round, Variant, Workload, concurrent_posts};
 use bytes::Bytes;

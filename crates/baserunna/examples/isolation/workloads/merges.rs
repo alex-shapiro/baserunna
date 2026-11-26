@@ -1,7 +1,7 @@
 //! Concurrent event part merges across 1 or 16 tables of 500,000 rows each.
 //!
-//! Setup populates 7 parts in each table.
-//! The attack inserts a single row per table to create an 8th part and trigger all merges together.
+//! `prepare` creates 7 parts in each table.
+//! Each attack round inserts 1 row per table to create an 8th part and start all merges at once.
 //! The harness stops the round after the node merges every table to 1 part, or after
 //! [`MERGE_TIMEOUT`].
 
@@ -44,8 +44,8 @@ impl Workload for Merges {
             let (api, token, db) = (&ctx.api, &ctx.attacker.token, db_name(round));
             api.create_db(token, &db).await?;
             let table_count = table_count(ctx.variant);
-            for i in 0..table_count {
-                let table = json!({"name": format!("ev{i}"), "columns": [{"name": "t", "type": "time"},
+            for table_index in 0..table_count {
+                let table = json!({"name": format!("ev{table_index}"), "columns": [{"name": "t", "type": "time"},
                     {"name": "u", "type": "string"}, {"name": "e", "type": "string"}], "time_column": "t", "order_by": ["t"]});
                 api.create_event_table(token, &db, table).await?;
             }
@@ -76,8 +76,8 @@ impl Workload for Merges {
                 }
             }
             let mut parts = Vec::new();
-            for i in 0..table_count {
-                parts.push(api.part_count(token, &db, &format!("ev{i}")).await?);
+            for table_index in 0..table_count {
+                parts.push(api.part_count(token, &db, &format!("ev{table_index}")).await?);
             }
             Ok(json!({"db": db, "tables": table_count, "rows_per_table": ROWS_PER_TABLE, "parts_per_table": parts,
                 "setup_s": started.elapsed().as_secs_f64()}))
@@ -89,9 +89,9 @@ impl Workload for Merges {
             let started = Instant::now();
             let (db, table_count) = (db_name(round), table_count(ctx.variant));
             let triggers = (0..table_count)
-                .map(|i| {
-                    let path = format!("/v1/dbs/{db}/events/ev{i}/rows");
-                    (format!("trigger ev{i}"), path, Bytes::from(format!("[{}]", format_event_row(i))))
+                .map(|table_index| {
+                    let path = format!("/v1/dbs/{db}/events/ev{table_index}/rows");
+                    (format!("trigger ev{table_index}"), path, Bytes::from(format!("[{}]", format_event_row(table_index))))
                 })
                 .collect();
             let requests = concurrent_posts(ctx, triggers, &[201]).await;

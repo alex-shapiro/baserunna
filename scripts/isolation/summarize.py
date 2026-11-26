@@ -3,8 +3,8 @@
 Usage: python3 -I summarize.py <results dir>
 
 A workload passes only if every run of its small and attack variants passes.
-For each failed run, the table lists the failed criteria numbers.
-For cost benchmarks, the summary prints key metrics.
+This script prints the failed criterion numbers for each failed run.
+This script also prints key metrics for each cost benchmark.
 """
 
 import json

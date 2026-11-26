@@ -4,7 +4,7 @@
 //! scans `MAX_EXAMINED_PER_QUERY` rows.
 //! It also reloads and decodes each scanned row by primary key.
 //! The per-user rate limit counts requests instead of scanned rows.
-//! Concurrent queries drive high node CPU use.
+//! Concurrent queries cause high node CPU use.
 
 use super::{AttackContext, AttackOutcome, Round, Variant, Workload};
 use bytes::Bytes;

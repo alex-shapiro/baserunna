@@ -7,7 +7,7 @@ Stop other nodes and builds in the VM. Keep the host Mac awake.
 If you omit workloads, this script runs all isolation workloads and all cost benchmarks.
 This script runs both the small and attack variants of each isolation workload.
 Set $REPS to change the repeat count per workload. The default is 2.
-Use summarize.py to format the saved results directory.
+Run summarize.py to format the saved results.
 """
 
 import json

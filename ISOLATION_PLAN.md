@@ -96,8 +96,8 @@ A workload passes if it meets all five criteria:
 - [ ] Model tenant memory limits in the simulator. Add a counting allocator to
       simulation builds. Charge each allocation to the tenant that owns the
       allocating task. Give each tenant a memory limit. If a tenant exceeds its
-      limit, stop all work for that tenant to match how the kernel stops a
-      worker. This PR removes the `TODO.md` item "Check memory estimates against
+      limit, stop all work for that tenant. This behavior matches how the kernel
+      stops a worker. This PR removes the `TODO.md` item "Check memory estimates against
       the real heap in simulation".
 - [ ] Port the isolation workloads to simulator scenarios. Each scenario checks
       criteria 1, 2, 4, and 5 with faults. Record the baseline result for each

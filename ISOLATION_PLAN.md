@@ -123,9 +123,10 @@ scale, not isolation.
 
 - [x] Set a length limit on every field in a metadata command, including the
       Google `sub` field.
-- [ ] Test that every metadata command reads and writes at most a fixed number
-      of rows and bytes. Multi-row deletes already run in batches of `PAGE_MAX`
-      rows.
+- [x] Test that every metadata command reads and writes at most a fixed number
+      of rows and bytes. Session and API key deletes run in batches of
+      `PAGE_MAX` rows. `delete_user` and `delete_org` run in one transaction.
+      The per-owner limits set their maximum cost.
 - [ ] Add a fair queue to the lease holder for the system database before it
       runs each command. Queue authenticated requests by account and
       unauthenticated requests by client IP address.

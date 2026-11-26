@@ -226,7 +226,7 @@ pub const REAP_INTERVAL_MS: u64 = 60_000;
 
 const REAPER_KEY: &str = "reaper";
 
-const META_BATCH: usize = 500;
+pub(crate) const META_BATCH: usize = 500;
 
 tokio::task_local! {
     static REQUEST_DEADLINE: Deadline;

@@ -8,12 +8,12 @@ use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-fn rt() -> tokio::runtime::Runtime {
+pub(super) fn rt() -> tokio::runtime::Runtime {
     baserunna_util::probe::record();
     tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap()
 }
 
-fn engine(seed: u64, cfg: EngineConfig) -> (Arc<Engine>, Arc<MemStore>, Arc<Env>) {
+pub(super) fn engine(seed: u64, cfg: EngineConfig) -> (Arc<Engine>, Arc<MemStore>, Arc<Env>) {
     let env = Arc::new(Env::sim(seed, 1_700_000_000_000, tokio::time::Instant::now(), 0));
     let clock_env = env.clone();
     let store = Arc::new(MemStore::new(Box::new(move || clock_env.now_ms())));
@@ -37,7 +37,7 @@ async fn read(db: &Arc<Db>) -> Txn {
     db.begin(Isolation::Serializable, baserunna_storage::engine::Consistency::Strong).await.unwrap()
 }
 
-fn signup(id: &str, email: &str, policy: SignupPolicy) -> MetaCmd {
+pub(super) fn signup(id: &str, email: &str, policy: SignupPolicy) -> MetaCmd {
     MetaCmd::Signup {
         id: id.into(),
         email: email.into(),
@@ -47,7 +47,7 @@ fn signup(id: &str, email: &str, policy: SignupPolicy) -> MetaCmd {
     }
 }
 
-fn session(hash: &str, user: &str, expires_at: i64) -> MetaCmd {
+pub(super) fn session(hash: &str, user: &str, expires_at: i64) -> MetaCmd {
     MetaCmd::CreateSession {
         token_hash: hash.into(),
         id: format!("id-{hash}"),

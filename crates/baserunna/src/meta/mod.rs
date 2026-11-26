@@ -5,6 +5,8 @@
 //! (except [`MetaCmd::DeleteDb`], which the caller authorizes before marking
 //! storage deleted). Reads are snapshot reads that any node can serve.
 
+#[cfg(test)]
+mod cost_tests;
 mod org;
 #[cfg(test)]
 mod tests;

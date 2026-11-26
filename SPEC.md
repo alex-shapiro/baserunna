@@ -1137,7 +1137,6 @@ The client address in a session must parse as an IP address. If a trusted
 proxy sends an entry in `X-Forwarded-For` that is not an IP address, the node
 uses the peer address.
 
-Each metadata command reads and writes at most a fixed number of entries.
 Metadata commands do not scan rows that a tenant can add without a limit.
 A multi-row delete command removes at most `PAGE_MAX` rows per call. The node
 repeats the command until it removes all target rows. This rule applies to
@@ -1226,8 +1225,9 @@ recreate a purged database.
   deletes the user row. The node marks each removed database manifest as
   deleted. It purges that storage later, as in `DELETE /v1/dbs/{db}`. The node
   rejects deletion for the last enabled administrator and for the only owner of
-  an organization. Each transaction checks these rules again. The caller's
-  session stays valid until the final batch. If a node stops during deletion,
+  an organization. Each transaction checks these rules again. If the user has
+  fewer than `PAGE_MAX` sessions, the caller's session stays valid until the
+  final batch. If a node stops during deletion,
   the user can retry with that session.
 
   Administrators disable and re-enable accounts.

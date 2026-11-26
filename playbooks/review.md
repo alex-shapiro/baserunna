@@ -25,7 +25,12 @@ Run each reviewer in a sub-agent to keep the reviewer independent from the fixer
 - the base branch
 - the list of findings that you rejected in earlier rounds, with the reason for each rejection
 
-Run the design reviewer on every branch. Also run the correctness reviewer if the branch changes data storage, reads, commits, or deletes. Run it if the branch can affect a goal in section 1 of `SPEC.md`. Run both reviewers in parallel.
+Run the design reviewer on every branch. Also run the correctness reviewer if the branch does either of these things:
+
+- changes data storage, reads, commits, or deletes
+- can affect a goal in section 1 of `SPEC.md`
+
+Run both reviewers in parallel.
 
 Reviewers do not report names, comment wording, or style. You fix those issues during the copy edit step.
 
@@ -44,7 +49,7 @@ checks for bugs. Answer these questions, in this order:
 2. Does the branch solve the problem in BRIEF.md for a real user? What will
    surprise a user?
 3. Would an expert choose this design if they started from nothing? If a
-   better design exists, describe it and say what it would delete.
+   better design exists, describe it and state what you can delete.
 4. Is the cost in proportion to the value? Consider new concepts, options,
    failure modes, and lines of code.
 5. What can we delete from the branch without harming users?
@@ -80,7 +85,8 @@ behavior that causes wrong results, lost data, or stuck operations. Include
 faults in the object store. The rest of SPEC.md and the existing tests
 describe the current design and can be wrong. A difference between the code
 and SPEC.md is a bug only if it harms a user. Ignore unreachable issues,
-missing defensive checks, and missing tests for unused behavior.
+missing defensive checks, and missing tests for behavior that users do not
+rely on.
 
 Prove each bug. A proof is a failing test, a failing simulation seed, or an
 exact sequence of events with file:line for each step. Each proof must

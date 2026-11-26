@@ -25,7 +25,7 @@ After the rewrite, all pieces of writing and all symbols must comply with AST-ST
 
 Run in a loop, optionally with sub-agents. Each loop iteration must perform the full task above across the whole branch. Commit and push after each loop iteration, with a message that future iterations can use. Loop break condition: at the end of each iteration, determine whether more than 5% of the branch's writing changed. If ≤5%, or after five iterations, break.
 
-After the final iteration, format and lint the code. Run the tests and fix all failures. Check whether a PR exists. If a PR does not exist, create a PR. If a PR exists, rewrite its title and description to match previous commits on `main`. Write the PR in AST-STE100 English. Explain the core concepts briefly instead of listing facts. If `BRIEF.md` exists, start the description with its problem and design decision. Then delete `BRIEF.md`, commit, and push.
+After the final iteration, format and lint the code. Run the tests and fix all failures. Check whether a PR exists. If a PR does not exist, create a PR. If a PR exists, rewrite its title and description to match previous commits on `main`. Write the PR in AST-STE100 English. Explain the core concepts briefly. Do not write long lists of facts. If `BRIEF.md` exists, start the description with the problem and design decision from `BRIEF.md`. Then delete `BRIEF.md`, commit, and push.
 
 ## LLMish Examples
 

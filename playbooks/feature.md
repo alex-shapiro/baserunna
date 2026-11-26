@@ -28,7 +28,7 @@ Show the brief to the user. Stop and wait for the user if the verdict is not "bu
 List approaches that use different designs. Treat different constants for the same approach as a single candidate. Always consider these approaches:
 
 - Do less, or do nothing.
-- Change the interface or the spec instead of the implementation.
+- Change the interface or the specification instead of the implementation.
 - Delete a mechanism instead of adding a new mechanism.
 - Move the problem to a different layer: the client, the store, or the operating system.
 - Use the standard design from the best comparable system.
@@ -41,11 +41,11 @@ Judge each approach with these questions, in this order:
 4. Would an expert in the field call it the standard design? If not, what makes ours better?
 5. How does it fail? What does the user see if it fails?
 
-Decide by argument if you can settle the choice by reasoning. Write your argument in `BRIEF.md`.
+If you can settle the choice by reasoning, decide without a contest. Write your argument in `BRIEF.md`.
 
 ### Contests
 
-Run a contest only if the choice depends on a question that requires measurement. Examples are speed, memory use, and behavior under faults. Each contest criterion must match a property that users care about in `BRIEF.md`. Set each cost limit as an absolute amount that a user notices, such as "adds at most 1 ms to a read". Do not use a percentage. A percentage of a small number can look large. For example, 0.09 ms to 0.14 ms is 54% slower, but users cannot notice 0.05 ms.
+Run a contest only if the choice depends on a question that requires measurement. Examples are speed, memory use, and behavior under faults. Base each contest criterion on a user need in `BRIEF.md`. Set each cost limit as an absolute amount that a user notices, such as "adds at most 1 ms to a read". Do not use a percentage. A percentage of a small number can look large. For example, 0.09 ms to 0.14 ms is 54% slower, but users cannot notice 0.05 ms.
 
 A contest is fair if every candidate can win:
 
@@ -60,18 +60,18 @@ Use the winner and continue. In the commit message, record the criteria, the res
 Back every correctness claim with a realistic test. Write realistic tests that follow two rules:
 
 - **Real inputs.** Use only client requests and production faults. Explain how each fault can happen in production.
-- **Real states.** Reach each state through a sequence of real inputs. Do not construct state by hand, set internal fields, or call internal functions with impossible arguments.
+- **Real states.** Reach each state through a sequence of real inputs. Do not construct state by hand, set internal fields, or call internal functions with arguments that the system never passes.
 
-An unrealistic test can help you debug. It does not prove that a bug exists or that a fix matters. If you cannot trigger a failure with a realistic test, do not fix it. Report the failure as unproven.
+An unrealistic test can help you debug. It does not prove that a bug exists or that a fix matters. If you cannot trigger a failure with a realistic test, do not fix the failure. Report the failure as unproven.
 
 Use property, fuzz, simulation, or load tests where they fit. Improve the test infrastructure if necessary.
 
 Keep the change in proportion to its value:
 
-- Stop if the diff exceeds twice the size estimate in `BRIEF.md`. Decide whether the design is wrong before you continue. Record your answer in `BRIEF.md`.
+- Stop if the diff is more than twice the size estimate in `BRIEF.md`. Decide whether the design is wrong before you continue. Record your answer in `BRIEF.md`.
 - If you keep finding bugs in a mechanism, ask whether to delete the mechanism before you add another fix.
 
-Existing designs, interfaces, and tests describe the current system. See the Requirements section of `AGENTS.md`. If an existing approach limits the result, replace it. Prove with tests that the replacement is better. Replace an existing approach only if the task requires it. Otherwise, add the problem to `TODO.md`.
+Existing designs, interfaces, and tests describe the current system. See the Requirements section of `AGENTS.md`. If an existing approach limits the quality of the result, replace it. Prove with tests that the replacement is better. Make this replacement only if the task requires it. Otherwise, add the problem to `TODO.md`.
 
 Add a problem to `TODO.md` only if a user or operator notices it, or if it breaks a goal in section 1 of `SPEC.md`.
 

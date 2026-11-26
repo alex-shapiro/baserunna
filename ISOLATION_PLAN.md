@@ -168,11 +168,20 @@ process of the server. Milestone 4 chooses the mechanism that separates them.
 
 At this point the only difference between the designs is the boundary.
 
-- [ ] Measure the worker pool and the WebAssembly sandbox with the workers from
-      milestone 3. Known numbers: an empty round trip costs 42% of
-      throughput over a Unix socket, and 7% for a call into a WebAssembly
-      instance (`BENCH_BOUNDARY` on branch `iso/floor`).
+- [ ] Before any measurement, record the result that makes each mechanism win.
+      Use absolute numbers, not percentages. Include these measurements:
+  - CPU time for each request
+  - the latency of a hot read
+  - memory and CPU with 1,000 active owners on a node
+  - the time of each event query in the harness
+  - the results of the harness from milestone 0
+
+  Known numbers: an empty round trip adds 25.6 µs of CPU for each request over
+  a Unix socket, and 2.4 µs for a call into a WebAssembly instance
+  (`BENCH_BOUNDARY` on branch `iso/floor`).
 - [ ] Find the cause of the 81% loss of KV throughput in `iso3/cgroup`.
+- [ ] Measure the worker pool and the WebAssembly sandbox with the workers from
+      milestone 3. Adopt the winner by the recorded rule.
 - [ ] Build the chosen mechanism. It must see every allocation and all CPU use,
       including those of dependencies. A counter in our code cannot. The number
       of PRs depends on the mechanism.

@@ -1363,4 +1363,7 @@ mod tests {
 mod events_tests;
 
 #[cfg(test)]
+mod meta_tests;
+
+#[cfg(test)]
 mod txns_tests;

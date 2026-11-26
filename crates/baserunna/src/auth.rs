@@ -164,6 +164,9 @@ fn jwt_part(s: &str) -> Result<Json> {
     serde_json::from_slice(&b).map_err(|_| Error::Unauthenticated("malformed ID token".into()))
 }
 
+/// Maximum length of an ID token `sub` claim (OpenID Connect Core 1.0 §2).
+pub const OIDC_SUB_MAX: usize = 255;
+
 /// Verifies an RS256 ID token against `jwks`.
 pub fn verify_id_token(token: &str, jwks: &Json, client_id: &str, issuers: &[String], now_ms: u64) -> Result<IdClaims> {
     let unauth = |m: &str| Error::Unauthenticated(format!("ID token rejected: {m}"));
@@ -210,6 +213,9 @@ pub fn verify_id_token(token: &str, jwks: &Json, client_id: &str, issuers: &[Str
         return Err(unauth("issued in the future"));
     }
     let sub = claims["sub"].as_str().ok_or_else(|| unauth("missing sub"))?.to_string();
+    if sub.is_empty() || sub.len() > OIDC_SUB_MAX || !sub.is_ascii() {
+        return Err(unauth(&format!("sub is not 1 to {OIDC_SUB_MAX} ASCII characters")));
+    }
     let email = claims["email"].as_str().ok_or_else(|| unauth("missing email"))?;
     let email_verified = match &claims["email_verified"] {
         Json::Bool(b) => *b,

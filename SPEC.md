@@ -1121,6 +1121,12 @@ keys) check that user's rights inside their own transaction: whether
 the user still exists and is enabled, and their role. Authorization of
 metadata changes is therefore serializable with the changes themselves.
 
+Each text field in a metadata command is at most 1024 bytes
+(`META_FIELD_MAX`). The lease holder rejects a command with a longer field
+with `400 invalid_argument` before it reads any row. This limit applies to
+fields from the client, such as IDs in URL paths, and to fields from other
+sources, such as the Google `sub` claim.
+
 Listings of users, sessions, API keys, organizations, members and
 databases are paginated (`limit`, default 100 and at most 1000, and
 `cursor`): they are table queries, whose cursors only resume inside the
@@ -1166,7 +1172,8 @@ recreate a purged database.
   `GET /v1/auth/google/callback` checks the state, exchanges the code at the
   token endpoint, and verifies the ID token. The checks are the RS256
   signature against Google's JWKS (cached), `iss`, `aud == client_id`, `exp`,
-  and `email_verified`. A user is matched by `google_sub`, then by verified
+  `email_verified`, and a `sub` of 1 to 255 ASCII characters (OpenID Connect
+  Core 1.0 §2). A user is matched by `google_sub`, then by verified
   email, and is created if allowed by the signup policy. Matching by email
   links Google to the existing account only if that account does not have a
   password or has verified its address: otherwise whoever signed up with

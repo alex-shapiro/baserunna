@@ -465,7 +465,19 @@ pub enum MetaCmd {
     },
 }
 
+/// Maximum length in bytes of each text field in a [`MetaCmd`].
+pub const META_FIELD_MAX: usize = 1024;
+
 impl MetaCmd {
+    /// Rejects the command if a text field is longer than [`META_FIELD_MAX`] bytes.
+    fn check_field_lengths(&self) -> Result<()> {
+        let encoded = serde_json::to_value(self).map_err(|e| Error::internal(format!("encoding a command: {e}")))?;
+        match long_field(&encoded, "") {
+            Some(field) => Err(Error::invalid(format!("the field {field:?} is longer than {META_FIELD_MAX} bytes"))),
+            None => Ok(()),
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         match self {
             MetaCmd::Migrate => "migrate",
@@ -495,6 +507,16 @@ impl MetaCmd {
             MetaCmd::SetRole { .. } => "set_role",
             MetaCmd::RemoveMember { .. } => "remove_member",
         }
+    }
+}
+
+/// Returns the name of the first string in `v` longer than [`META_FIELD_MAX`] bytes.
+fn long_field<'a>(v: &'a Json, field: &'a str) -> Option<&'a str> {
+    match v {
+        Json::String(s) => (s.len() > META_FIELD_MAX).then_some(field),
+        Json::Object(fields) => fields.iter().find_map(|(name, v)| long_field(v, name)),
+        Json::Array(items) => items.iter().find_map(|v| long_field(v, field)),
+        Json::Null | Json::Bool(_) | Json::Number(_) => None,
     }
 }
 
@@ -1095,6 +1117,7 @@ fn answer<T: Serialize>(v: T) -> Result<Json> {
 
 /// Executes `cmd` within `txn` and returns its serialized result.
 pub async fn apply(txn: &mut Txn, blobs: &BlobResolver<'_>, cmd: &MetaCmd, now_ms: i64) -> Result<Json> {
+    cmd.check_field_lengths()?;
     let w = &mut Write { txn, blobs, now_ms };
     match cmd {
         MetaCmd::Migrate => answer(migrate(w).await?),

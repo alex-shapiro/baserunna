@@ -31,6 +31,8 @@ struct Inner {
     faults: VecDeque<(Method, Fault)>,
     requests: BTreeMap<String, usize>,
     writes: u64,
+    max_list_keys: Option<usize>,
+    latency: Option<Duration>,
 }
 
 #[derive(Clone, Default)]
@@ -41,9 +43,17 @@ pub struct FakeS3 {
 
 impl FakeS3 {
     pub async fn start() -> FakeS3 {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        FakeS3::start_on("127.0.0.1:0").await
+    }
+
+    /// Starts a server that listens on `addr`.
+    pub async fn start_on(addr: &str) -> FakeS3 {
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
         let s = FakeS3 { inner: Default::default(), url: format!("http://{}", listener.local_addr().unwrap()) };
-        let app = axum::Router::new().fallback(handle).with_state(s.clone());
+        let app = axum::Router::new()
+            .fallback(handle)
+            .layer(axum::extract::DefaultBodyLimit::disable())
+            .with_state(s.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         s
     }
@@ -60,6 +70,18 @@ impl FakeS3 {
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
+    }
+
+    /// Sets the largest page that a list request returns, which defaults to 3 keys.
+    #[allow(dead_code)]
+    pub fn set_max_list_keys(&self, max: usize) {
+        self.inner.lock().max_list_keys = Some(max);
+    }
+
+    /// Delays every request by `latency`, as a remote object store would.
+    #[allow(dead_code)]
+    pub fn set_latency(&self, latency: Duration) {
+        self.inner.lock().latency = Some(latency);
     }
 
     pub fn inject_fault(&self, method: Method, fault: Fault) {
@@ -159,14 +181,18 @@ fn xml_escape(s: &str) -> String {
 }
 
 async fn handle(State(s): State<FakeS3>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
-    let fault = {
+    let (fault, latency) = {
         let mut g = s.inner.lock();
         *g.requests.entry(method.to_string()).or_default() += 1;
-        match g.faults.iter().position(|(m, _)| *m == method) {
+        let fault = match g.faults.iter().position(|(m, _)| *m == method) {
             Some(i) => g.faults.remove(i).map(|(_, f)| f),
             None => None,
-        }
+        };
+        (fault, g.latency)
     };
+    if let Some(d) = latency {
+        tokio::time::sleep(d).await;
+    }
     match fault {
         Some(Fault::Fail(code)) => return xml_error_response(code, "InjectedFault"),
         Some(Fault::Delay(d)) => tokio::time::sleep(d).await,
@@ -262,7 +288,11 @@ fn delete_objects(g: &mut Inner, body: &[u8]) -> Response {
 fn list(g: &Inner, q: &BTreeMap<String, String>) -> Response {
     let prefix = q.get("prefix").cloned().unwrap_or_default();
     let after = q.get("continuation-token").or(q.get("start-after")).cloned().unwrap_or_default();
-    let max = q.get("max-keys").and_then(|m| m.parse().ok()).unwrap_or(MAX_LIST_KEYS).min(MAX_LIST_KEYS);
+    let max = q
+        .get("max-keys")
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(usize::MAX)
+        .min(g.max_list_keys.unwrap_or(MAX_LIST_KEYS));
     let keys: Vec<(&String, &Obj)> =
         g.objects.range(after.clone()..).filter(|(k, _)| **k > after && k.starts_with(&prefix)).take(max + 1).collect();
     let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult>");

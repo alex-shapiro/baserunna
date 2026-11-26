@@ -661,6 +661,6 @@ only.
       `MetaCmd::CreateApiKey` and `create_key` in `api/account.rs` do not limit
       key counts. Each sign-in also adds a session without a limit. Account
       deletion removes at most `PAGE_MAX` rows per batch. All batches share a
-      single 10 s request deadline. Deleting an account with many keys or
-      sessions can time out with `outcome_unknown: true`. The user must then
-      retry deletion. We have not measured this timeout with a probe test.
+      10 s request deadline. Deleting an account with many keys or sessions can
+      time out with `outcome_unknown: true`. The user must then retry deletion.
+      We have not measured this timeout with a probe test.

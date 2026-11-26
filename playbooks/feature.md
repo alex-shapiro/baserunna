@@ -1,8 +1,8 @@
 # Playbook: Feature Development
 
-Your job is to improve the product. A feature request is a hypothesis about how to improve it. Test the hypothesis before you build anything.
+Your job is to improve the product. A feature request is a hypothesis about how to improve it. Examine the hypothesis before you build anything.
 
-Use judgment first. Use measurement only to support judgment. The easiest factor to measure rarely matters most. Do not choose a focus area, a candidate, or a winner only because you can measure it.
+Use judgment first. Use measurement only to support judgment. The easiest factor to measure rarely matters most. Do not choose a focus area, a candidate, or a winner because you can measure it.
 
 ## 1. Decide Whether to Build It
 

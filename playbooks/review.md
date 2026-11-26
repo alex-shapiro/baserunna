@@ -1,6 +1,6 @@
 # Playbook: Reviewing a Branch
 
-Use a review to decide whether the branch improves the product. Apply only the few changes that matter most. A review requires judgment. A long list of findings shows a poor review.
+Use a review to decide whether the branch improves the product. Apply only the few changes that matter most. A review requires judgment. It is not a search for defects. A long list of findings shows a poor review.
 
 You own every subsystem that the branch touches. Reviewers give advice. You make the decisions.
 

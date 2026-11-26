@@ -67,7 +67,7 @@ on `store` and the shared modules we will put in `baserunna-util`.
 
 Each milestone is a group of PRs. After each milestone, run the isolation
 harness and the isolation simulator scenarios from milestone 0. Record the
-results in the commit message and the PR description.
+results in a new file in `scripts/isolation/results/`.
 
 Start with milestone 0. Milestones 1 to 3 are independent. Start them in any
 order. Milestone 4 depends on milestone 3. Finish with milestone 5.
@@ -90,6 +90,9 @@ A workload passes if it meets all five criteria:
 
 - [x] Move the isolation harness and its pass criteria to `main`. Record the
       baseline result for each workload on `main`.
+- [ ] Run each attack for a fixed time while the victim runs. Today the victim
+      sends only about 470 requests during an attack, so one slow request can
+      fail criterion 3.
 - [ ] Model tenant memory limits in the simulator. Add a counting allocator to
       simulation builds that charges each allocation to the tenant whose task
       makes it. Give each tenant a memory limit. If a tenant exceeds its limit,

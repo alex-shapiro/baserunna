@@ -97,3 +97,16 @@ The table layer accepts an indexed value over 4,160 bytes and then fails the
 commit with a false "corrupt data" error. This problem affects user tables too.
 It is in the storage domain, so this PR does not fix it. `TODO.md` lists it as
 untriaged.
+
+## Result check
+
+- The result solves the problem. The lease holder rejects every text field
+  over 1024 bytes in each metadata command, from any source.
+- I would choose the same design again. The check costs one encode of the
+  command, and the command is at most a few KiB.
+- I cannot delete a part without harm. The `sub` check overlaps the field
+  limit, but it also rejects an empty or non-ASCII `sub`, and it follows the
+  OIDC rule.
+- The diff is 63 lines. The estimate was about 100 lines.
+
+## Review decisions

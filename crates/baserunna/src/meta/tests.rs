@@ -1,14 +1,27 @@
 use super::*;
-use crate::engine::tests::{engine, rt};
-use crate::engine::{Db, EngineConfig, Isolation};
-use crate::util::prop;
-use crate::util::rng::Rng;
+use baserunna_storage::engine::{Db, Engine, EngineConfig, Isolation};
+use baserunna_storage::store::MemStore;
+use baserunna_util::env::Env;
+use baserunna_util::prop;
+use baserunna_util::rng::Rng;
 use serde::de::DeserializeOwned;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+fn rt() -> tokio::runtime::Runtime {
+    baserunna_util::probe::record();
+    tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap()
+}
+
+fn engine(seed: u64, cfg: EngineConfig) -> (Arc<Engine>, Arc<MemStore>, Arc<Env>) {
+    let env = Arc::new(Env::sim(seed, 1_700_000_000_000, tokio::time::Instant::now(), 0));
+    let clock_env = env.clone();
+    let store = Arc::new(MemStore::new(Box::new(move || clock_env.now_ms())));
+    (Engine::new(store.clone(), env.clone(), cfg, "node-a".into()), store, env)
+}
+
 async fn run(db: &Arc<Db>, cmd: &MetaCmd) -> Result<Json> {
-    let mut t = db.begin(Isolation::Serializable, crate::engine::Consistency::Strong).await?;
+    let mut t = db.begin(Isolation::Serializable, baserunna_storage::engine::Consistency::Strong).await?;
     let r = apply(&mut t, &BlobResolver { db }, cmd, 1000).await;
     if r.is_ok() {
         db.commit(t.into_request()).await?;
@@ -21,7 +34,7 @@ async fn run_as<T: DeserializeOwned>(db: &Arc<Db>, cmd: &MetaCmd) -> Result<T> {
 }
 
 async fn read(db: &Arc<Db>) -> Txn {
-    db.begin(Isolation::Serializable, crate::engine::Consistency::Strong).await.unwrap()
+    db.begin(Isolation::Serializable, baserunna_storage::engine::Consistency::Strong).await.unwrap()
 }
 
 fn signup(id: &str, email: &str, policy: SignupPolicy) -> MetaCmd {

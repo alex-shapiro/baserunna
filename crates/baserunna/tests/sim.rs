@@ -3,9 +3,9 @@
 //! reproduce with `SIM_SEED=<seed> cargo test --test sim <name>`, and debug
 //! with `cargo run --release --example sim_tool -- trace <scenario> <seed>`.
 
-use baserunna::probe::{self, Probe};
 use baserunna::sim::workloads::scenario;
 use baserunna::sim::{SimConfig, run, run_seeds};
+use baserunna_util::probe::{self, Probe};
 
 /// Generates a test function per scenario and verifies that all scenarios are covered.
 macro_rules! scenario_tests {
@@ -79,7 +79,7 @@ fn branched_runs_repeat_their_parent_until_the_branch_point() {
 #[test]
 fn sim_is_deterministic() {
     let s = scenario("mix").expect("scenario exists");
-    let seed = baserunna::util::prop::env_u64("SIM_SEED").unwrap_or(4242);
+    let seed = baserunna_util::prop::env_u64("SIM_SEED").unwrap_or(4242);
     let a = run(seed, s.config_for(seed), s.run);
     let b = run(seed, s.config_for(seed), s.run);
     assert!(a.result.is_ok(), "{:?}", a.result);
@@ -341,8 +341,8 @@ fn store_clock_lease_expiry() {
 
 #[test]
 fn request_and_commit_log_timing() {
-    use baserunna::log::{Level, REQUEST_ID_HEADER, capture};
     use baserunna::sim::client::Client;
+    use baserunna_util::log::{Level, REQUEST_ID_HEADER, capture};
     let cap = capture(Level::Info);
     let out = run(22, SimConfig::basic(), |sim| async move {
         let c = Client::signup(&sim, "u", "u@timing.test", "password-123").await?;
@@ -372,8 +372,8 @@ fn request_and_commit_log_timing() {
 
 #[test]
 fn request_ids_follow_forwarded_requests() {
-    use baserunna::log::{Level, REQUEST_ID_HEADER, capture};
     use baserunna::sim::client::Client;
+    use baserunna_util::log::{Level, REQUEST_ID_HEADER, capture};
     let cap = capture(Level::Info);
     let mut cfg = SimConfig::basic();
     cfg.nodes = 2;
@@ -393,12 +393,12 @@ fn request_ids_follow_forwarded_requests() {
             }
             sent.push(rid);
         }
-        let too_long = "x".repeat(baserunna::log::MAX_REQUEST_ID_LEN + 1);
+        let too_long = "x".repeat(baserunna_util::log::MAX_REQUEST_ID_LEN + 1);
         for bad in ["has space", "é", &too_long] {
             let r = c.send("GET", "/v1/me", &[(REQUEST_ID_HEADER, bad.to_string())], "".into()).await;
             let r = r.map_err(|e| format!("{e:?}"))?;
             let echoed = r.headers.get(REQUEST_ID_HEADER).and_then(|v| v.to_str().ok()).unwrap_or_default();
-            if echoed == bad || !baserunna::log::valid_request_id(echoed) {
+            if echoed == bad || !baserunna_util::log::valid_request_id(echoed) {
                 return Err(format!("invalid id {bad:?} echoed as {echoed:?}"));
             }
         }

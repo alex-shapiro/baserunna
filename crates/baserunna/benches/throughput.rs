@@ -22,11 +22,12 @@
 //! | `BENCH_VALUE_BYTES`| 8       | bytes per written value                              |
 //! | `BENCH_TAIL_KB`    | default | manifest tail limit (`tail_max_bytes`) in KiB        |
 
-use baserunna::env::Env;
 use baserunna::node::{Node, Services};
-use baserunna::sim::cost::{MeteredStore, call_router, node_config};
-use baserunna::store::{DynStore, MemStore};
-use baserunna::util::rng::Rng;
+use baserunna::sim::cost::{call_router, node_config};
+use baserunna_storage::store::metered::MeteredStore;
+use baserunna_storage::store::{DynStore, MemStore};
+use baserunna_util::env::Env;
+use baserunna_util::rng::Rng;
 use bytes::Bytes;
 use serde_json::json;
 use std::sync::Arc;
@@ -68,7 +69,7 @@ async fn bench(threads: usize) {
     let latency = env("BENCH_LATENCY_MS", 0);
     let keys = env("BENCH_KEYS", 1).max(1);
     let value_bytes = env("BENCH_VALUE_BYTES", 8) as usize;
-    baserunna::log::set_level(Some(baserunna::log::Level::Error));
+    baserunna_util::log::set_level(Some(baserunna_util::log::Level::Error));
 
     let store = Arc::new(MeteredStore::new(Arc::new(MemStore::with_system_clock()), 0));
     let mut cfg = node_config("bench", "http://127.0.0.1:0");

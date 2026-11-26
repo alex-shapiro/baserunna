@@ -1,7 +1,7 @@
 #![no_main]
 //! Verifies that [`ChangeCursor::decode`] never panics and that
 //! [`ChangeCursor::encode`] round-trips.
-use baserunna::engine::ChangeCursor;
+use baserunna_storage::engine::ChangeCursor;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

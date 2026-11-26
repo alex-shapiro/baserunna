@@ -1,4 +1,5 @@
-use crate::sim::cost::{World, call_router, run_paused};
+use crate::sim::cost::{World, call_router};
+use baserunna_util::run_paused;
 use bytes::Bytes;
 use serde_json::{Value as Json, json};
 use tower::ServiceExt;
@@ -461,7 +462,7 @@ fn queries_of_many_expressions_stop_near_their_time_limit() {
         let rows: Vec<Json> = (0..40_000).map(|i| json!({"event": "a", "time": 1000 + i})).collect();
         let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/rows", &[], &json!(rows).to_string()).await;
         assert_eq!(s, 201, "{r}");
-        let pad = "x".repeat(crate::events::schema::DEFAULT_MAX_BYTES - 2);
+        let pad = "x".repeat(baserunna_storage::events::schema::DEFAULT_MAX_BYTES - 2);
         let col = json!({"name": "pad", "type": "string", "default": pad});
         let (s, r) = send(&w, 0, &t, "POST", "/v1/dbs/d/events/ev/columns", &[], &col.to_string()).await;
         assert_eq!(s, 200, "{r}");

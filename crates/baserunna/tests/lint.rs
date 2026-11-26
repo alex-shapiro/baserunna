@@ -22,37 +22,53 @@ const RULES: &[(&str, &[&str], &str)] = &[
     (
         "tokio::spawn(",
         &[
-            "src/sim/",
-            "src/engine/tests.rs",
-            "src/engine/memory_tests.rs",
-            "src/queries_tests.rs",
-            "src/stream/tests.rs",
-            "src/store/conformance.rs",
-            "../baserunna-client/src/",
+            "baserunna/src/sim/",
+            "baserunna-storage/src/engine/tests.rs",
+            "baserunna-storage/src/engine/memory_tests.rs",
+            "baserunna-storage/src/queries_tests.rs",
+            "baserunna-storage/src/stream/tests.rs",
+            "baserunna-storage/src/store/conformance.rs",
+            "baserunna-client/src/",
         ],
         "spawn tasks through Env so node crashes abort them",
     ),
-    ("SystemTime", &["src/env.rs", "src/store/", "src/main.rs", "src/log.rs"], "read wall time from Env::now_ms"),
+    (
+        "SystemTime",
+        &[
+            "baserunna-util/src/env.rs",
+            "baserunna-storage/src/store/",
+            "baserunna/src/main.rs",
+            "baserunna-util/src/log.rs",
+        ],
+        "read wall time from Env::now_ms",
+    ),
     (
         "std::time::Instant",
-        &["src/auth.rs", "src/sim/campaign.rs", "src/sim/explore.rs"],
+        &["baserunna/src/auth.rs", "baserunna/src/sim/campaign.rs", "baserunna/src/sim/explore.rs"],
         "use tokio::time::Instant for virtual time",
     ),
-    ("aws_lc_rs::rand", &["src/env.rs", "src/store/fs.rs", "src/sim/google.rs"], "obtain randomness from Env"),
+    (
+        "aws_lc_rs::rand",
+        &["baserunna-util/src/env.rs", "baserunna-storage/src/store/fs.rs", "baserunna/src/sim/google.rs"],
+        "obtain randomness from Env",
+    ),
     ("thread_rng", &[], "obtain randomness from Env"),
 ];
 
+/// Library crates whose source the lints check. The client runs inside
+/// simulations, so it follows the same rules.
+const CRATES: &[&str] = &["baserunna", "baserunna-api", "baserunna-client", "baserunna-storage", "baserunna-util"];
+
 #[test]
 fn determinism_and_safety_lints() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
-    // The client runs inside simulations, so it follows the same rules.
-    for dir in ["src", "../baserunna-api/src", "../baserunna-client/src"] {
-        rust_files(&root.join(dir), &mut files);
+    for name in CRATES {
+        rust_files(&crates_dir.join(name).join("src"), &mut files);
     }
     let mut violations = Vec::new();
     for f in files {
-        let rel = f.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+        let rel = f.strip_prefix(&crates_dir).unwrap().to_string_lossy().replace('\\', "/");
         let text = std::fs::read_to_string(&f).unwrap();
         for (n, line) in text.lines().enumerate() {
             let code = line.split("//").next().unwrap_or("");
@@ -68,8 +84,9 @@ fn determinism_and_safety_lints() {
 
 #[test]
 fn forbid_unsafe_is_declared() {
-    for lib in ["src/lib.rs", "../baserunna-api/src/lib.rs", "../baserunna-client/src/lib.rs"] {
-        let text = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(lib)).unwrap();
-        assert!(text.contains("#![forbid(unsafe_code)]"), "{lib} does not forbid unsafe code");
+    let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    for name in CRATES {
+        let text = std::fs::read_to_string(crates_dir.join(name).join("src/lib.rs")).unwrap();
+        assert!(text.contains("#![forbid(unsafe_code)]"), "{name} does not forbid unsafe code");
     }
 }

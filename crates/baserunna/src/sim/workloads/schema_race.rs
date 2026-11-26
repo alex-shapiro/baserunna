@@ -6,7 +6,7 @@
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, Status, ZOMBIE_WAIT_MS};
-use crate::util::rng::Rng;
+use baserunna_util::rng::Rng;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -74,7 +74,7 @@ async fn one_shot(c: &Client, body: Json, rejected: &[(u16, &str)]) -> Result<Ap
 
 /// Queries all rows in writer `w`'s key range to resynchronize its model.
 async fn query_writer_rows(c: &Client, w: i64) -> Result<BTreeMap<i64, Row>, String> {
-    crate::probe::hit(crate::probe::Probe::ModelAdoptedFromDatabase);
+    baserunna_util::probe::hit(baserunna_util::probe::Probe::ModelAdoptedFromDatabase);
     let body = json!({"range": {"gte": w * 100, "lt": w * 100 + 100}, "limit": 1000});
     let r = c.call_retry("POST", &format!("{BASE}/tables/items/rows/query"), Some(body)).await;
     let rows = r.json["rows"].as_array().ok_or(format!("rows of writer {w}: {} {}", r.status, r.json))?;

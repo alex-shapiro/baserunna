@@ -20,7 +20,7 @@
 //! | `LOAD_WARMUP_SECS` | 5                              | warmup duration in seconds before the first step      |
 //! | `LOAD_CLEANUP`     | 0                              | set to `1` to delete the test databases after the run |
 
-use baserunna::util::rng::Rng;
+use baserunna_util::rng::Rng;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};

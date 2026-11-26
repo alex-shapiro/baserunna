@@ -2,11 +2,11 @@
 
 use super::db::{DbList, db_path, db_rows};
 use super::{Flash, Page, Pager, Params, Posted, Session, back, esc, field, page, stay, table, url_seg, when};
-use crate::meta::Role;
 use crate::node::Node;
 use axum::Router;
 use axum::extract::Path;
 use axum::routing::{get, post};
+use baserunna_util::access::Role;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;

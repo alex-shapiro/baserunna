@@ -1,11 +1,11 @@
 //! Simulated Google OpenID Connect provider that signs RS256 ID tokens with a test key.
 
 use crate::auth::OidcProvider;
-use crate::error::{Error, Result};
-use crate::store::BoxFut;
 use aws_lc_rs::rsa::KeyPair;
 use aws_lc_rs::signature::{KeyPair as _, RSA_PKCS1_SHA256, RsaPublicKeyComponents};
 use baserunna_api::b64;
+use baserunna_util::BoxFut;
+use baserunna_util::error::{Error, Result};
 use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;

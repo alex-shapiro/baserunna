@@ -5,10 +5,10 @@ use super::{
     Fields, Flash, Page, Pager, Params, Posted, Session, back, esc, field, format_bytes, format_duration,
     format_timestamp, page, stay, table, url_seg,
 };
-use crate::meta::Role;
 use axum::Router;
 use axum::extract::Path;
 use axum::routing::{get, post};
+use baserunna_util::access::Role;
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
 use std::sync::Arc;
@@ -157,7 +157,7 @@ pub(crate) fn default_query(t: &Json) -> String {
     }
     let newest = t["partitions"].as_array().into_iter().flatten().filter_map(|p| p["end"].as_i64()).max();
     let from = newest.map_or(json!("2000-01-01"), |end| json!(end - 30 * 86_400_000));
-    json!({"from": from, "to": crate::events::schema::TIME_RANGE.end() + 1, "group_by": group_by,
+    json!({"from": from, "to": baserunna_storage::events::schema::TIME_RANGE.end() + 1, "group_by": group_by,
         "aggregates": {count: {"fn": "count"}}, "order_by": [{"col": count, "desc": true}], "limit": 50})
     .to_string()
 }

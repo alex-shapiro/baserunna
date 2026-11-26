@@ -1,8 +1,8 @@
 //! In-memory [`Mailer`] that captures outbound emails in simulation.
 
-use crate::error::Result;
 use crate::mail::{Mail, Mailer};
-use crate::store::BoxFut;
+use baserunna_util::BoxFut;
+use baserunna_util::error::Result;
 use parking_lot::Mutex;
 
 #[derive(Default)]

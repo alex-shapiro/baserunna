@@ -5,10 +5,11 @@
 //! Run `cargo run --release --example cost_model` and `--example amplification`
 //! to print the current numbers.
 
-use baserunna::engine::EngineConfig;
-use baserunna::engine::segment::Compression;
 use baserunna::sim::amp::{self, measure_all as measure_amplification, measure_streams};
-use baserunna::sim::cost::{Counts, measure_all, monthly_cost, profiles};
+use baserunna::sim::cost::{measure_all, monthly_cost, profiles};
+use baserunna_storage::engine::EngineConfig;
+use baserunna_storage::engine::segment::Compression;
+use baserunna_storage::store::metered::Counts;
 
 /// Upper bounds per unit: `(measurement, GET, PUT, LIST, DELETE)`.
 const BUDGETS: &[(&str, f64, f64, f64, f64)] = &[

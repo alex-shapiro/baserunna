@@ -19,6 +19,8 @@ Full design details are in [`SPEC.md`](SPEC.md).
 The repository is a Cargo workspace:
 
 - `crates/baserunna`: server
+- `crates/baserunna-storage`: storage engine and database features: key-value transactions, tables, streams, and event tables
+- `crates/baserunna-util`: support modules that the other crates share: errors, logging, simulation hooks, and codecs
 - `crates/baserunna-api`: HTTP API request and response types
 - `crates/baserunna-client`: typed HTTP client with retries, interactive transactions, and exactly-once writes
 

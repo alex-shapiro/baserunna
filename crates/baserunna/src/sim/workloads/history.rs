@@ -15,7 +15,7 @@
 
 use super::super::Sim;
 use super::super::client::{Client, Status, ZOMBIE_WAIT_MS};
-use crate::util::rng::Rng;
+use baserunna_util::rng::Rng;
 use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;

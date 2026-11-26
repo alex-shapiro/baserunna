@@ -6,30 +6,10 @@
 
 pub mod api;
 pub mod auth;
-pub mod buggify;
-pub mod catalog;
 pub mod cluster;
 pub mod console;
-pub mod engine;
-pub mod env;
-pub mod error;
-pub mod events;
-pub mod filter;
 pub mod limits;
-pub mod log;
 pub mod mail;
 pub mod meta;
-pub mod metrics;
 pub mod node;
-pub mod ops;
-pub mod probe;
-pub mod queries;
 pub mod sim;
-pub mod store;
-pub mod stream;
-pub mod table;
-pub mod timing;
-pub mod txns;
-pub mod util;
-
-pub use error::{Error, Result};

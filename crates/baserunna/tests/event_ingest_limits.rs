@@ -5,8 +5,9 @@
 mod counting_alloc;
 
 use baserunna::node::NodeConfig;
-use baserunna::probe::{self, Probe};
-use baserunna::sim::cost::{Resp, World, call_router, run_paused};
+use baserunna::sim::cost::{Resp, World, call_router};
+use baserunna_util::probe::{self, Probe};
+use baserunna_util::run_paused;
 use bytes::Bytes;
 use counting_alloc::{HEAP_MEASUREMENT_LOCK, allocated_bytes, heap_change_bytes, peak_growth_bytes, reset_peak_bytes};
 use serde_json::{Value as Json, json};
@@ -236,11 +237,11 @@ const BULK_BODY_BYTES: usize = 30 * MIB;
 
 /// Runs `f` on a multi-thread runtime with a real clock.
 fn run_threaded<F: std::future::Future>(f: F) -> F::Output {
-    let level = baserunna::log::level();
-    baserunna::log::set_level(Some(baserunna::log::Level::Error));
+    let level = baserunna_util::log::level();
+    baserunna_util::log::set_level(Some(baserunna_util::log::Level::Error));
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().expect("runtime");
     let out = rt.block_on(f);
-    baserunna::log::set_level(level);
+    baserunna_util::log::set_level(level);
     out
 }
 
@@ -458,8 +459,8 @@ async fn write_all(s: &tokio::net::TcpStream, mut data: &[u8]) {
 #[ignore = "TODO blocker: stream JSON request bodies and charge bulk insert buffers to MemoryGate (body read timeout)"]
 fn stalled_request_body_times_out_over_tcp() {
     let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
-    let level = baserunna::log::level();
-    baserunna::log::set_level(Some(baserunna::log::Level::Error));
+    let level = baserunna_util::log::level();
+    baserunna_util::log::set_level(Some(baserunna_util::log::Level::Error));
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().expect("runtime");
     rt.block_on(async {
         let w = World::with_config(1, 0, production_limits).await;
@@ -523,7 +524,7 @@ fn stalled_request_body_times_out_over_tcp() {
         w.shutdown();
         assert!(answer.is_some(), "a request body that stalled for {STALL:?} over TCP did not time out");
     });
-    baserunna::log::set_level(level);
+    baserunna_util::log::set_level(level);
 }
 
 /// Start of the day that holds every row of a merge measurement.
@@ -707,13 +708,18 @@ fn merges_time_out(c: &mut NodeConfig) {
 }
 
 /// Triggers maintenance with a single-row bulk insert and returns the store request counts for `db_id`.
-async fn trigger_maintenance(w: &World, token: &str, db_id: &str, row: usize) -> baserunna::sim::cost::Counts {
+async fn trigger_maintenance(
+    w: &World,
+    token: &str,
+    db_id: &str,
+    row: usize,
+) -> baserunna_storage::store::metered::Counts {
     let before = w.store.scope(db_id);
     let other_day = format!(r#"[{{"t":{},"u":"x","e":"x"}}]"#, MERGE_DAY_MS - 30 * DAY_MS + row as i64);
     bulk_insert(w, token, "d", "ev", other_day).await;
     tokio::time::sleep(Duration::from_secs(60)).await;
     let after = w.store.scope(db_id);
-    baserunna::sim::cost::Counts {
+    baserunna_storage::store::metered::Counts {
         gets: after.gets - before.gets,
         puts: after.puts - before.puts,
         lists: after.lists - before.lists,

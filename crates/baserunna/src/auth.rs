@@ -1,10 +1,10 @@
 //! Password hashing, opaque tokens, and Google OpenID Connect ID-token verification.
 
-use crate::env::Env;
-use crate::error::{Error, Result};
-use crate::store::BoxFut;
-use crate::util::{ct_eq, hmac_sha256, sha256};
 use baserunna_api::b64;
+use baserunna_util::BoxFut;
+use baserunna_util::env::Env;
+use baserunna_util::error::{Error, Result};
+use baserunna_util::{ct_eq, hmac_sha256, sha256};
 use serde_json::Value as Json;
 use std::num::NonZeroU32;
 
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn fuzz_tokens() {
-        let mut r = crate::util::rng::Rng::new(11);
+        let mut r = baserunna_util::rng::Rng::new(11);
         let valid: Vec<(String, (String, String))> = (0..8)
             .map(|i| {
                 let (subject, fp) = (format!("user-{i}"), fingerprint(&format!("v{i}")));

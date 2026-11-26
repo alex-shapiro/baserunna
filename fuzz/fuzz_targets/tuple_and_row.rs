@@ -1,7 +1,7 @@
 #![no_main]
 //! Tuple and row decoders must never panic, and decoded tuples must re-encode
 //! to the same canonical bytes.
-use baserunna::table::{schema, tuple};
+use baserunna_storage::table::{schema, tuple};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

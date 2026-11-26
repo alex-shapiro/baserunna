@@ -5,20 +5,20 @@ use super::{
     Auth, DbCtx, Endpoints as _, Found, JsonBody, LONG_POLL_MAX_MS, Params, QueryOf, Ran, Reply, Req, consistency_from,
     consistency_of, naming_commit, percent_decode, run_txn, watch, with_read, with_txn,
 };
-use crate::engine::manifest::ObjKind;
-use crate::engine::{Change, ChangeCursor, Committed, Consistency, Isolation, Txn, Value, blob};
-use crate::error::{Error, Result};
 use crate::meta::{self, DbRecord, DbRef, MetaCmd};
 use crate::node::Node;
-use crate::ops::{self, EncodingExt, Op, OpCtx, exec_ops, user_key};
-use crate::table::{self, BlobResolver, InsertMode, Query, Selection};
-use crate::txns::OpenTxn;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Extension, Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use baserunna_api::{self as api, Endpoint as _};
+use baserunna_storage::engine::manifest::ObjKind;
+use baserunna_storage::engine::{Change, ChangeCursor, Committed, Consistency, Isolation, Txn, Value, blob};
+use baserunna_storage::ops::{self, EncodingExt, Op, OpCtx, exec_ops, user_key};
+use baserunna_storage::table::{self, BlobResolver, InsertMode, Query, Selection};
+use baserunna_storage::txns::OpenTxn;
+use baserunna_util::error::{Error, Result};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
@@ -72,7 +72,7 @@ fn op_ctx<'a>(node: &'a Node, ctx: &'a DbCtx, enc: api::Encoding) -> OpCtx<'a> {
         access: ctx.access,
         json_value_max: node.cfg.json_value_max,
         query_limits: node.cfg.query_limits,
-        node: Some(node),
+        txns: Some(&node.txns),
         user_id: &ctx.principal.user.id,
     }
 }
@@ -442,7 +442,7 @@ pub(super) fn commit_id_for_key(db_id: &str, key: &str) -> u64 {
     d.extend_from_slice(db_id.as_bytes());
     d.push(0);
     d.extend_from_slice(key.as_bytes());
-    let h = crate::util::sha256(&d);
+    let h = baserunna_util::sha256(&d);
     let mut a = [0u8; 8];
     a.copy_from_slice(&h[..8]);
     u64::from_be_bytes(a)
@@ -527,7 +527,7 @@ async fn begin_txn(
     let user = &ctx.principal.user.id;
     node.txns.admit_begin(user, &ctx.db.id)?;
     let t = match isolation(b.isolation) {
-        crate::engine::Isolation::Serializable => ctx.db.begin_optimistic().await?,
+        baserunna_storage::engine::Isolation::Serializable => ctx.db.begin_optimistic().await?,
         iso => ctx.db.begin(iso, Consistency::Strong).await?,
     };
     let (rv, cid) = (t.read_version(), t.commit_id);

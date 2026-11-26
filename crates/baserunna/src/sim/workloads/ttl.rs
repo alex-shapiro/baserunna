@@ -13,7 +13,7 @@
 
 use super::super::Sim;
 use super::super::client::{Client, ZOMBIE_WAIT_MS, url_escape};
-use crate::util::rng::Rng;
+use baserunna_util::rng::Rng;
 use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;

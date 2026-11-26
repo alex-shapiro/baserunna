@@ -6,8 +6,8 @@
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, Status, url_escape};
-use crate::util::rng::Rng;
 use baserunna_api::b64;
+use baserunna_util::rng::Rng;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -33,7 +33,7 @@ fn in_range(k: &[u8], r: &(Key, Option<Key>)) -> bool {
 }
 
 fn prefix_range(p: &[u8]) -> (Key, Option<Key>) {
-    (p.to_vec(), crate::util::prefix_end(p))
+    (p.to_vec(), baserunna_util::prefix_end(p))
 }
 
 impl TxnSim {

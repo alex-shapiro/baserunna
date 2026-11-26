@@ -8,15 +8,15 @@ use super::{
     DbCtx, Endpoints as _, Found, JsonBody, Params, QueryOf, Ran, Reply, Req, consistency_from, consistency_of, paging,
     run_txn, watch, with_read, with_txn,
 };
-use crate::engine::{Committed, Consistency, Db, Isolation, Retention, StreamState};
-use crate::error::{Error, Result};
 use crate::node::Node;
-use crate::stream::{self, AppendTo, Body, ReadOut, ReadSpec};
 use axum::Router;
 use axum::extract::{Extension, Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use baserunna_api::{self as api, Encoding, Endpoint as _};
+use baserunna_storage::engine::{Committed, Consistency, Db, Isolation, Retention, StreamState};
+use baserunna_storage::stream::{self, AppendTo, Body, ReadOut, ReadSpec};
+use baserunna_util::error::{Error, Result};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use serde::Deserialize;
@@ -56,7 +56,7 @@ async fn list(
     QueryOf(q): QueryOf<api::ListStreamsQuery>,
     _: Req<api::ListStreams>,
 ) -> Result<Reply<api::ListStreams>> {
-    let limit = crate::ops::page_limit(q.limit)?;
+    let limit = baserunna_storage::ops::page_limit(q.limit)?;
     let (prefix, cursor) = (q.prefix.unwrap_or_default(), q.cursor.filter(|c| !c.is_empty()));
     let c = consistency_from(q.consistency, q.max_staleness_ms);
     let ((page, next_cursor), version) =
@@ -527,7 +527,8 @@ async fn delete_consumer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::cost::{World, call_router, run_paused};
+    use crate::sim::cost::{World, call_router};
+    use baserunna_util::run_paused;
     use tower::ServiceExt;
 
     const S: &str = "/v1/dbs/logs/streams/app";

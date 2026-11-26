@@ -11,9 +11,9 @@
 mod common;
 
 use baserunna::meta::SignupPolicy;
-use baserunna::util::sha256;
 use baserunna_client::api::{self, BlobMeta, ByteRange, ColumnType, NewColumn, NewIndex, NewTable, Selection, b64};
 use baserunna_client::{Client, HttpTransport, Op, Row};
+use baserunna_util::sha256;
 use bytes::Bytes;
 use common::step;
 use serde::{Deserialize, Serialize};

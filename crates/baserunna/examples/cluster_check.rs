@@ -10,10 +10,10 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use baserunna::store::{DynStore, MemStore, Retry, list_all};
 use baserunna_client::{
     Client, Db, Error, HttpTransport, KeyRange, Op, OpResult, RetryPolicy, TransportError, Value, api,
 };
+use baserunna_storage::store::{DynStore, MemStore, Retry, list_all};
 use parking_lot::Mutex;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -371,7 +371,7 @@ async fn main() {
         Some(url) => {
             let prefix = format!("{}/cluster-check-{nonce:x}", url.trim_end_matches('/'));
             let open = move || -> DynStore {
-                Arc::new(baserunna::store::CloudStore::from_url(&prefix).expect("BASERUNNA_STORE"))
+                Arc::new(baserunna_storage::store::CloudStore::from_url(&prefix).expect("BASERUNNA_STORE"))
             };
             let scratch = open();
             (Box::new(open), Some(scratch))

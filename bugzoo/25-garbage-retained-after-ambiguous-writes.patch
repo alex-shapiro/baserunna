@@ -1,7 +1,7 @@
-diff --git a/crates/baserunna/src/engine/db.rs b/crates/baserunna/src/engine/db.rs
+diff --git a/crates/baserunna-storage/src/engine/db.rs b/crates/baserunna-storage/src/engine/db.rs
 index b79fa1b..c74388c 100644
---- a/crates/baserunna/src/engine/db.rs
-+++ b/crates/baserunna/src/engine/db.rs
+--- a/crates/baserunna-storage/src/engine/db.rs
++++ b/crates/baserunna-storage/src/engine/db.rs
 @@ -1071,10 +1071,6 @@ impl Db {
                      maybe_applied = true;
                      unknown_writes.push((m.write_seq, attempt_started, base.etag.clone()));

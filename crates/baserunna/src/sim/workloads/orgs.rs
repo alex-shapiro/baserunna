@@ -10,7 +10,7 @@ use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};
 use super::super::{NetError, Sim};
 use super::steps::{add_member, create_key, create_org, members};
 use super::{cache_expiry, cache_lag, expect};
-use crate::meta::Role;
+use baserunna_util::access::Role;
 use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;

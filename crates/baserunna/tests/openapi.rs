@@ -233,9 +233,9 @@ fn op_schema_matches_accepted_ops() {
         json!({"op": "query_events", "table": "e", "from": 0, "to": 1, "nope": 1}),
     ];
     let schema = json!({"$ref": "#/components/schemas/Op"});
-    let parse = |op: &Value| -> Result<baserunna::ops::Op, String> {
+    let parse = |op: &Value| -> Result<baserunna_storage::ops::Op, String> {
         let op: baserunna_api::Op = serde_json::from_value(op.clone()).map_err(|e| e.to_string())?;
-        baserunna::ops::Op::try_from(op).map_err(|e| e.to_string())
+        baserunna_storage::ops::Op::try_from(op).map_err(|e| e.to_string())
     };
     for op in accepted {
         parse(&op).unwrap_or_else(|e| panic!("server rejects {op}: {e}"));

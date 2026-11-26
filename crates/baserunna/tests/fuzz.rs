@@ -3,7 +3,7 @@
 
 use baserunna::sim::client::Client;
 use baserunna::sim::{SimConfig, openapi_check, run};
-use baserunna::util::rng::Rng;
+use baserunna_util::rng::Rng;
 use serde_json::{Value, json};
 
 fn rand_string(r: &mut Rng) -> String {
@@ -282,8 +282,8 @@ fn mutate_once(r: &mut Rng, v: &mut Value, depth: u32) {
 
 #[test]
 fn fuzz_http_api() {
-    let iters = baserunna::util::prop::env_u64("FUZZ_ITERS").unwrap_or(1500) as usize;
-    let seed = baserunna::util::prop::env_u64("FUZZ_SEED").unwrap_or(77);
+    let iters = baserunna_util::prop::env_u64("FUZZ_ITERS").unwrap_or(1500) as usize;
+    let seed = baserunna_util::prop::env_u64("FUZZ_SEED").unwrap_or(77);
     let out = run(seed, SimConfig::basic(), move |sim| async move {
         let c = Client::signup(&sim, "fuzzer", "f@z.io", "password-fz").await?;
         c.create_db("fz").await?;
@@ -434,8 +434,8 @@ fn fuzz_http_api() {
 
 #[test]
 fn fuzz_txn_ops_against_model() {
-    let iters = baserunna::util::prop::env_u64("FUZZ_ITERS").unwrap_or(400);
-    let base = baserunna::util::prop::env_u64("FUZZ_SEED").unwrap_or(1);
+    let iters = baserunna_util::prop::env_u64("FUZZ_ITERS").unwrap_or(400);
+    let base = baserunna_util::prop::env_u64("FUZZ_SEED").unwrap_or(1);
     for i in 0..iters {
         let seed = base.wrapping_add(i);
         let mut r = Rng::new(seed);

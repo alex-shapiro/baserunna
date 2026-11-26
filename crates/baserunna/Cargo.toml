@@ -7,11 +7,13 @@ license.workspace = true
 
 [features]
 default = ["cloud"]
-cloud = ["dep:object_store", "dep:reqwest"]
+cloud = ["baserunna-storage/cloud", "dep:reqwest"]
 
 [dependencies]
 baserunna-api.workspace = true
 baserunna-client.workspace = true
+baserunna-storage.workspace = true
+baserunna-util.workspace = true
 aws-lc-rs = "1.18"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "form", "tokio", "matched-path", "original-uri"] }
 bytes = "1"
@@ -29,7 +31,6 @@ serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_urlencoded = "0.7"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal", "test-util"] }
 tower = { version = "0.5", default-features = false, features = ["util"] }
-object_store = { version = "0.14", default-features = false, features = ["aws"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"], optional = true }
 
 [dev-dependencies]

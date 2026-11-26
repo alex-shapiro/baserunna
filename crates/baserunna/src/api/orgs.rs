@@ -1,12 +1,13 @@
 //! Organization and membership management routes.
 
 use super::{Auth, Endpoints as _, JsonBody, Params, Reply, Req, paging};
-use crate::error::{Error, Result};
-use crate::meta::{self, MemberInfo, MemberLimits, MetaCmd, ORG_ID_PREFIX, Org, Role};
+use crate::meta::{self, MemberInfo, MemberLimits, MetaCmd, ORG_ID_PREFIX, Org};
 use crate::node::Node;
 use axum::Router;
 use axum::extract::{Path, State};
 use baserunna_api::{self as api, Endpoint as _};
+use baserunna_util::access::Role;
+use baserunna_util::error::{Error, Result};
 
 use axum::routing::{get, post};
 use serde::{Deserialize, Serialize};

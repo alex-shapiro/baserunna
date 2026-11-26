@@ -7,17 +7,19 @@
 
 use axum::body::Body;
 use baserunna::cluster::{Transport, TransportError};
-use baserunna::engine::Consistency;
-use baserunna::engine::local::{DiskCache, LocalTier};
-use baserunna::engine::manifest::{Levels, Manifest};
-use baserunna::engine::segment::{self, FOOTER_LEN, SegmentIndex};
-use baserunna::env::Env;
-use baserunna::log::{self, Level};
 use baserunna::node::{Node, NodeConfig, Services};
-use baserunna::sim::cost::{node_config, run_paused};
-use baserunna::store::{BoxFut, GetOpts, GetResult, ListPage, MemStore, ObjectStore, PutMode, SResult, StoreError};
-use baserunna::util::rng::Rng;
+use baserunna::sim::cost::node_config;
 use baserunna_api::b64;
+use baserunna_storage::engine::Consistency;
+use baserunna_storage::engine::local::{DiskCache, LocalTier};
+use baserunna_storage::engine::manifest::{Levels, Manifest};
+use baserunna_storage::engine::segment::{self, FOOTER_LEN, SegmentIndex};
+use baserunna_storage::store::{GetOpts, GetResult, ListPage, MemStore, ObjectStore, PutMode, SResult, StoreError};
+use baserunna_util::BoxFut;
+use baserunna_util::env::Env;
+use baserunna_util::log::{self, Level};
+use baserunna_util::rng::Rng;
+use baserunna_util::run_paused;
 use bytes::Bytes;
 use http::Request;
 use parking_lot::Mutex;
@@ -977,7 +979,7 @@ impl StreamData {
             let Ok(entries) = segment::read_all(&data) else { continue };
             let seqs: Vec<u64> = entries
                 .iter()
-                .filter_map(|e| baserunna::engine::stream::parse_record_key(&e.key))
+                .filter_map(|e| baserunna_storage::engine::stream::parse_record_key(&e.key))
                 .map(|(_, s)| s)
                 .collect();
             if seqs.len() == entries.len() && !seqs.is_empty() {
@@ -1176,9 +1178,9 @@ fn blob_meta_layout(meta: &[u8]) -> BlobMetaLayout {
 /// The `BlobRef` that the database stores for `key`, read from the engine, as `BlobMeta` JSON.
 async fn bound_blob(d: &Deployment, db_id: &str, key: &str) -> Json {
     let v = d.node().engine.db(db_id).read_version(Consistency::Strong).await.expect("read version");
-    let k = baserunna::ops::user_key(key.as_bytes()).expect("key");
+    let k = baserunna_storage::ops::user_key(key.as_bytes()).expect("key");
     match v.get(&k, v.read_time()).await.expect("get").map(|e| e.value) {
-        Some(baserunna::engine::Value::Blob(r)) => json!({"blob_id": r.id, "size": r.size,
+        Some(baserunna_storage::engine::Value::Blob(r)) => json!({"blob_id": r.id, "size": r.size,
             "sha256": r.sha256.iter().map(|b| format!("{b:02x}")).collect::<String>(), "content_type": r.content_type}),
         other => json!({"not_a_blob": format!("{other:?}")}),
     }
@@ -1336,11 +1338,11 @@ impl EventData {
     }
 }
 
-async fn part_refs(d: &Deployment, db_id: &str) -> Vec<baserunna::engine::events::PartRef> {
+async fn part_refs(d: &Deployment, db_id: &str) -> Vec<baserunna_storage::engine::events::PartRef> {
     let v = d.node().engine.db(db_id).read_version(Consistency::Strong).await.expect("read version");
-    let range = baserunna::engine::KeyRange::prefix(&[baserunna::engine::events::PARTS]);
+    let range = baserunna_storage::engine::KeyRange::prefix(&[baserunna_storage::engine::events::PARTS]);
     let entries = v.scan(&range, false, usize::MAX, v.read_time()).await.expect("scan part references");
-    entries.iter().filter_map(baserunna::engine::events::ref_of).collect()
+    entries.iter().filter_map(baserunna_storage::engine::events::ref_of).collect()
 }
 
 /// Bit flips in the first byte, the column data, index, and metadata of column `v`, and the last
@@ -1349,13 +1351,13 @@ async fn part_faults(d: &Deployment, e: &EventData, day: i64) -> Vec<(String, Fa
     let r = part_refs(d, &e.db).await.into_iter().find(|r| r.id == e.parts[&day]).expect("part reference");
     let data = d.object(&e.part_key(day));
     assert_eq!(data.len() as u64, r.size, "a part must be stored in a single chunk");
-    let meta = baserunna::events::part::PartMeta::decode(
+    let meta = baserunna_storage::events::part::PartMeta::decode(
         &data.slice(r.meta_off as usize..(r.meta_off + r.meta_len) as usize),
         r.rows,
     )
     .expect("part metadata");
     let col = |n: usize| {
-        meta.cols.iter().find(|c| c.cref == baserunna::events::part::ColRef::User(n as u32)).expect("column")
+        meta.cols.iter().find(|c| c.cref == baserunna_storage::events::part::ColRef::User(n as u32)).expect("column")
     };
     let len = data.len();
     let mut faults = vec![("(a) flip byte 0".to_string(), Fault::FlipBit(0))];
@@ -1605,7 +1607,7 @@ async fn write_masks(d: &Deployment, e: &EventData) -> BTreeMap<i64, String> {
     let mut masks = BTreeMap::new();
     for r in part_refs(d, &e.db).await {
         let day = (r.min_time - EVENTS_FROM_MS).div_euclid(DAY_MS);
-        if let Some(baserunna::engine::events::Mask::Object { id, .. }) = &r.mask {
+        if let Some(baserunna_storage::engine::events::Mask::Object { id, .. }) = &r.mask {
             assert_eq!(r.deleted, 2_400, "day {day} must have 2,400 deleted rows");
             masks.insert(day, format!("dbs/{}/part/{id}/0000", e.db));
         }

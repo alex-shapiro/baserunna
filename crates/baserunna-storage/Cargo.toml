@@ -1,0 +1,24 @@
+[package]
+name = "baserunna-storage"
+description = "Storage engine and database features of baserunna"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["cloud"]
+cloud = ["dep:object_store"]
+
+[dependencies]
+baserunna-api.workspace = true
+baserunna-util.workspace = true
+aws-lc-rs = "1.18"
+bytes.workspace = true
+crc32c = "0.6"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "test-util"] }
+zstd = { version = "0.13", default-features = false }
+object_store = { version = "0.14", default-features = false, features = ["aws"], optional = true }

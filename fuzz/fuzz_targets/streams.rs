@@ -2,9 +2,9 @@
 //! Stream record values, chunk references, stream state, commit records,
 //! record bodies and filters must decode or parse without panicking, and
 //! what decodes must survive a round trip.
-use baserunna::engine::stream::{StreamState, Stored};
-use baserunna::engine::types::decode_commit_record;
-use baserunna::stream::{Body, Filter};
+use baserunna_storage::engine::stream::{StreamState, Stored};
+use baserunna_storage::engine::types::decode_commit_record;
+use baserunna_storage::stream::{Body, Filter};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

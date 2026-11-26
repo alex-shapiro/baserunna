@@ -12,12 +12,12 @@
 //! and stop starting new runs after `SIM_MINUTES`. When `SIM_REQUIRE_PROBES` is set,
 //! a campaign exits with a non-zero status if any probe was not reached.
 
-use baserunna::probe::Probe;
 use baserunna::sim::campaign::{Job, RARE, Report, campaign, default_threads, parse_branches};
 use baserunna::sim::explore::{Budget, explore};
 use baserunna::sim::workloads::{Scenario, scenario, scenarios};
 use baserunna::sim::{SimOutcome, run};
-use baserunna::util::prop::env_u64;
+use baserunna_util::probe::Probe;
+use baserunna_util::prop::env_u64;
 use std::time::{Duration, Instant};
 
 /// Default run limit when neither `SIM_RUNS` nor `SIM_MINUTES` is set.

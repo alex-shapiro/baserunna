@@ -1,9 +1,9 @@
 //! Node-to-node transport, membership, and routing.
 
 use crate::meta::NodeRecord;
-use crate::store::BoxFut;
-use crate::util::DetHashMap;
 use axum::body::Body;
+use baserunna_util::BoxFut;
+use baserunna_util::DetHashMap;
 use bytes::Bytes;
 use http::{Request, Response};
 use parking_lot::Mutex;

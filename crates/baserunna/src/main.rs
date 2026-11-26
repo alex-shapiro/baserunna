@@ -1,12 +1,12 @@
 //! Server binary entry point and environment configuration.
 
 use baserunna::cluster::{HttpTransport, Transport};
-use baserunna::engine::local::{DiskCache, LocalTier};
-use baserunna::env::Env;
 use baserunna::limits::Rate;
 use baserunna::meta::SignupPolicy;
 use baserunna::node::{Node, NodeConfig, Services};
-use baserunna::store::{DynStore, FsStore, MemStore};
+use baserunna_storage::engine::local::{DiskCache, LocalTier};
+use baserunna_storage::store::{DynStore, FsStore, MemStore};
+use baserunna_util::env::Env;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +31,7 @@ pub fn store_from_url(url: &str) -> Result<DynStore, String> {
     }
     #[cfg(feature = "cloud")]
     {
-        Ok(Arc::new(baserunna::store::CloudStore::from_url(url)?))
+        Ok(Arc::new(baserunna_storage::store::CloudStore::from_url(url)?))
     }
     #[cfg(not(feature = "cloud"))]
     {
@@ -43,8 +43,8 @@ pub fn store_from_url(url: &str) -> Result<DynStore, String> {
 async fn verify_store_conditional_writes(url: &str) -> Result<(), String> {
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
     let ns = format!("{}/preflight/{nonce:x}-{}", url.trim_end_matches('/'), std::process::id());
-    let store: DynStore = Arc::new(baserunna::store::CloudStore::from_url(&ns)?);
-    baserunna::store::conformance::preflight(store)
+    let store: DynStore = Arc::new(baserunna_storage::store::CloudStore::from_url(&ns)?);
+    baserunna_storage::store::conformance::preflight(store)
         .await
         .map_err(|e| format!("object store at {url} failed conditional-write verification: {e}"))
 }
@@ -116,7 +116,7 @@ async fn stop_signal() {
                 either.await;
                 return;
             }
-            _ => baserunna::warn!("cannot install signal handlers; stopping on Ctrl-C only"),
+            _ => baserunna_util::warn!("cannot install signal handlers; stopping on Ctrl-C only"),
         }
     }
     let _ = tokio::signal::ctrl_c().await;
@@ -124,16 +124,16 @@ async fn stop_signal() {
 
 #[tokio::main]
 async fn main() {
-    if let Err(e) = baserunna::log::init_from_env() {
+    if let Err(e) = baserunna_util::log::init_from_env() {
         eprintln!("baserunna: {e}");
         std::process::exit(1);
     }
-    baserunna::log::start_background_writer();
+    baserunna_util::log::start_background_writer();
     let result = run().await;
     if let Err(e) = &result {
-        baserunna::error!("{e}");
+        baserunna_util::error!("{e}");
     }
-    baserunna::log::flush();
+    baserunna_util::log::flush();
     if result.is_err() {
         std::process::exit(1);
     }
@@ -176,15 +176,15 @@ async fn run() -> Result<(), String> {
             n.metrics.lag(started.elapsed().saturating_sub(PERIOD));
         }
     });
-    baserunna::log::set_process_node(&node.id);
+    baserunna_util::log::set_process_node(&node.id);
     let app = baserunna::api::router(node.clone());
     let listener =
         tokio::net::TcpListener::bind(&listen).await.map_err(|e| format!("cannot listen on {listen}: {e}"))?;
-    baserunna::info!("listening on {listen} (store {store_url})");
+    baserunna_util::info!("listening on {listen} (store {store_url})");
     let n2 = node.clone();
     let stopping = async move {
         stop_signal().await;
-        baserunna::info!("shutting down: draining for {:?}", shutdown.drain_delay);
+        baserunna_util::info!("shutting down: draining for {:?}", shutdown.drain_delay);
         n2.drain();
         tokio::time::sleep(shutdown.drain_delay).await;
         n2.end_waits();
@@ -192,9 +192,9 @@ async fn run() -> Result<(), String> {
         let n3 = n2.clone();
         env.spawn(async move {
             tokio::time::sleep(shutdown.timeout).await;
-            baserunna::warn!("shutting down: requests still in flight after {:?}", shutdown.timeout);
+            baserunna_util::warn!("shutting down: requests still in flight after {:?}", shutdown.timeout);
             n3.shutdown().await;
-            baserunna::log::flush();
+            baserunna_util::log::flush();
             std::process::exit(0);
         });
     };
@@ -205,7 +205,7 @@ async fn run() -> Result<(), String> {
         .with_graceful_shutdown(stopping)
         .await
         .map_err(|e| e.to_string())?;
-    baserunna::info!("shutting down: releasing leases");
+    baserunna_util::info!("shutting down: releasing leases");
     node.shutdown().await;
     Ok(())
 }

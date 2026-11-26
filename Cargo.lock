@@ -122,6 +122,8 @@ dependencies = [
  "axum",
  "baserunna-api",
  "baserunna-client",
+ "baserunna-storage",
+ "baserunna-util",
  "bytes",
  "crc32c",
  "futures-util",
@@ -131,7 +133,6 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
- "object_store",
  "parking_lot",
  "reqwest",
  "serde",
@@ -168,6 +169,40 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "baserunna-storage"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "baserunna-api",
+ "baserunna-util",
+ "bytes",
+ "crc32c",
+ "futures-util",
+ "object_store",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zstd",
+]
+
+[[package]]
+name = "baserunna-util"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "axum-core",
+ "baserunna-api",
+ "crc32c",
+ "http",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "zstd",
 ]
 
 [[package]]

@@ -1,8 +1,8 @@
 //! HTTP client for simulation workloads.
 
 use super::{NetError, Sim, SimResponse};
-use crate::util::rng::Rng;
 use axum::body::Body;
+use baserunna_util::rng::Rng;
 use bytes::Bytes;
 use http::Request;
 use parking_lot::Mutex;
@@ -110,7 +110,7 @@ pub fn url_escape(b: &[u8]) -> String {
 
 impl Client {
     pub fn new(sim: &Arc<Sim>, name: &str) -> Client {
-        let h = crate::util::sha256(name.as_bytes());
+        let h = baserunna_util::sha256(name.as_bytes());
         Client {
             rng: Mutex::new(sim.fork_rng()),
             sim: sim.clone(),
@@ -187,7 +187,7 @@ impl Client {
                 Ok(r) => format!(
                     "{} {}{}{}",
                     r.status,
-                    baserunna_api::b64::hex(&crate::util::sha256(&r.body)[..6]),
+                    baserunna_api::b64::hex(&baserunna_util::sha256(&r.body)[..6]),
                     match r.status >= 400 {
                         true => format!(" {}", String::from_utf8_lossy(&r.body[..r.body.len().min(160)])),
                         false => String::new(),

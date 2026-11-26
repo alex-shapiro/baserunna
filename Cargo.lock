@@ -185,8 +185,10 @@ dependencies = [
 name = "baserunna-isolation"
 version = "0.1.0"
 dependencies = [
+ "baserunna-api",
  "bytes",
  "futures-util",
+ "http",
  "http-body-util",
  "hyper",
  "hyper-util",

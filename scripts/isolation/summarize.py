@@ -23,39 +23,6 @@ CRITERIA = (
 )
 
 
-def failed_criteria(result):
-    """Return the numbers of criteria that failed or did not run."""
-    conditions = result.get("conditions") or {}
-    failed = []
-    for name in CRITERIA:
-        value = conditions.get(name)
-        if isinstance(value, dict):
-            value = value.get("pass")
-        if value is False or (value is None and name != "5_small_variant_succeeds"):
-            failed.append(name.split("_", 1)[0])
-    return failed
-
-
-def run_cell(result):
-    """Format a table cell with the run verdict and key metrics."""
-    if (result.get("conditions") or {}).get("pass"):
-        verdict = "pass"
-    else:
-        verdict = "fail " + ",".join(failed_criteria(result))
-    latency = (result.get("conditions") or {}).get("3_victim_p99_within_limit") or {}
-    details = []
-    if latency:
-        details.append(
-            f"p99 {latency['p99_alone_ms']:.0f}→{latency['p99_attacked_ms']:.0f} ms"
-        )
-    growth = result.get("phase_b_growth_from_idle_mib")
-    if growth is not None:
-        details.append(f"{growth:.0f} MiB")
-    if result.get("error"):
-        details.append("error")
-    return verdict + (f" ({', '.join(details)})" if details else "")
-
-
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
@@ -126,6 +93,39 @@ def main():
         print(
             f"\nevent_scan: {event_scan.get('failed_queries')} failed queries; median per query: {queries}"
         )
+
+
+def run_cell(result):
+    """Format a table cell with the run verdict and key metrics."""
+    if (result.get("conditions") or {}).get("pass"):
+        verdict = "pass"
+    else:
+        verdict = "fail " + ",".join(failed_criteria(result))
+    latency = (result.get("conditions") or {}).get("3_victim_p99_within_limit") or {}
+    details = []
+    if latency:
+        details.append(
+            f"p99 {latency['p99_alone_ms']:.0f}→{latency['p99_attacked_ms']:.0f} ms"
+        )
+    growth = result.get("phase_b_growth_from_idle_mib")
+    if growth is not None:
+        details.append(f"{growth:.0f} MiB")
+    if result.get("error"):
+        details.append("error")
+    return verdict + (f" ({', '.join(details)})" if details else "")
+
+
+def failed_criteria(result):
+    """Return the numbers of criteria that failed or did not run."""
+    conditions = result.get("conditions") or {}
+    failed = []
+    for name in CRITERIA:
+        value = conditions.get(name)
+        if isinstance(value, dict):
+            value = value.get("pass")
+        if value is False or (value is None and name != "5_small_variant_succeeds"):
+            failed.append(name.split("_", 1)[0])
+    return failed
 
 
 if __name__ == "__main__":

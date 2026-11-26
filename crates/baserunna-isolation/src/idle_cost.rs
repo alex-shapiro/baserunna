@@ -5,10 +5,10 @@
 //! Measures cgroup memory, CPU, and process counts over a 30-second idle window.
 
 use crate::cgroup::{MemorySampler, NodeCgroup};
-use crate::http::NodeApi;
+use crate::http::{NodeApi, Owner};
+use baserunna_api::{GetValue, NoBody};
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
-use reqwest::Method;
 use serde_json::{Value as Json, json};
 use std::time::{Duration, Instant};
 
@@ -22,12 +22,11 @@ const MIB: f64 = (1 << 20) as f64;
 pub async fn run(api: &NodeApi, cgroup: &NodeCgroup) -> Result<Json, String> {
     let memory_before_setup_bytes = cgroup.memory_current_bytes();
     let setup_started = Instant::now();
-    let owner_results: Vec<Result<(String, String), String>> = stream::iter(0..OWNER_COUNT)
+    let owner_results: Vec<Result<Owner, String>> = stream::iter(0..OWNER_COUNT)
         .map(|owner_index| async move {
             let owner = api.create_owner(&format!("idle{owner_index}@iso.test"), &format!("i{owner_index}")).await?;
-            let path = format!("/v1/dbs/{}/kv/k0", owner.db);
-            api.send_expect(Method::PUT, &path, &owner.token, Bytes::from_static(b"value-00"), &[200]).await?;
-            Ok((owner.token, path))
+            api.put_value(&owner.token, &owner.db, "k0", Bytes::from_static(b"value-00")).await?;
+            Ok(owner)
         })
         .buffer_unordered(SETUP_CONCURRENCY)
         .collect()
@@ -38,9 +37,10 @@ pub async fn run(api: &NodeApi, cgroup: &NodeCgroup) -> Result<Json, String> {
 
     let touch_started = Instant::now();
     let touch_results: Vec<Result<(), String>> = stream::iter(&owners)
-        .map(|(token, path)| async move {
-            api.send_expect(Method::GET, path, token, Bytes::new(), &[200]).await?;
-            api.send_expect(Method::PUT, path, token, Bytes::from_static(b"value-01"), &[200]).await.map(|_| ())
+        .map(|owner| async move {
+            let endpoint = GetValue { db: owner.db.clone(), key: Bytes::from_static(b"k0"), range: None };
+            api.call(&endpoint, &owner.token, &NoBody {}).await?;
+            api.put_value(&owner.token, &owner.db, "k0", Bytes::from_static(b"value-01")).await
         })
         .buffer_unordered(SETUP_CONCURRENCY)
         .collect()
@@ -55,14 +55,10 @@ pub async fn run(api: &NodeApi, cgroup: &NodeCgroup) -> Result<Json, String> {
     let idle_started = Instant::now();
     tokio::time::sleep(IDLE_DURATION).await;
     let idle_s = idle_started.elapsed().as_secs_f64();
-    let cpu_usec_end = cgroup.cpu_usage_usec();
+    let idle_cpu_usec = cgroup.cpu_usage_usec_since(cpu_usec_start);
     let memory = sampler.finish();
     let subtree_counts_end = cgroup.subtree_counts();
     let memory_end_bytes = cgroup.memory_current_bytes();
-    let idle_cpu_usec = match (cpu_usec_start, cpu_usec_end) {
-        (Some(before), Some(after)) => Some(after.saturating_sub(before)),
-        _ => None,
-    };
     let bytes_to_mib = |bytes: Option<u64>| bytes.map(|value| value as f64 / MIB);
     let summary = json!({
         "memory_before_setup_mib": bytes_to_mib(memory_before_setup_bytes),
@@ -72,15 +68,11 @@ pub async fn run(api: &NodeApi, cgroup: &NodeCgroup) -> Result<Json, String> {
         "processes_idle_start": subtree_counts_start.processes,
         "processes_idle_end": subtree_counts_end.processes,
     });
-    eprintln!("idle_cost: {summary}");
     Ok(json!({
         "owners": OWNER_COUNT, "dbs": OWNER_COUNT, "keys_per_db": 1,
         "setup_s": setup_s, "touch_s": touch_s, "idle_s": idle_s,
         "summary": summary,
-        "memory_before_setup_bytes": memory_before_setup_bytes,
         "memory_after_create_bytes": memory_after_create_bytes,
-        "memory_after_setup_bytes": memory_after_setup_bytes,
-        "memory_idle_end_bytes": memory_end_bytes,
         "idle_memory": memory,
         "idle_cpu_usage_usec": idle_cpu_usec,
         "subtree_idle_start": subtree_counts_start,

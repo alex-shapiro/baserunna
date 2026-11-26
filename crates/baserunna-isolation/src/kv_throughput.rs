@@ -4,6 +4,7 @@
 
 use crate::cgroup::NodeCgroup;
 use crate::http::NodeApi;
+use crate::percentile;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use http_body_util::{BodyExt, Full};
@@ -12,7 +13,6 @@ use hyper::{Method, Request, Uri};
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
-use serde::Serialize;
 use serde_json::{Value as Json, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
@@ -26,88 +26,17 @@ const SETUP_CONCURRENCY: usize = 64;
 const WARMUP_DURATION: Duration = Duration::from_secs(3);
 const MEASURE_DURATION: Duration = Duration::from_secs(15);
 
-type LoadClient = Client<HttpConnector, Full<Bytes>>;
-
-/// Returns the KV value of `VALUE_BYTES` bytes for `index`.
-fn kv_value(index: usize) -> String {
-    format!("{index:0width$}", width = VALUE_BYTES)
-}
-
-/// SplitMix64 generator that picks keys and operations for one load client.
-struct LoadRng {
-    state: u64,
-}
-
-impl LoadRng {
-    fn new(seed: u64) -> LoadRng {
-        LoadRng { state: seed }
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-
-    /// Returns a number in `[0, n)`.
-    fn below(&mut self, n: u64) -> u64 {
-        ((self.next_u64() as u128 * n as u128) >> 64) as u64
-    }
-}
-
-/// Target key URI and authorization header for a database.
-struct DbKey {
-    uri: Uri,
-    auth: HeaderValue,
-}
-
-/// Throughput, latency, and CPU measurements for a load window.
-#[derive(Clone, Debug, Serialize)]
-pub struct LoadWindow {
-    pub clients: usize,
-    pub seconds: f64,
-    pub ops: usize,
-    pub errors: u64,
-    pub ops_per_s: f64,
-    pub p50_ms: f64,
-    pub p99_ms: f64,
-    pub max_ms: f64,
-    /// Node cgroup CPU time used during the window, in microseconds.
-    pub node_cpu_usage_usec: Option<u64>,
-    pub node_cpu_usec_per_op: Option<f64>,
-    /// Average node CPU use in vCPUs during the window.
-    pub node_cpu_vcpus: Option<f64>,
-    /// Average client process CPU use in vCPUs during the window.
-    pub client_cpu_vcpus: f64,
-    pub error_samples: Vec<String>,
-}
-
 /// Creates the benchmark databases and measures a load window with `client_count` clients.
 pub async fn run(api: &NodeApi, node_url: &str, cgroup: &NodeCgroup, client_count: usize) -> Result<Json, String> {
     let setup_started = Instant::now();
     let keys = Arc::new(setup(api, node_url).await?);
     let setup_s = setup_started.elapsed().as_secs_f64();
     let http: LoadClient = Client::builder(TokioExecutor::new()).build_http();
-    let mut report = json!({
+    Ok(json!({
         "dbs": DB_COUNT, "owners": DB_COUNT.div_ceil(DBS_PER_OWNER), "keys_per_db": 1, "value_bytes": VALUE_BYTES,
         "write_pct": WRITE_PERCENT, "setup_s": setup_s,
-    });
-    let window = measure(&http, &keys, cgroup, client_count, WARMUP_DURATION, MEASURE_DURATION).await;
-    eprintln!(
-        "kv_throughput: {client_count} clients: {:.0} ops/s, {} errors, p50 {:.2} ms, p99 {:.2} ms, node CPU {:.2} vCPUs, \
-         {:.1} us per op, client CPU {:.2} vCPUs",
-        window.ops_per_s,
-        window.errors,
-        window.p50_ms,
-        window.p99_ms,
-        window.node_cpu_vcpus.unwrap_or(f64::NAN),
-        window.node_cpu_usec_per_op.unwrap_or(f64::NAN),
-        window.client_cpu_vcpus,
-    );
-    report["result"] = json!(window);
-    Ok(report)
+        "result": measure(&http, &keys, cgroup, client_count).await,
+    }))
 }
 
 /// Creates owners, databases, and initial `k0` keys.
@@ -125,10 +54,9 @@ async fn setup(api: &NodeApi, node_url: &str) -> Result<Vec<DbKey>, String> {
         .map(|db_index| async move {
             let token = &tokens[db_index / DBS_PER_OWNER];
             if db_index % DBS_PER_OWNER != 0 {
-                create_db_with_retries(api, token, &format!("d{db_index}")).await?;
+                api.create_db(token, &format!("d{db_index}")).await?;
             }
-            let value = kv_value(db_index);
-            api.send_expect(Method::PUT, &format!("/v1/dbs/d{db_index}/kv/k0"), token, value, &[200]).await.map(|_| ())
+            api.put_value(token, &format!("d{db_index}"), "k0", kv_value(db_index)).await
         })
         .buffer_unordered(SETUP_CONCURRENCY)
         .collect()
@@ -147,33 +75,13 @@ async fn setup(api: &NodeApi, node_url: &str) -> Result<Vec<DbKey>, String> {
         .collect()
 }
 
-/// Creates database `db` and retries on a retryable conflict.
-async fn create_db_with_retries(api: &NodeApi, token: &str, db: &str) -> Result<(), String> {
-    let body = json!({"name": db}).to_string();
-    for _ in 0..50 {
-        let reply = api.send(Method::POST, "/v1/dbs", token, Bytes::from(body.clone())).await?;
-        match reply.status {
-            200 | 201 => return Ok(()),
-            409 if reply.json()["error"]["retryable"] == json!(true) => continue,
-            status => return Err(format!("POST /v1/dbs {db}: status {status}: {}", reply.excerpt())),
-        }
-    }
-    Err(format!("POST /v1/dbs {db}: 50 conflicts"))
-}
-
 const PHASE_WARMING: u8 = 0;
 const PHASE_MEASURING: u8 = 1;
 const PHASE_STOPPED: u8 = 2;
 
-/// Warms up `client_count` closed-loop clients. Measures throughput over `measure_window`.
-async fn measure(
-    http: &LoadClient,
-    keys: &Arc<Vec<DbKey>>,
-    cgroup: &NodeCgroup,
-    client_count: usize,
-    warmup: Duration,
-    measure_window: Duration,
-) -> LoadWindow {
+/// Warms up `client_count` closed-loop clients, then returns throughput, latency, and CPU use over
+/// [`MEASURE_DURATION`].
+async fn measure(http: &LoadClient, keys: &Arc<Vec<DbKey>>, cgroup: &NodeCgroup, client_count: usize) -> Json {
     let phase = Arc::new(AtomicU8::new(PHASE_WARMING));
     let values: Arc<Vec<Bytes>> = Arc::new((0..64).map(|i| Bytes::from(kv_value(1_000 + i))).collect());
     let tasks: Vec<_> = (0..client_count)
@@ -187,18 +95,15 @@ async fn measure(
             ))
         })
         .collect();
-    tokio::time::sleep(warmup).await;
+    tokio::time::sleep(WARMUP_DURATION).await;
     let node_cpu_usec_before = cgroup.cpu_usage_usec();
     let client_cpu_secs_before = process_cpu_secs();
     let measure_started = Instant::now();
     phase.store(PHASE_MEASURING, Relaxed);
-    tokio::time::sleep(measure_window).await;
+    tokio::time::sleep(MEASURE_DURATION).await;
     phase.store(PHASE_STOPPED, Relaxed);
     let seconds = measure_started.elapsed().as_secs_f64();
-    let node_cpu_usec = match (node_cpu_usec_before, cgroup.cpu_usage_usec()) {
-        (Some(before), Some(after)) => Some(after.saturating_sub(before)),
-        _ => None,
-    };
+    let node_cpu_usec = cgroup.cpu_usage_usec_since(node_cpu_usec_before);
     let client_cpu_secs = process_cpu_secs() - client_cpu_secs_before;
     let (mut latencies_us, mut errors, mut error_samples) = (Vec::new(), 0, Vec::new());
     for task in tasks {
@@ -208,27 +113,23 @@ async fn measure(
         error_samples.extend(task_samples.into_iter().take(5usize.saturating_sub(error_samples.len())));
     }
     latencies_us.sort_unstable();
-    let percentile_ms = |quantile: f64| {
-        latencies_us
-            .get(((latencies_us.len() as f64 * quantile) as usize).min(latencies_us.len().saturating_sub(1)))
-            .map_or(0.0, |&value| value as f64 / 1000.0)
-    };
-    let ops = latencies_us.len();
-    LoadWindow {
-        clients: client_count,
-        seconds,
-        ops,
-        errors,
-        ops_per_s: ops as f64 / seconds.max(1e-9),
-        p50_ms: percentile_ms(0.5),
-        p99_ms: percentile_ms(0.99),
-        max_ms: latencies_us.last().map_or(0.0, |&value| value as f64 / 1000.0),
-        node_cpu_usage_usec: node_cpu_usec,
-        node_cpu_usec_per_op: node_cpu_usec.map(|value| value as f64 / ops.max(1) as f64),
-        node_cpu_vcpus: node_cpu_usec.map(|value| value as f64 / 1e6 / seconds.max(1e-9)),
-        client_cpu_vcpus: client_cpu_secs / seconds.max(1e-9),
-        error_samples,
-    }
+    let latencies_ms: Vec<f64> = latencies_us.iter().map(|&micros| micros as f64 / 1000.0).collect();
+    let ops = latencies_ms.len();
+    json!({
+        "clients": client_count,
+        "seconds": seconds,
+        "ops": ops,
+        "errors": errors,
+        "ops_per_s": ops as f64 / seconds.max(1e-9),
+        "p50_ms": percentile(&latencies_ms, 0.5),
+        "p99_ms": percentile(&latencies_ms, 0.99),
+        "max_ms": latencies_ms.last().copied().unwrap_or(0.0),
+        "node_cpu_usage_usec": node_cpu_usec,
+        "node_cpu_usec_per_op": node_cpu_usec.map(|value| value as f64 / ops.max(1) as f64),
+        "node_cpu_vcpus": node_cpu_usec.map(|value| value as f64 / 1e6 / seconds.max(1e-9)),
+        "client_cpu_vcpus": client_cpu_secs / seconds.max(1e-9),
+        "error_samples": error_samples,
+    })
 }
 
 /// Runs a closed-loop client task until `phase` becomes [`PHASE_STOPPED`].
@@ -282,6 +183,43 @@ async fn client_loop(
         }
     }
     (latencies_us, errors, error_samples)
+}
+
+/// Target key URI and authorization header for a database.
+struct DbKey {
+    uri: Uri,
+    auth: HeaderValue,
+}
+
+type LoadClient = Client<HttpConnector, Full<Bytes>>;
+
+/// SplitMix64 generator that picks keys and operations for one load client.
+struct LoadRng {
+    state: u64,
+}
+
+impl LoadRng {
+    fn new(seed: u64) -> LoadRng {
+        LoadRng { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Returns a number in `[0, n)`.
+    fn below(&mut self, n: u64) -> u64 {
+        ((self.next_u64() as u128 * n as u128) >> 64) as u64
+    }
+}
+
+/// Returns the KV value of `VALUE_BYTES` bytes for `index`.
+fn kv_value(index: usize) -> String {
+    format!("{index:0width$}", width = VALUE_BYTES)
 }
 
 fn process_cpu_secs() -> f64 {

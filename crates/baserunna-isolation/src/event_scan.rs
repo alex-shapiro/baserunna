@@ -4,16 +4,81 @@
 
 use crate::cgroup::NodeCgroup;
 use crate::http::{NodeApi, Owner};
+use crate::percentile;
 use bytes::Bytes;
 use reqwest::Method;
 use serde_json::{Value as Json, json};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 const DAY_MS: i64 = 86_400_000;
 const QUERY_END_MS: i64 = 9_999_999_999_999;
 const START_TIME_MS: i64 = 1_749_000_000_000;
 const EVENT_ROW_COUNT: usize = 1_000_000;
 const USER_COUNT: usize = 500_000;
+
+/// Loads the event table and runs the query suite `rounds` times. Returns timing results as JSON.
+///
+/// Counts failed warm-up and benchmark queries in `failed_queries`. Omits failed queries from
+/// medians.
+pub async fn run(api: &NodeApi, owner: &Owner, cgroup: &NodeCgroup, rounds: usize) -> Result<Json, String> {
+    let (token, db) = (&owner.token, &owner.db);
+    api.create_event_table(token, db, "ev", "time", &["user", "event"]).await?;
+    let setup_started = Instant::now();
+    let time_span_ms = 10 * DAY_MS;
+    for batch_start in (0..EVENT_ROW_COUNT).step_by(100_000) {
+        let rows: Vec<String> = (batch_start..EVENT_ROW_COUNT.min(batch_start + 100_000))
+            .map(|i| {
+                let time = START_TIME_MS + (i as i64 * 7_919) % time_span_ms;
+                format!(r#"{{"time": {time}, "user": "user-{:07}", "event": "e{}"}}"#, (i * 7_919) % USER_COUNT, i % 8)
+            })
+            .collect();
+        api.bulk_insert(token, db, "ev", format!("[{}]", rows.join(","))).await?;
+    }
+    let table_info = api.wait_for_stable_parts(token, db, "ev").await?;
+    let setup_s = setup_started.elapsed().as_secs_f64();
+    let path = format!("/v1/dbs/{db}/events/ev/rows/query");
+    let queries = benchmark_queries();
+    let mut failures = Vec::new();
+    for (name, query) in &queries {
+        if let Err(err) = api.send_expect(Method::POST, &path, token, query.to_string(), &[200]).await {
+            failures.push(format!("warm-up {name}: {err}"));
+        }
+    }
+    let mut query_latencies_ms = vec![Vec::new(); queries.len()];
+    let cpu_usec_before = cgroup.cpu_usage_usec();
+    let bench_started = Instant::now();
+    for _ in 0..rounds {
+        for ((name, query), latencies_ms) in queries.iter().zip(&mut query_latencies_ms) {
+            let body = Bytes::from(query.to_string());
+            let record = api.send_timed(name, Method::POST, &path, token, body, &[200]).await;
+            if record.expected {
+                latencies_ms.push(record.elapsed_ms);
+            } else {
+                failures.push(format!("{name}: status {:?}: {}", record.status, record.error.unwrap_or_default()));
+            }
+        }
+    }
+    let wall_s = bench_started.elapsed().as_secs_f64();
+    let cpu_usec = cgroup.cpu_usage_usec_since(cpu_usec_before);
+    let per_query: Vec<Json> = queries
+        .iter()
+        .zip(&query_latencies_ms)
+        .map(|((name, _), latencies_ms)| {
+            json!({"query": name, "median_ms": median(latencies_ms.clone()), "successes": latencies_ms.len()})
+        })
+        .collect();
+    Ok(json!({
+        "rows": table_info["rows"], "parts": table_info["parts"].as_array().map_or(0, Vec::len),
+        "stored_bytes": table_info["bytes"],
+        "setup_s": setup_s, "rounds": rounds, "query_count": queries.len(),
+        "median_query_ms": median(query_latencies_ms.concat()),
+        "per_query": per_query,
+        "bench_wall_s": wall_s,
+        "node_cpu_usage_usec": cpu_usec,
+        "failed_queries": failures.len(),
+        "failure_samples": failures.iter().take(5).collect::<Vec<_>>(),
+    }))
+}
 
 fn benchmark_queries() -> Vec<(&'static str, Json)> {
     let with_full_time_range = |mut query: Json| {
@@ -46,86 +111,5 @@ fn benchmark_queries() -> Vec<(&'static str, Json)> {
 
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
-    if values.is_empty() { 0.0 } else { values[values.len() / 2] }
-}
-
-/// Loads the event table and runs the query suite `rounds` times. Returns timing results as JSON.
-///
-/// Counts failed warm-up and benchmark queries in `failed_queries`. Omits failed queries from
-/// medians.
-pub async fn run(api: &NodeApi, owner: &Owner, cgroup: &NodeCgroup, rounds: usize) -> Result<Json, String> {
-    let (token, db) = (&owner.token, &owner.db);
-    api.create_event_table(
-        token,
-        db,
-        json!({"name": "ev", "columns": [{"name": "time", "type": "time"}, {"name": "user", "type": "string"},
-            {"name": "event", "type": "string"}], "time_column": "time", "order_by": ["time"]}),
-    )
-    .await?;
-    let setup_started = Instant::now();
-    let time_span_ms = 10 * DAY_MS;
-    for batch_start in (0..EVENT_ROW_COUNT).step_by(100_000) {
-        let rows: Vec<String> = (batch_start..EVENT_ROW_COUNT.min(batch_start + 100_000))
-            .map(|i| {
-                let time = START_TIME_MS + (i as i64 * 7_919) % time_span_ms;
-                format!(r#"{{"time": {time}, "user": "user-{:07}", "event": "e{}"}}"#, (i * 7_919) % USER_COUNT, i % 8)
-            })
-            .collect();
-        api.bulk_insert(token, db, "ev", format!("[{}]", rows.join(","))).await?;
-    }
-    let mut part_count = api.part_count(token, db, "ev").await?;
-    let mut stable_polls = 0;
-    while stable_polls < 5 && setup_started.elapsed() < Duration::from_secs(60) {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        let current_part_count = api.part_count(token, db, "ev").await?;
-        stable_polls = if current_part_count == part_count { stable_polls + 1 } else { 0 };
-        part_count = current_part_count;
-    }
-    let table_info = api.table_info(token, db, "ev").await?;
-    let setup_s = setup_started.elapsed().as_secs_f64();
-    let path = format!("/v1/dbs/{db}/events/ev/rows/query");
-    let queries = benchmark_queries();
-    let mut failures = Vec::new();
-    for (name, query) in &queries {
-        if let Err(err) = api.send_expect(Method::POST, &path, token, query.to_string(), &[200]).await {
-            failures.push(format!("warm-up {name}: {err}"));
-        }
-    }
-    let mut query_latencies_ms = vec![Vec::new(); queries.len()];
-    let cpu_usec_before = cgroup.cpu_usage_usec();
-    let bench_started = Instant::now();
-    for _ in 0..rounds {
-        for ((name, query), latencies_ms) in queries.iter().zip(&mut query_latencies_ms) {
-            let query_started = Instant::now();
-            let result = api.send(Method::POST, &path, token, Bytes::from(query.to_string())).await;
-            match result {
-                Ok(reply) if reply.status == 200 => latencies_ms.push(query_started.elapsed().as_secs_f64() * 1000.0),
-                Ok(reply) => failures.push(format!("{name}: status {}: {}", reply.status, reply.excerpt())),
-                Err(err) => failures.push(format!("{name}: {err}")),
-            }
-        }
-    }
-    let wall_s = bench_started.elapsed().as_secs_f64();
-    let cpu_usec = match (cpu_usec_before, cgroup.cpu_usage_usec()) {
-        (Some(before), Some(after)) => Some(after - before),
-        _ => None,
-    };
-    let per_query: Vec<Json> = queries
-        .iter()
-        .zip(&query_latencies_ms)
-        .map(|((name, _), latencies_ms)| {
-            json!({"query": name, "median_ms": median(latencies_ms.clone()), "successes": latencies_ms.len()})
-        })
-        .collect();
-    Ok(json!({
-        "rows": table_info["rows"], "parts": table_info["parts"].as_array().map_or(0, Vec::len),
-        "stored_bytes": table_info["bytes"],
-        "setup_s": setup_s, "rounds": rounds, "query_count": queries.len(),
-        "median_query_ms": median(query_latencies_ms.concat()),
-        "per_query": per_query,
-        "bench_wall_s": wall_s,
-        "node_cpu_usage_usec": cpu_usec,
-        "failed_queries": failures.len(),
-        "failure_samples": failures.iter().take(5).collect::<Vec<_>>(),
-    }))
+    percentile(&values, 0.5)
 }

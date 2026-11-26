@@ -19,22 +19,6 @@ const MERGE_TIMEOUT: Duration = Duration::from_secs(40);
 /// Maximum tables populated concurrently during setup.
 const SETUP_CONCURRENCY: usize = 4;
 
-fn table_count(variant: Variant) -> usize {
-    match variant {
-        Variant::Small => 1,
-        Variant::Attack => 16,
-    }
-}
-
-fn db_name(round: Round) -> String {
-    format!("merges{}", round.index())
-}
-
-fn format_event_row(row_index: usize) -> String {
-    let time = MERGE_DAY_MS + (row_index as i64 * 7_919) % DAY_MS;
-    format!(r#"{{"t":{time},"u":"u{:07}","e":"e{}"}}"#, row_index % 100_000, row_index % 8)
-}
-
 pub struct Merges;
 
 impl Workload for Merges {
@@ -45,9 +29,7 @@ impl Workload for Merges {
             api.create_db(token, &db).await?;
             let table_count = table_count(ctx.variant);
             for table_index in 0..table_count {
-                let table = json!({"name": format!("ev{table_index}"), "columns": [{"name": "t", "type": "time"},
-                    {"name": "u", "type": "string"}, {"name": "e", "type": "string"}], "time_column": "t", "order_by": ["t"]});
-                api.create_event_table(token, &db, table).await?;
+                api.create_event_table(token, &db, &format!("ev{table_index}"), "t", &["u", "e"]).await?;
             }
             // Insert sequentially into each table so the node creates separate parts.
             for table_batch in (0..table_count).collect::<Vec<_>>().chunks(SETUP_CONCURRENCY) {
@@ -123,4 +105,20 @@ impl Workload for Merges {
             })
         })
     }
+}
+
+fn table_count(variant: Variant) -> usize {
+    match variant {
+        Variant::Small => 1,
+        Variant::Attack => 16,
+    }
+}
+
+fn db_name(round: Round) -> String {
+    format!("merges{}", round.index())
+}
+
+fn format_event_row(row_index: usize) -> String {
+    let time = MERGE_DAY_MS + (row_index as i64 * 7_919) % DAY_MS;
+    format!(r#"{{"t":{time},"u":"u{:07}","e":"e{}"}}"#, row_index % 100_000, row_index % 8)
 }

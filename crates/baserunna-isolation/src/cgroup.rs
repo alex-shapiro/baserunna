@@ -11,19 +11,17 @@ use std::time::{Duration, Instant};
 pub struct NodeCgroup(pub PathBuf);
 
 impl NodeCgroup {
-    fn read_file(&self, file_name: &str) -> Option<String> {
-        std::fs::read_to_string(self.0.join(file_name)).ok()
-    }
-
     pub fn memory_current_bytes(&self) -> Option<u64> {
         self.read_file("memory.current")?.trim().parse().ok()
     }
 
-    /// Reads the integer value for `key` from a `key value` cgroup file.
-    fn read_keyed_u64(&self, file_name: &str, key: &str) -> Option<u64> {
-        self.read_file(file_name)?
-            .lines()
-            .find_map(|line| line.strip_prefix(key)?.strip_prefix(' ')?.trim().parse().ok())
+    pub fn cpu_usage_usec(&self) -> Option<u64> {
+        self.read_keyed_u64("cpu.stat", "usage_usec")
+    }
+
+    /// Returns the CPU time used since an earlier [`NodeCgroup::cpu_usage_usec`] reading.
+    pub fn cpu_usage_usec_since(&self, before: Option<u64>) -> Option<u64> {
+        Some(self.cpu_usage_usec()?.saturating_sub(before?))
     }
 
     /// Counts OOM kills inside the node's `main` leaf cgroup.
@@ -32,10 +30,6 @@ impl NodeCgroup {
     pub fn node_oom_kills(&self) -> Option<u64> {
         let leaf = NodeCgroup(self.0.join("main"));
         leaf.read_keyed_u64("memory.events.local", "oom_kill")
-    }
-
-    pub fn cpu_usage_usec(&self) -> Option<u64> {
-        self.read_keyed_u64("cpu.stat", "usage_usec")
     }
 
     /// Counts all processes and descendant cgroups under this cgroup.
@@ -59,25 +53,17 @@ impl NodeCgroup {
     pub fn exists(&self) -> bool {
         Path::new(&self.0).join("memory.current").exists()
     }
-}
 
-/// Process and descendant cgroup counts under a cgroup subtree.
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub struct SubtreeCounts {
-    pub processes: usize,
-    pub cgroups: usize,
-}
+    /// Reads the integer value for `key` from a `key value` cgroup file.
+    fn read_keyed_u64(&self, file_name: &str, key: &str) -> Option<u64> {
+        self.read_file(file_name)?
+            .lines()
+            .find_map(|line| line.strip_prefix(key)?.strip_prefix(' ')?.trim().parse().ok())
+    }
 
-/// Summary of periodic `memory.current` samples.
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct MemorySummary {
-    pub start_bytes: u64,
-    pub peak_bytes: u64,
-    pub end_bytes: u64,
-    pub growth_bytes: u64,
-    pub sample_count: usize,
-    /// Peak memory use in MiB for each 1-second window from the start.
-    pub peak_mib_per_second: Vec<f64>,
+    fn read_file(&self, file_name: &str) -> Option<String> {
+        std::fs::read_to_string(self.0.join(file_name)).ok()
+    }
 }
 
 /// Background thread that samples `memory.current` at a fixed interval.
@@ -125,4 +111,23 @@ impl MemorySampler {
         self.stop_flag.store(true, Relaxed);
         self.thread.join().expect("memory sampler")
     }
+}
+
+/// Summary of periodic `memory.current` samples.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MemorySummary {
+    pub start_bytes: u64,
+    pub peak_bytes: u64,
+    pub end_bytes: u64,
+    pub growth_bytes: u64,
+    pub sample_count: usize,
+    /// Peak memory use in MiB for each 1-second window from the start.
+    pub peak_mib_per_second: Vec<f64>,
+}
+
+/// Process and descendant cgroup counts under a cgroup subtree.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct SubtreeCounts {
+    pub processes: usize,
+    pub cgroups: usize,
 }

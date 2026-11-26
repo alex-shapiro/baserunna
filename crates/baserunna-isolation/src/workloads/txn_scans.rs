@@ -8,7 +8,7 @@
 //! Repeating scan operations up to `MAX_TXN_OPS` multiplies per-request node memory use.
 
 use super::{AttackContext, AttackOutcome, Round, Variant, Workload};
-use bytes::Bytes;
+use baserunna_api::{Body, Op, Txn, TxnRequest};
 use futures_util::future::BoxFuture;
 use reqwest::Method;
 use serde_json::{Value as Json, json};
@@ -33,17 +33,20 @@ impl Workload for TxnScans {
     fn prepare<'a>(&'a self, ctx: &'a AttackContext, round: Round) -> BoxFuture<'a, Result<Json, String>> {
         Box::pin(async move {
             if round == Round::WithVictim {
-                return Ok(json!({"reuses": "the keys of the first round"}));
+                return Ok(Json::Null);
             }
             let value = "x".repeat(VALUE_BYTES);
-            let path = format!("/v1/dbs/{}/txn", ctx.attacker.db);
+            let endpoint = Txn { db: ctx.attacker.db.clone() };
             for batch_start in (0..KEY_COUNT).step_by(PUTS_PER_TXN) {
-                let ops: Vec<Json> = (batch_start..(batch_start + PUTS_PER_TXN).min(KEY_COUNT))
-                    .map(|i| json!({"op": "put", "key": format!("{KEY_PREFIX}{i:06}"), "value": value}))
+                let ops = (batch_start..(batch_start + PUTS_PER_TXN).min(KEY_COUNT))
+                    .map(|i| Op::Put {
+                        key: format!("{KEY_PREFIX}{i:06}"),
+                        value: Some(value.clone()),
+                        blob_id: None,
+                        ttl_ms: None,
+                    })
                     .collect();
-                ctx.api
-                    .send_expect(Method::POST, &path, &ctx.attacker.token, json!({"ops": ops}).to_string(), &[200])
-                    .await?;
+                ctx.api.call(&endpoint, &ctx.attacker.token, &TxnRequest { ops, ..Default::default() }).await?;
             }
             Ok(json!({"keys": KEY_COUNT, "value_bytes": VALUE_BYTES}))
         })
@@ -55,8 +58,16 @@ impl Workload for TxnScans {
                 Variant::Small => (1, SMALL_SCANS),
                 Variant::Attack => (ATTACK_REQUESTS, ATTACK_SCANS),
             };
-            let scan = json!({"op": "scan", "prefix": KEY_PREFIX, "limit": KEY_COUNT});
-            let body = Bytes::from(json!({"ops": vec![scan; scans_per_txn]}).to_string());
+            let scan = Op::Scan {
+                prefix: Some(KEY_PREFIX.into()),
+                start: None,
+                end: None,
+                limit: Some(KEY_COUNT),
+                reverse: false,
+                keys_only: false,
+                cursor: None,
+            };
+            let body = TxnRequest { ops: vec![scan; scans_per_txn], ..Default::default() }.encode();
             let path = format!("/v1/dbs/{}/txn", ctx.attacker.db);
             let tasks: Vec<_> = (0..txn_count)
                 .map(|i| {

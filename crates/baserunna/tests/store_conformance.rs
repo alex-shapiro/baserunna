@@ -68,7 +68,7 @@ fn model_sequences_agree_on_mem_and_fs_stores() {
 fn fake_store(s3: &FakeS3, prefix: &str, extra: &[(&str, &str)]) -> DynStore {
     let mut cfg = s3.config();
     cfg.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
-    Arc::new(CloudStore::from_url_with(&format!("s3://{}/{prefix}", BUCKET), cfg).unwrap())
+    Arc::new(CloudStore::from_url_with(&format!("s3://{BUCKET}/{prefix}"), cfg).unwrap())
 }
 
 #[test]

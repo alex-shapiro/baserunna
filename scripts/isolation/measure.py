@@ -29,27 +29,28 @@ ISOLATION_WORKLOADS = [
     "stream_filter_scans",
 ]
 COST_WORKLOADS = ["kv_throughput", "idle_cost", "event_scan"]
-COST_CLIENT_FLAGS = {"kv_throughput": ["--clients", "256"]}
 RUN_SCRIPT = Path(__file__).resolve().with_name("run.py")
 
 
-def copy_binaries(target_dir, bin_dir):
-    """Copy binaries into `bin_dir` so concurrent builds do not overwrite them.
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    results_dir = Path(sys.argv[1]).resolve()
+    workloads = sys.argv[2:] or ISOLATION_WORKLOADS + COST_WORKLOADS
+    repeats = int(os.environ.get("REPS", "2"))
+    target_dir = Path(
+        os.environ.get("ISOLATION_TARGET_DIR", Path.home() / "target-isolation")
+    )
+    bin_dir = results_dir / "bin"
+    copy_binaries(target_dir, bin_dir)
+    for workload in workloads:
+        for iteration in range(1, repeats + 1):
+            variants = ["-"] if workload in COST_WORKLOADS else ["small", "attack"]
+            for variant in variants:
+                run_workload(results_dir, bin_dir, workload, variant, iteration)
 
-    Delete old copies first because overwriting a running binary on a shared mount can crash it.
-    """
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    sources = [
-        target_dir / "release/baserunna",
-        target_dir / "release/isolation",
-        target_dir / "release/fake_s3_server",
-    ]
-    for source in sources:
-        (bin_dir / source.name).unlink(missing_ok=True)
-        shutil.copy2(source, bin_dir / source.name)
 
-
-def run_workload(results_dir, bin_dir, workload, variant, iteration, client_flags):
+def run_workload(results_dir, bin_dir, workload, variant, iteration):
     result_path = results_dir / f"{workload}-{variant}-r{iteration}.json"
     print(
         f"== {time.strftime('%H:%M:%S')} {workload} {variant} r{iteration}",
@@ -66,9 +67,7 @@ def run_workload(results_dir, bin_dir, workload, variant, iteration, client_flag
     ]
     env = dict(os.environ, HARNESS_BIN_DIR=str(bin_dir))
     with open(result_path.with_suffix(".stdout"), "w") as log:
-        subprocess.run(
-            command + client_flags, env=env, stdout=log, stderr=subprocess.STDOUT
-        )
+        subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT)
     try:
         result = json.loads(result_path.read_text())
     except (OSError, ValueError):
@@ -78,37 +77,26 @@ def run_workload(results_dir, bin_dir, workload, variant, iteration, client_flag
     print(
         json.dumps(
             result.get("conditions")
-            or {"stopped": run_info.get("node_stopped"), "error": result.get("error")}
+            or {"node_exit_status": run_info.get("node_exit_status"), "error": result.get("error")}
         ),
         flush=True,
     )
 
 
-def main():
-    if len(sys.argv) < 2:
-        sys.exit(__doc__)
-    results_dir = Path(sys.argv[1]).resolve()
-    workloads = sys.argv[2:] or ISOLATION_WORKLOADS + COST_WORKLOADS
-    repeats = int(os.environ.get("REPS", "2"))
-    target_dir = Path(
-        os.environ.get("ISOLATION_TARGET_DIR", Path.home() / "target-isolation")
-    )
-    bin_dir = results_dir / "bin"
-    copy_binaries(target_dir, bin_dir)
-    for workload in workloads:
-        for iteration in range(1, repeats + 1):
-            if workload in COST_WORKLOADS:
-                run_workload(
-                    results_dir,
-                    bin_dir,
-                    workload,
-                    "-",
-                    iteration,
-                    COST_CLIENT_FLAGS.get(workload, []),
-                )
-            else:
-                for variant in ("small", "attack"):
-                    run_workload(results_dir, bin_dir, workload, variant, iteration, [])
+def copy_binaries(target_dir, bin_dir):
+    """Copy binaries into `bin_dir` so concurrent builds do not overwrite them.
+
+    Delete old copies first because overwriting a running binary on a shared mount can crash it.
+    """
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    sources = [
+        target_dir / "release/baserunna",
+        target_dir / "release/isolation",
+        target_dir / "release/fake_s3_server",
+    ]
+    for source in sources:
+        (bin_dir / source.name).unlink(missing_ok=True)
+        shutil.copy2(source, bin_dir / source.name)
 
 
 if __name__ == "__main__":

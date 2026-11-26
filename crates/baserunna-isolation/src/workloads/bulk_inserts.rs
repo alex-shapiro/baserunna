@@ -14,13 +14,7 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use serde_json::{Value as Json, json};
 
-/// Row formatter and body sizes for a bulk insert row shape.
-struct RowShape {
-    name: &'static str,
-    format_row: fn(usize) -> String,
-    attack_body_bytes: usize,
-    small_body_bytes: usize,
-}
+const PROBE_BODY_BYTES: usize = 256 << 10;
 
 const ROW_SHAPES: &[RowShape] = &[
     RowShape {
@@ -39,22 +33,14 @@ const ROW_SHAPES: &[RowShape] = &[
     },
 ];
 
-const PROBE_BODY_BYTES: usize = 256 << 10;
-
-fn table_name(round: Round, shape: &str) -> String {
-    format!("bulk{}_{shape}", round.index())
-}
-
 pub struct BulkInserts;
 
 impl Workload for BulkInserts {
     fn prepare<'a>(&'a self, ctx: &'a AttackContext, round: Round) -> BoxFuture<'a, Result<Json, String>> {
         Box::pin(async move {
+            let (api, token, db) = (&ctx.api, &ctx.attacker.token, &ctx.attacker.db);
             for shape in ROW_SHAPES {
-                let table_schema = json!({"name": table_name(round, shape.name), "columns": [{"name": "time", "type": "time", "default": "now"},
-                    {"name": "user", "type": "string"}, {"name": "event", "type": "string"}],
-                    "time_column": "time", "order_by": ["time"]});
-                ctx.api.create_event_table(&ctx.attacker.token, &ctx.attacker.db, table_schema).await?;
+                api.create_event_table(token, db, &table_name(round, shape.name), "time", &["user", "event"]).await?;
             }
             if round == Round::WithVictim {
                 return Ok(Json::Null);
@@ -62,14 +48,11 @@ impl Workload for BulkInserts {
             let mut notes = Vec::new();
             for shape in ROW_SHAPES {
                 let table = format!("probe_{}", shape.name);
-                let table_schema = json!({"name": table, "columns": [{"name": "time", "type": "time", "default": "now"},
-                    {"name": "user", "type": "string"}, {"name": "event", "type": "string"}],
-                    "time_column": "time", "order_by": ["time"]});
-                ctx.api.create_event_table(&ctx.attacker.token, &ctx.attacker.db, table_schema).await?;
+                api.create_event_table(token, db, &table, "time", &["user", "event"]).await?;
                 let (probe_body, _) = json_rows(PROBE_BODY_BYTES, shape.format_row);
                 let probe_len = probe_body.len();
                 let sampler = MemorySampler::start(ctx.cgroup.clone());
-                ctx.api.bulk_insert(&ctx.attacker.token, &ctx.attacker.db, &table, probe_body).await?;
+                api.bulk_insert(token, db, &table, probe_body).await?;
                 let growth_bytes = sampler.finish().growth_bytes;
                 let node_bytes_per_body_byte = growth_bytes as f64 / probe_len as f64;
                 notes.push(json!({"shape": shape.name, "probe_node_bytes_per_body_byte": node_bytes_per_body_byte}));
@@ -108,4 +91,16 @@ impl Workload for BulkInserts {
             Ok(AttackOutcome { requests, completed: true, notes: Json::Array(notes) })
         })
     }
+}
+
+fn table_name(round: Round, shape: &str) -> String {
+    format!("bulk{}_{shape}", round.index())
+}
+
+/// Row formatter and body sizes for a bulk insert row shape.
+struct RowShape {
+    name: &'static str,
+    format_row: fn(usize) -> String,
+    attack_body_bytes: usize,
+    small_body_bytes: usize,
 }

@@ -1,6 +1,8 @@
 //! Victim workload generator using closed-loop KV and transaction clients plus periodic event queries.
 
-use crate::http::{NodeApi, Owner};
+use crate::http::{NodeApi, Owner, RequestRecord};
+use crate::percentile;
+use baserunna_api::{Body, Op, TxnRequest};
 use bytes::Bytes;
 use reqwest::Method;
 use serde::Serialize;
@@ -12,60 +14,6 @@ use std::time::{Duration, Instant};
 pub const CLIENT_COUNT: usize = 8;
 const KEY_COUNT: usize = 100;
 const EVENT_TABLE: &str = "vev";
-
-/// Latency and failure summary for victim requests during a phase.
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct VictimStats {
-    pub requests: usize,
-    pub failures: usize,
-    pub p50_ms: f64,
-    pub p99_ms: f64,
-    pub max_ms: f64,
-    pub event_queries: usize,
-    pub event_query_p99_ms: f64,
-    pub seconds: f64,
-    /// Up to 10 sample failures formatted as `label: detail`.
-    pub failure_samples: Vec<String>,
-}
-
-/// Populates victim KV keys and a small event table.
-pub async fn prepare(api: &NodeApi, victim: &Owner) -> Result<(), String> {
-    for key_index in 0..KEY_COUNT {
-        api.send_expect(
-            Method::PUT,
-            &format!("/v1/dbs/{}/kv/k{key_index}", victim.db),
-            &victim.token,
-            vec![b'v'; 100],
-            &[200, 201, 204],
-        )
-        .await?;
-    }
-    api.create_event_table(
-        &victim.token,
-        &victim.db,
-        json!({"name": EVENT_TABLE, "columns": [{"name": "t", "type": "time"}, {"name": "u", "type": "string"},
-            {"name": "e", "type": "string"}], "time_column": "t", "order_by": ["t"]}),
-    )
-    .await?;
-    let rows: Vec<String> = (0..10_000)
-        .map(|i| format!(r#"{{"t":{},"u":"u{}","e":"e{}"}}"#, 1_749_000_000_000i64 + i * 1000, i % 500, i % 8))
-        .collect();
-    api.bulk_insert(&victim.token, &victim.db, EVENT_TABLE, format!("[{}]", rows.join(","))).await
-}
-
-fn percentile(sorted: &[f64], quantile: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    sorted[((sorted.len() as f64 * quantile).ceil() as usize).clamp(1, sorted.len()) - 1]
-}
-
-struct RequestSample {
-    label: &'static str,
-    succeeded: bool,
-    elapsed_ms: f64,
-    detail: String,
-}
 
 /// Runs victim traffic until `stop` is true and returns latency statistics.
 ///
@@ -92,12 +40,20 @@ pub async fn run(api: Arc<NodeApi>, victim: Owner, stop: Arc<AtomicBool>, max_rp
                         Bytes::from(vec![b'w'; 100]),
                     ),
                     _ => {
-                        let ops = json!({"ops": [{"op": "get", "key": format!("k{key_index}")},
-                            {"op": "put", "key": format!("k{}", (key_index + 1) % KEY_COUNT), "value": "txn value"}]});
-                        ("txn", Method::POST, format!("/v1/dbs/{}/txn", victim.db), Bytes::from(ops.to_string()))
+                        let ops = vec![
+                            Op::Get { key: format!("k{key_index}") },
+                            Op::Put {
+                                key: format!("k{}", (key_index + 1) % KEY_COUNT),
+                                value: Some("txn value".into()),
+                                blob_id: None,
+                                ttl_ms: None,
+                            },
+                        ];
+                        let body = TxnRequest { ops, ..Default::default() }.encode();
+                        ("txn", Method::POST, format!("/v1/dbs/{}/txn", victim.db), body)
                     }
                 };
-                samples.push(send_sample(&api, &victim, label, method, &path, body).await);
+                samples.push(api.send_timed(label, method, &path, &victim.token, body, &[200]).await);
                 step += CLIENT_COUNT;
                 tokio::time::sleep_until(next_request_at).await;
             }
@@ -113,10 +69,8 @@ pub async fn run(api: Arc<NodeApi>, victim: Owner, stop: Arc<AtomicBool>, max_rp
             while !stop.load(Relaxed) {
                 let next_request_at = tokio::time::Instant::now() + Duration::from_secs(1);
                 let path = format!("/v1/dbs/{}/events/{EVENT_TABLE}/rows/query", victim.db);
-                samples.push(
-                    send_sample(&api, &victim, "event query", Method::POST, &path, Bytes::from(query.to_string()))
-                        .await,
-                );
+                let body = Bytes::from(query.to_string());
+                samples.push(api.send_timed("event query", Method::POST, &path, &victim.token, body, &[200]).await);
                 tokio::time::sleep_until(next_request_at).await;
             }
             samples
@@ -132,7 +86,7 @@ pub async fn run(api: Arc<NodeApi>, victim: Owner, stop: Arc<AtomicBool>, max_rp
     samples.extend(query_samples);
     let mut all_latencies_ms: Vec<f64> = samples.iter().map(|sample| sample.elapsed_ms).collect();
     all_latencies_ms.sort_by(f64::total_cmp);
-    let failed_samples: Vec<&RequestSample> = samples.iter().filter(|sample| !sample.succeeded).collect();
+    let failed_samples: Vec<&RequestRecord> = samples.iter().filter(|sample| !sample.expected).collect();
     VictimStats {
         requests: samples.len(),
         failures: failed_samples.len(),
@@ -145,32 +99,34 @@ pub async fn run(api: Arc<NodeApi>, victim: Owner, stop: Arc<AtomicBool>, max_rp
         failure_samples: failed_samples
             .iter()
             .take(10)
-            .map(|sample| format!("{}: {}", sample.label, sample.detail))
+            .map(|sample| format!("{}: {}", sample.label, sample.error.as_deref().unwrap_or_default()))
             .collect(),
     }
 }
 
-async fn send_sample(
-    api: &NodeApi,
-    victim: &Owner,
-    label: &'static str,
-    method: Method,
-    path: &str,
-    body: Bytes,
-) -> RequestSample {
-    let started = Instant::now();
-    let result = api.send(method, path, &victim.token, body).await;
-    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    match result {
-        Ok(reply) if (200..300).contains(&reply.status) => {
-            RequestSample { label, succeeded: true, elapsed_ms, detail: String::new() }
-        }
-        Ok(reply) => RequestSample {
-            label,
-            succeeded: false,
-            elapsed_ms,
-            detail: format!("status {}: {}", reply.status, reply.excerpt()),
-        },
-        Err(err) => RequestSample { label, succeeded: false, elapsed_ms, detail: err },
+/// Populates victim KV keys and a small event table.
+pub async fn prepare(api: &NodeApi, victim: &Owner) -> Result<(), String> {
+    for key_index in 0..KEY_COUNT {
+        api.put_value(&victim.token, &victim.db, &format!("k{key_index}"), vec![b'v'; 100]).await?;
     }
+    api.create_event_table(&victim.token, &victim.db, EVENT_TABLE, "t", &["u", "e"]).await?;
+    let rows: Vec<String> = (0..10_000)
+        .map(|i| format!(r#"{{"t":{},"u":"u{}","e":"e{}"}}"#, 1_749_000_000_000i64 + i * 1000, i % 500, i % 8))
+        .collect();
+    api.bulk_insert(&victim.token, &victim.db, EVENT_TABLE, format!("[{}]", rows.join(","))).await
+}
+
+/// Latency and failure summary for victim requests during a phase.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct VictimStats {
+    pub requests: usize,
+    pub failures: usize,
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+    pub event_queries: usize,
+    pub event_query_p99_ms: f64,
+    pub seconds: f64,
+    /// Up to 10 sample failures formatted as `label: detail`.
+    pub failure_samples: Vec<String>,
 }

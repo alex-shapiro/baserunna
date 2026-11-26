@@ -1,12 +1,14 @@
 //! HTTP client for the node's public API.
 
+use baserunna_api::{Body, CreateDb, Credentials, Endpoint, NewDb, Octets, PutOptions, PutValue, SignUp};
 use bytes::Bytes;
-use reqwest::Method;
+use reqwest::header::{CONTENT_TYPE, HeaderMap};
+use reqwest::{Method, RequestBuilder};
 use serde::Serialize;
 use serde_json::{Value as Json, json};
 use std::time::{Duration, Instant};
 
-/// Maximum time that [`NodeApi::send_expect`] retries a request.
+/// Maximum time that [`NodeApi::call`] and [`NodeApi::send_expect`] retry a request.
 pub const SETUP_RETRY_LIMIT: Duration = Duration::from_secs(60);
 
 /// HTTP client bound to a single node URL.
@@ -15,63 +17,33 @@ pub struct NodeApi {
     base_url: String,
 }
 
-/// HTTP response returned by the node.
-pub struct HttpReply {
-    pub status: u16,
-    pub body: Bytes,
-}
-
-impl HttpReply {
-    pub fn json(&self) -> Json {
-        serde_json::from_slice(&self.body).unwrap_or(Json::Null)
-    }
-
-    pub fn excerpt(&self) -> String {
-        String::from_utf8_lossy(&self.body[..self.body.len().min(300)]).into_owned()
-    }
-}
-
-/// Timing and outcome of a request, including its HTTP status or transport error.
-#[derive(Clone, Debug, Serialize)]
-pub struct RequestRecord {
-    pub label: String,
-    pub status: Option<u16>,
-    pub elapsed_ms: f64,
-    /// True if the response status is in the expected status list.
-    pub expected: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// Authenticated database owner with a bearer token and database name.
-#[derive(Clone)]
-pub struct Owner {
-    pub token: String,
-    pub db: String,
-}
-
 impl NodeApi {
     pub fn new(base_url: &str, timeout: Duration) -> NodeApi {
         let http = reqwest::Client::builder().timeout(timeout).pool_max_idle_per_host(64).build().expect("http client");
         NodeApi { http, base_url: base_url.trim_end_matches('/').to_string() }
     }
 
-    pub async fn send(&self, method: Method, path: &str, token: &str, body: Bytes) -> Result<HttpReply, String> {
-        let mut request =
-            self.http.request(method, format!("{}{path}", self.base_url)).header("content-type", "application/json");
-        if !token.is_empty() {
-            request = request.bearer_auth(token);
-        }
-        let response = request.body(body).send().await.map_err(|err| format!("{err:?}"))?;
-        let status = response.status().as_u16();
-        let body = response.bytes().await.map_err(|err| format!("{err:?}"))?;
-        Ok(HttpReply { status, body })
+    /// Sends a typed API request and decodes its response. Retries like [`NodeApi::send_expect`].
+    pub async fn call<E: Endpoint>(&self, endpoint: &E, token: &str, body: &E::Body) -> Result<E::Response, String> {
+        let path = endpoint.path();
+        let build_request = || {
+            let mut request = self.request(E::METHOD, &path, token);
+            if let Some(content_type) = E::Body::CONTENT_TYPE {
+                request = request.header(CONTENT_TYPE, content_type);
+            }
+            request.headers(endpoint.headers()).body(body.encode())
+        };
+        let label = format!("{} {path}", E::METHOD);
+        let reply = self.send_with_retries(&label, build_request, &[E::STATUS.as_u16()]).await?;
+        let (mut head, ()) = ::http::Response::new(()).into_parts();
+        head.status = E::STATUS;
+        head.headers = reply.headers;
+        E::response(&head, reply.body).map_err(|err| format!("{label}: {err}"))
     }
 
-    /// Sends a request and requires the response status to match `expected_statuses`.
+    /// Sends a JSON request and requires the response status to match `expected_statuses`.
     ///
-    /// Retries any error response that the node marks retryable, such as HTTP 503 or HTTP 409.
-    /// Uses exponential backoff up to [`SETUP_RETRY_LIMIT`].
+    /// Use this method only for routes that have no [`Endpoint`] type, such as event tables.
     pub async fn send_expect(
         &self,
         method: Method,
@@ -81,26 +53,11 @@ impl NodeApi {
         expected_statuses: &[u16],
     ) -> Result<HttpReply, String> {
         let body = body.into();
-        let started = Instant::now();
-        let mut backoff = Duration::from_millis(100);
-        loop {
-            let reply = self
-                .send(method.clone(), path, token, body.clone())
-                .await
-                .map_err(|err| format!("{method} {path}: {err}"))?;
-            if expected_statuses.contains(&reply.status) {
-                return Ok(reply);
-            }
-            let retryable = reply.json()["error"]["retryable"] == json!(true);
-            if !retryable || started.elapsed() + backoff > SETUP_RETRY_LIMIT {
-                return Err(format!("{method} {path}: status {}: {}", reply.status, reply.excerpt()));
-            }
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(5));
-        }
+        let build_request = || self.json_request(method.clone(), path, token, body.clone());
+        self.send_with_retries(&format!("{method} {path}"), build_request, expected_statuses).await
     }
 
-    /// Sends a request and records its status and elapsed time.
+    /// Sends a JSON request once and records its status and elapsed time.
     pub async fn send_timed(
         &self,
         label: &str,
@@ -110,25 +67,11 @@ impl NodeApi {
         body: Bytes,
         expected_statuses: &[u16],
     ) -> RequestRecord {
-        let started = Instant::now();
-        let result = self.send(method, path, token, body).await;
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-        match result {
-            Ok(reply) => RequestRecord {
-                label: label.into(),
-                status: Some(reply.status),
-                elapsed_ms,
-                expected: expected_statuses.contains(&reply.status),
-                error: (!expected_statuses.contains(&reply.status)).then(|| reply.excerpt()),
-            },
-            Err(err) => {
-                RequestRecord { label: label.into(), status: None, elapsed_ms, expected: false, error: Some(err) }
-            }
-        }
+        self.send_timed_drain(label, method, path, token, body, expected_statuses).await.0
     }
 
-    /// Sends a request and discards its response body in chunks. Returns the request record and
-    /// total response bytes.
+    /// Sends a JSON request once and discards its response body in chunks. Returns the request
+    /// record and total response bytes.
     ///
     /// Reads chunks as they arrive so the client does not buffer large responses in memory.
     pub async fn send_timed_drain(
@@ -141,11 +84,6 @@ impl NodeApi {
         expected_statuses: &[u16],
     ) -> (RequestRecord, u64) {
         let started = Instant::now();
-        let mut request =
-            self.http.request(method, format!("{}{path}", self.base_url)).header("content-type", "application/json");
-        if !token.is_empty() {
-            request = request.bearer_auth(token);
-        }
         let build_record = |status: Option<u16>, error: Option<String>| RequestRecord {
             label: label.into(),
             status,
@@ -153,7 +91,7 @@ impl NodeApi {
             expected: error.is_none() && status.is_some_and(|code| expected_statuses.contains(&code)),
             error,
         };
-        let mut response = match request.body(body).send().await {
+        let mut response = match self.json_request(method, path, token, body).send().await {
             Ok(response) => response,
             Err(err) => return (build_record(None, Some(format!("{err:?}"))), 0),
         };
@@ -181,34 +119,43 @@ impl NodeApi {
         (build_record(Some(status), error), total_bytes)
     }
 
-    pub async fn wait_healthy(&self, timeout: Duration) -> Result<(), String> {
-        let started = Instant::now();
-        while started.elapsed() < timeout {
-            if let Ok(reply) = self.send(Method::GET, "/healthz", "", Bytes::new()).await
-                && reply.status == 200
-            {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-        Err(format!("{}/healthz did not return 200 within {timeout:?}", self.base_url))
-    }
-
     /// Registers a user account and creates database `db`.
     pub async fn create_owner(&self, email: &str, db: &str) -> Result<Owner, String> {
-        let body = json!({"email": email, "password": "password-123"}).to_string();
-        let reply = self.send_expect(Method::POST, "/v1/auth/signup", "", body, &[200, 201]).await?;
-        let token = reply.json()["token"].as_str().ok_or("signup response did not contain a token")?.to_string();
-        self.create_db(&token, db).await?;
-        Ok(Owner { token, db: db.into() })
+        let credentials = Credentials { email: email.into(), password: "password-123".into() };
+        let session = self.call(&SignUp, "", &credentials).await?;
+        self.create_db(&session.token, db).await?;
+        Ok(Owner { token: session.token, db: db.into() })
     }
 
     pub async fn create_db(&self, token: &str, db: &str) -> Result<(), String> {
-        self.send_expect(Method::POST, "/v1/dbs", token, json!({"name": db}).to_string(), &[200, 201]).await.map(|_| ())
+        self.call(&CreateDb, token, &NewDb { name: db.into(), org: None }).await.map(|_| ())
     }
 
-    pub async fn create_event_table(&self, token: &str, db: &str, table: Json) -> Result<(), String> {
-        self.send_expect(Method::POST, &format!("/v1/dbs/{db}/events"), token, table.to_string(), &[201])
+    pub async fn put_value(&self, token: &str, db: &str, key: &str, value: impl Into<Bytes>) -> Result<(), String> {
+        let endpoint = PutValue {
+            db: db.into(),
+            key: Bytes::copy_from_slice(key.as_bytes()),
+            options: PutOptions::default(),
+            idempotency_key: None,
+        };
+        self.call(&endpoint, token, &Octets(value.into())).await.map(|_| ())
+    }
+
+    /// Creates an event table with time column `time_column` and string columns `string_columns`.
+    ///
+    /// Rows without a time value get the insert time.
+    pub async fn create_event_table(
+        &self,
+        token: &str,
+        db: &str,
+        table: &str,
+        time_column: &str,
+        string_columns: &[&str],
+    ) -> Result<(), String> {
+        let mut columns = vec![json!({"name": time_column, "type": "time", "default": "now"})];
+        columns.extend(string_columns.iter().map(|name| json!({"name": name, "type": "string"})));
+        let schema = json!({"name": table, "columns": columns, "time_column": time_column, "order_by": [time_column]});
+        self.send_expect(Method::POST, &format!("/v1/dbs/{db}/events"), token, schema.to_string(), &[201])
             .await
             .map(|_| ())
     }
@@ -227,6 +174,112 @@ impl NodeApi {
 
     pub async fn part_count(&self, token: &str, db: &str, table: &str) -> Result<usize, String> {
         Ok(self.table_info(token, db, table).await?["parts"].as_array().map_or(0, Vec::len))
+    }
+
+    /// Polls event table `table` until its part count stays the same for 3 seconds, or for at most
+    /// 60 seconds. Returns the table info.
+    pub async fn wait_for_stable_parts(&self, token: &str, db: &str, table: &str) -> Result<Json, String> {
+        let started = Instant::now();
+        let mut part_count = self.part_count(token, db, table).await?;
+        let mut stable_polls = 0;
+        while stable_polls < 6 && started.elapsed() < Duration::from_secs(60) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let current_part_count = self.part_count(token, db, table).await?;
+            stable_polls = if current_part_count == part_count { stable_polls + 1 } else { 0 };
+            part_count = current_part_count;
+        }
+        self.table_info(token, db, table).await
+    }
+
+    pub async fn wait_healthy(&self, timeout: Duration) -> Result<(), String> {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if let Ok(reply) = Self::reply(self.request(Method::GET, "/healthz", "")).await
+                && reply.status == 200
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        Err(format!("{}/healthz did not return 200 within {timeout:?}", self.base_url))
+    }
+
+    /// Sends the request from `build_request` until the status matches `expected_statuses`.
+    ///
+    /// Retries any error response that the node marks retryable, such as HTTP 503 or HTTP 409.
+    /// Uses exponential backoff up to [`SETUP_RETRY_LIMIT`].
+    async fn send_with_retries(
+        &self,
+        label: &str,
+        build_request: impl Fn() -> RequestBuilder,
+        expected_statuses: &[u16],
+    ) -> Result<HttpReply, String> {
+        let started = Instant::now();
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            let reply = Self::reply(build_request()).await.map_err(|err| format!("{label}: {err}"))?;
+            if expected_statuses.contains(&reply.status) {
+                return Ok(reply);
+            }
+            let retryable = reply.json()["error"]["retryable"] == json!(true);
+            if !retryable || started.elapsed() + backoff > SETUP_RETRY_LIMIT {
+                return Err(format!("{label}: status {}: {}", reply.status, reply.excerpt()));
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(5));
+        }
+    }
+
+    fn request(&self, method: Method, path: &str, token: &str) -> RequestBuilder {
+        let request = self.http.request(method, format!("{}{path}", self.base_url));
+        if token.is_empty() { request } else { request.bearer_auth(token) }
+    }
+
+    fn json_request(&self, method: Method, path: &str, token: &str, body: Bytes) -> RequestBuilder {
+        self.request(method, path, token).header(CONTENT_TYPE, "application/json").body(body)
+    }
+
+    async fn reply(request: RequestBuilder) -> Result<HttpReply, String> {
+        let response = request.send().await.map_err(|err| format!("{err:?}"))?;
+        let (status, headers) = (response.status().as_u16(), response.headers().clone());
+        let body = response.bytes().await.map_err(|err| format!("{err:?}"))?;
+        Ok(HttpReply { status, headers, body })
+    }
+}
+
+/// Authenticated database owner with a bearer token and database name.
+#[derive(Clone)]
+pub struct Owner {
+    pub token: String,
+    pub db: String,
+}
+
+/// Timing and outcome of a request, including its HTTP status or transport error.
+#[derive(Clone, Debug, Serialize)]
+pub struct RequestRecord {
+    pub label: String,
+    pub status: Option<u16>,
+    pub elapsed_ms: f64,
+    /// True if the response status is in the expected status list.
+    pub expected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// HTTP response returned by the node.
+pub struct HttpReply {
+    pub status: u16,
+    pub headers: HeaderMap,
+    pub body: Bytes,
+}
+
+impl HttpReply {
+    pub fn json(&self) -> Json {
+        serde_json::from_slice(&self.body).unwrap_or(Json::Null)
+    }
+
+    pub fn excerpt(&self) -> String {
+        String::from_utf8_lossy(&self.body[..self.body.len().min(300)]).into_owned()
     }
 }
 

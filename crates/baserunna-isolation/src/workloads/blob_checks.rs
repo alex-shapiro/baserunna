@@ -3,9 +3,8 @@
 //! Each check compares the full blob against a short string. The harness expects HTTP 412.
 
 use super::{AttackContext, AttackOutcome, Round, Variant, Workload, concurrent_posts};
-use bytes::Bytes;
+use baserunna_api::{Body, Op, TxnRequest};
 use futures_util::future::BoxFuture;
-use reqwest::Method;
 use serde_json::{Value as Json, json};
 
 const BLOB_BYTES: usize = 256 << 20;
@@ -16,13 +15,10 @@ impl Workload for BlobChecks {
     fn prepare<'a>(&'a self, ctx: &'a AttackContext, round: Round) -> BoxFuture<'a, Result<Json, String>> {
         Box::pin(async move {
             if round == Round::WithVictim {
-                return Ok(json!({"reuses": "the blob of the first round"}));
+                return Ok(Json::Null);
             }
             let started = std::time::Instant::now();
-            let path = format!("/v1/dbs/{}/kv/big", ctx.attacker.db);
-            ctx.api
-                .send_expect(Method::PUT, &path, &ctx.attacker.token, vec![b'x'; BLOB_BYTES], &[200, 201, 204])
-                .await?;
+            ctx.api.put_value(&ctx.attacker.token, &ctx.attacker.db, "big", vec![b'x'; BLOB_BYTES]).await?;
             Ok(json!({"blob_bytes": BLOB_BYTES, "upload_s": started.elapsed().as_secs_f64()}))
         })
     }
@@ -33,8 +29,9 @@ impl Workload for BlobChecks {
                 Variant::Small => 1,
                 Variant::Attack => 4,
             };
-            let request_body =
-                Bytes::from(json!({"ops": [{"op": "check", "key": "big", "value": "not the blob"}]}).to_string());
+            let check =
+                Op::Check { key: "big".into(), exists: None, version: None, value: Some("not the blob".into()) };
+            let request_body = TxnRequest { ops: vec![check], ..Default::default() }.encode();
             let path = format!("/v1/dbs/{}/txn", ctx.attacker.db);
             let batch = (0..check_count).map(|i| (format!("check {i}"), path.clone(), request_body.clone())).collect();
             let requests = concurrent_posts(ctx, batch, &[412]).await;

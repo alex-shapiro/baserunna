@@ -12,29 +12,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const BUCKET: &str = "bucket";
 const MAX_LIST_KEYS: usize = 3;
 
-#[derive(Clone, Debug)]
-pub enum Fault {
-    Fail(u16),
-    ApplyThenFail(u16),
-    Delay(Duration),
-}
-
-struct Obj {
-    data: Bytes,
-    etag: String,
-    modified_s: u64,
-}
-
-#[derive(Default)]
-struct Inner {
-    objects: BTreeMap<String, Obj>,
-    faults: VecDeque<(Method, Fault)>,
-    requests: BTreeMap<String, usize>,
-    writes: u64,
-    max_list_keys: Option<usize>,
-    latency: Option<Duration>,
-}
-
 #[derive(Clone, Default)]
 pub struct FakeS3 {
     inner: Arc<Mutex<Inner>>,
@@ -73,13 +50,11 @@ impl FakeS3 {
     }
 
     /// Sets the maximum key count returned per list request. The default is 3.
-    #[allow(dead_code)]
     pub fn set_max_list_keys(&self, max_keys: usize) {
         self.inner.lock().max_list_keys = Some(max_keys);
     }
 
     /// Adds `latency` to each request to simulate remote object storage.
-    #[allow(dead_code)]
     pub fn set_latency(&self, latency: Duration) {
         self.inner.lock().latency = Some(latency);
     }
@@ -97,87 +72,11 @@ impl FakeS3 {
     }
 }
 
-fn now_s() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
-}
-
-fn utc_date_time(secs: u64) -> (i64, u32, u32, u64) {
-    let days = (secs / 86_400) as i64;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = yoe + era * 400 + i64::from(m <= 2);
-    (y, m, d, secs % 86_400)
-}
-
-fn http_date(secs: u64) -> String {
-    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
-    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    let (y, m, d, t) = utc_date_time(secs);
-    let wd = DAYS[((secs / 86_400) % 7) as usize];
-    format!("{wd}, {d:02} {} {y} {:02}:{:02}:{:02} GMT", MONTHS[m as usize - 1], t / 3600, t / 60 % 60, t % 60)
-}
-
-fn iso_date(secs: u64) -> String {
-    let (y, m, d, t) = utc_date_time(secs);
-    format!("{y}-{m:02}-{d:02}T{:02}:{:02}:{:02}.000Z", t / 3600, t / 60 % 60, t % 60)
-}
-
-fn response_with_status(code: u16, body: &str) -> Response {
-    Response::builder().status(code).body(Body::from(body.to_string())).unwrap()
-}
-
-fn xml_error_response(code: u16, s3_code: &str) -> Response {
-    response_with_status(
-        code,
-        &format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{s3_code}</Code><Message>{s3_code}</Message></Error>"
-        ),
-    )
-}
-
-fn parse_query(uri: &Uri) -> BTreeMap<String, String> {
-    uri.query()
-        .unwrap_or("")
-        .split('&')
-        .filter(|kv| !kv.is_empty())
-        .map(|kv| {
-            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
-            (percent_decode(k), percent_decode(v))
-        })
-        .collect()
-}
-
-fn percent_decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'%' if i + 2 < b.len() => {
-                out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
-                i += 3;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).unwrap()
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+#[derive(Clone, Debug)]
+pub enum Fault {
+    Fail(u16),
+    ApplyThenFail(u16),
+    Delay(Duration),
 }
 
 async fn handle(State(s): State<FakeS3>, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
@@ -316,6 +215,105 @@ fn list(g: &Inner, q: &BTreeMap<String, String>) -> Response {
     }
     xml += "</ListBucketResult>";
     Response::builder().status(200).header(header::CONTENT_TYPE, "application/xml").body(Body::from(xml)).unwrap()
+}
+
+#[derive(Default)]
+struct Inner {
+    objects: BTreeMap<String, Obj>,
+    faults: VecDeque<(Method, Fault)>,
+    requests: BTreeMap<String, usize>,
+    writes: u64,
+    max_list_keys: Option<usize>,
+    latency: Option<Duration>,
+}
+
+struct Obj {
+    data: Bytes,
+    etag: String,
+    modified_s: u64,
+}
+
+fn response_with_status(code: u16, body: &str) -> Response {
+    Response::builder().status(code).body(Body::from(body.to_string())).unwrap()
+}
+
+fn xml_error_response(code: u16, s3_code: &str) -> Response {
+    response_with_status(
+        code,
+        &format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{s3_code}</Code><Message>{s3_code}</Message></Error>"
+        ),
+    )
+}
+
+fn parse_query(uri: &Uri) -> BTreeMap<String, String> {
+    uri.query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            (percent_decode(k), percent_decode(v))
+        })
+        .collect()
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => {
+                out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+                i += 3;
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap()
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+fn now_s() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+fn http_date(secs: u64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let (y, m, d, t) = utc_date_time(secs);
+    let wd = DAYS[((secs / 86_400) % 7) as usize];
+    format!("{wd}, {d:02} {} {y} {:02}:{:02}:{:02} GMT", MONTHS[m as usize - 1], t / 3600, t / 60 % 60, t % 60)
+}
+
+fn iso_date(secs: u64) -> String {
+    let (y, m, d, t) = utc_date_time(secs);
+    format!("{y}-{m:02}-{d:02}T{:02}:{:02}:{:02}.000Z", t / 3600, t / 60 % 60, t % 60)
+}
+
+fn utc_date_time(secs: u64) -> (i64, u32, u32, u64) {
+    let days = (secs / 86_400) as i64;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d, secs % 86_400)
 }
 
 #[test]

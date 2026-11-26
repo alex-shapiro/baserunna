@@ -125,7 +125,6 @@ dependencies = [
  "baserunna-storage",
  "baserunna-util",
  "bytes",
- "crc32c",
  "futures-util",
  "http",
  "http-body",
@@ -140,7 +139,6 @@ dependencies = [
  "serde_urlencoded",
  "tokio",
  "tower",
- "zstd",
 ]
 
 [[package]]
@@ -196,13 +194,11 @@ dependencies = [
  "aws-lc-rs",
  "axum-core",
  "baserunna-api",
- "crc32c",
  "http",
  "parking_lot",
  "serde",
  "serde_json",
  "tokio",
- "zstd",
 ]
 
 [[package]]

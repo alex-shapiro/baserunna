@@ -2329,7 +2329,7 @@ mod tests {
             let window = (n + n / 2 + 1).next_power_of_two() as u64 / 8;
             (0i64..)
                 .map(|i| Val::Int(i).canonical_bytes())
-                .filter(|k| !collide || baserunna_util::bloom::key_hash(k) & (window * 8 - 1) < window)
+                .filter(|k| !collide || crate::bloom::key_hash(k) & (window * 8 - 1) < window)
                 .take(n)
                 .collect()
         };

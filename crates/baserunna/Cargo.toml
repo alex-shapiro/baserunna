@@ -17,7 +17,6 @@ baserunna-util.workspace = true
 aws-lc-rs = "1.18"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "form", "tokio", "matched-path", "original-uri"] }
 bytes = "1"
-crc32c = "0.6"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 http = "1"
 http-body = "1"
@@ -26,7 +25,6 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 parking_lot.workspace = true
 serde = { version = "1", features = ["derive"] }
-zstd = { version = "0.13", default-features = false }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_urlencoded = "0.7"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "signal", "test-util"] }

@@ -3,10 +3,8 @@
 #![forbid(unsafe_code)]
 
 pub mod access;
-pub mod bloom;
 pub mod buggify;
 pub mod codec;
-pub mod crc32c;
 pub mod env;
 pub mod error;
 pub mod json;
@@ -15,7 +13,6 @@ pub mod probe;
 pub mod prop;
 pub mod rng;
 mod ttl;
-pub mod zstd;
 
 pub use error::{Error, Result};
 pub use ttl::TtlCache;

@@ -1,8 +1,8 @@
 //! Node-local disk and memory cache for immutable segment data.
 
+use crate::crc32c::crc32c;
 use baserunna_util::BoxFut;
 use baserunna_util::DetHashMap;
-use baserunna_util::crc32c::crc32c;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;

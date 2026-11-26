@@ -447,7 +447,7 @@ pub fn encode_mask_object(r: &Runs) -> Bytes {
     let mut w = Writer::new();
     w.raw(b"BRMK");
     r.encode(&mut w);
-    let crc = baserunna_util::crc32c::crc32c(&w.buf);
+    let crc = crate::crc32c::crc32c(&w.buf);
     w.u32(crc);
     Bytes::from(w.into_inner())
 }
@@ -457,7 +457,7 @@ pub fn decode_mask_object(b: &[u8]) -> DResult<Runs> {
         return Err(DecodeError("bad mask object"));
     }
     let (body, c) = b.split_at(b.len() - 4);
-    if baserunna_util::crc32c::crc32c(body) != u32::from_le_bytes([c[0], c[1], c[2], c[3]]) {
+    if crate::crc32c::crc32c(body) != u32::from_le_bytes([c[0], c[1], c[2], c[3]]) {
         return Err(DecodeError("mask checksum mismatch"));
     }
     let mut r = Reader::new(&body[4..]);

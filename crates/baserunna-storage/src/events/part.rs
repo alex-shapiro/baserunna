@@ -19,12 +19,12 @@
 
 use super::json::JType;
 use super::vector::{NULL_CODE, Phys, Strs, Vector};
+use crate::bloom::Bloom;
 use crate::engine::Shared;
 use crate::engine::cache::{CacheKey, CacheVal};
 use crate::engine::events::{Mask, PartRef, Runs, decode_mask_object};
 use crate::engine::segment::{Compression, frame, unframe};
 use crate::store::{GetOpts, PutMode, StoreError};
-use baserunna_util::bloom::Bloom;
 use baserunna_util::codec::{DResult, DecodeError, Reader, Writer};
 use baserunna_util::error::{Error, Result};
 use baserunna_util::{Either, race};
@@ -561,20 +561,20 @@ pub fn stat_prefix(s: &str) -> &str {
 }
 
 pub fn bloom_hash_int(v: i64) -> u64 {
-    baserunna_util::bloom::key_hash(&[&b"i"[..], &v.to_le_bytes()].concat())
+    crate::bloom::key_hash(&[&b"i"[..], &v.to_le_bytes()].concat())
 }
 
 pub fn bloom_hash_float(v: f64) -> u64 {
     let v = if v == 0.0 { 0.0 } else { v };
-    baserunna_util::bloom::key_hash(&[&b"f"[..], &v.to_bits().to_le_bytes()].concat())
+    crate::bloom::key_hash(&[&b"f"[..], &v.to_bits().to_le_bytes()].concat())
 }
 
 pub fn bloom_hash_bool(v: bool) -> u64 {
-    baserunna_util::bloom::key_hash(&[b'b', v as u8])
+    crate::bloom::key_hash(&[b'b', v as u8])
 }
 
 pub fn bloom_hash_str(v: &str) -> u64 {
-    baserunna_util::bloom::key_hash(&[&b"s"[..], v.as_bytes()].concat())
+    crate::bloom::key_hash(&[&b"s"[..], v.as_bytes()].concat())
 }
 
 const NULLS_NONE: u8 = 0;

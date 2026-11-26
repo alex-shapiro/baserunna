@@ -1,6 +1,6 @@
 //! Bloom filter.
 
-use super::codec::{DResult, DecodeError, Reader, Writer};
+use baserunna_util::codec::{DResult, DecodeError, Reader, Writer};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bloom {

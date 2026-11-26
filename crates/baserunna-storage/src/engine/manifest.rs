@@ -8,9 +8,9 @@
 
 use super::range_delete::RangeTombstone;
 use super::types::{Entry, Seq, is_commit_key, valid_object_id};
-use baserunna_util::bloom::key_hash;
+use crate::bloom::key_hash;
+use crate::crc32c::crc32c;
 use baserunna_util::codec::{DResult, DecodeError, Reader, Writer};
-use baserunna_util::crc32c::crc32c;
 use bytes::Bytes;
 
 const MAGIC: &[u8; 4] = b"BRMF";
@@ -152,7 +152,7 @@ impl PageCache {
     }
 
     fn compress(&mut self, prefix: &[u8], tail: &[Vec<u8>], suffix: &[u8]) -> Option<Vec<u8>> {
-        let compress = |b: &[u8]| baserunna_util::zstd::compress(b, ZSTD_LEVEL).ok();
+        let compress = |b: &[u8]| crate::zstd::compress(b, ZSTD_LEVEL).ok();
         let mut out = compress(prefix)?;
         let mut frames = std::collections::BTreeMap::new();
         for page in tail {
@@ -405,8 +405,8 @@ impl Manifest {
                     return Err(DecodeError("manifest body too large"));
                 }
                 let rest = r.take(r.remaining())?;
-                let inflated = baserunna_util::zstd::decompress(rest, n as usize)
-                    .map_err(|_| DecodeError("bad compressed manifest"))?;
+                let inflated =
+                    crate::zstd::decompress(rest, n as usize).map_err(|_| DecodeError("bad compressed manifest"))?;
                 if inflated.len() as u64 != n {
                     return Err(DecodeError("manifest body length mismatch"));
                 }
@@ -736,7 +736,7 @@ mod tests {
         let mut pages = PageCache::default();
         let first = m.encode_with(&mut pages);
         assert_eq!(Manifest::decode(&first).unwrap(), m);
-        let whole = baserunna_util::zstd::compress(&m.encode_body(), ZSTD_LEVEL).unwrap();
+        let whole = crate::zstd::compress(&m.encode_body(), ZSTD_LEVEL).unwrap();
         assert!(first.len() < whole.len() * 5 / 4, "paged {} bytes, whole {} bytes", first.len(), whole.len());
         let frames: Vec<Vec<u8>> = pages.frames.values().cloned().collect();
         assert!(frames.len() > 20, "{} pages", frames.len());

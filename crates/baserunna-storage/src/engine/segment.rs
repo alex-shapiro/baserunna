@@ -16,9 +16,9 @@
 //! for loading.
 
 use super::types::{Entry, Seq};
-use baserunna_util::bloom::{Bloom, key_hash};
+use crate::bloom::{Bloom, key_hash};
+use crate::crc32c::crc32c;
 use baserunna_util::codec::{DResult, DecodeError, Reader, Writer};
-use baserunna_util::crc32c::crc32c;
 use bytes::Bytes;
 use std::sync::Arc;
 
@@ -301,7 +301,7 @@ pub fn frame(raw: &[u8], compression: Compression, out: &mut Vec<u8>) {
     let off = out.len();
     let compressed = match compression {
         Compression::Zstd(level) if raw.len() >= 64 => {
-            baserunna_util::zstd::compress(raw, level).ok().filter(|c| c.len() + 10 < raw.len() - raw.len() / 8)
+            crate::zstd::compress(raw, level).ok().filter(|c| c.len() + 10 < raw.len() - raw.len() / 8)
         }
         _ => None,
     };
@@ -336,7 +336,7 @@ pub fn unframe(raw: &Bytes) -> DResult<Bytes> {
                 return Err(DecodeError("block too large"));
             }
             let c = &payload[payload.len() - r.remaining()..];
-            let d = baserunna_util::zstd::decompress(c, n as usize).map_err(|_| DecodeError("bad compressed block"))?;
+            let d = crate::zstd::decompress(c, n as usize).map_err(|_| DecodeError("bad compressed block"))?;
             if d.len() as u64 != n {
                 return Err(DecodeError("compressed block length mismatch"));
             }

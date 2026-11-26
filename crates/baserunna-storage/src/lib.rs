@@ -4,7 +4,9 @@
 #![forbid(unsafe_code)]
 #![recursion_limit = "512"]
 
+pub mod bloom;
 pub mod catalog;
+pub mod crc32c;
 pub mod engine;
 pub mod events;
 pub mod filter;
@@ -16,3 +18,4 @@ pub mod stream;
 pub mod table;
 pub mod timing;
 pub mod txns;
+pub mod zstd;

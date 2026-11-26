@@ -32,7 +32,7 @@ Run the design reviewer on every branch. Also run the correctness reviewer if th
 
 Run both reviewers in parallel.
 
-Reviewers do not report names, comment wording, or style. You fix those issues during the copy edit step.
+Reviewers do not report names, comment wording, or style. Gemini fixes those issues during the copy edit step.
 
 ### Design Reviewer Prompt
 

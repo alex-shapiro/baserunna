@@ -6,7 +6,7 @@ mod counting_alloc;
 use baserunna::node::NodeConfig;
 use baserunna::sim::cost::{Resp, World, call_router, run_paused};
 use bytes::Bytes;
-use counting_alloc::{HEAP_MEASUREMENT_LOCK, peak_growth, reset_peak};
+use counting_alloc::{HEAP_MEASUREMENT_LOCK, peak_growth_bytes, reset_peak_bytes};
 use serde_json::{Value as Json, json};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -106,9 +106,9 @@ async fn join_posts(tasks: Vec<tokio::task::JoinHandle<Outcome>>) -> Vec<Outcome
 
 /// Sends `bodies` to `path` at the same time and returns each outcome and the heap growth peak.
 async fn concurrent_posts(w: &World, token: &str, path: &str, bodies: Vec<String>) -> (Vec<Outcome>, usize) {
-    let before = reset_peak();
+    let before = reset_peak_bytes();
     let out = join_posts(spawn_posts(w, token, path, bodies)).await;
-    (out, peak_growth(before))
+    (out, peak_growth_bytes(before))
 }
 
 fn statuses(out: &[Outcome]) -> Vec<u16> {
@@ -152,7 +152,7 @@ fn top_users_query(from: i64, to: i64) -> Json {
 
 #[test]
 fn concurrent_event_queries_respect_node_memory_budget() {
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::with_config(1, 0, production_limits).await;
         let t = w.signup(0, "a1@mem.test").await;
@@ -246,7 +246,7 @@ async fn acquire_lease(w: &World, token: &str, db: &str) {
 
 #[test]
 fn one_user_cannot_hold_every_query_slot() {
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let mut w = World::with_config(1, 0, production_limits).await;
         let heavy = w.signup(0, "heavy@slots.test").await;
@@ -287,7 +287,7 @@ fn one_user_cannot_hold_every_query_slot() {
 
 #[test]
 fn transactional_event_queries_take_query_slots() {
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let mut w = World::with_config(1, 0, production_limits).await;
         let t = w.signup(0, "b1@slots.test").await;
@@ -324,7 +324,7 @@ fn transactional_event_queries_take_query_slots() {
 #[test]
 #[ignore = "TODO nice-to-have: extend the deadline of transactional query_events ops"]
 fn transactional_event_queries_get_the_event_query_deadline() {
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let mut w = World::with_config(1, 0, production_limits).await;
         let t = w.signup(0, "b2@slots.test").await;
@@ -454,7 +454,7 @@ async fn long_string_query_peak(w: &mut World, token: &str, days: usize) -> usiz
 #[test]
 #[ignore = "TODO blocker: estimate granule run memory from actual string lengths"]
 fn long_string_queries_respect_memory_limit() {
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let days = 8;
         let mut w = World::with_config(1, 0, production_limits).await;

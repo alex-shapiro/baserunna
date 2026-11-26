@@ -7,7 +7,7 @@ use baserunna::engine::{Consistency, Engine, EngineConfig, Isolation, KeyRange, 
 use baserunna::env::Env;
 use baserunna::store::{DynStore, MemStore};
 use bytes::Bytes;
-use counting_alloc::{HEAP_MEASUREMENT_LOCK, allocated_bytes, heap_growth, peak_growth, reset_peak};
+use counting_alloc::{HEAP_MEASUREMENT_LOCK, allocated_bytes, heap_change_bytes, peak_growth_bytes, reset_peak_bytes};
 use std::sync::Arc;
 
 const MIB: usize = 1024 * 1024;
@@ -85,7 +85,7 @@ async fn charges_cover_decoded_manifests(w: &World) {
             db.open(false).await.unwrap();
             handles.push(db);
         }
-        let heap = heap_growth(heap_before).max(0) as usize;
+        let heap = heap_change_bytes(heap_before).max(0) as usize;
         let charged = reader.shared.memory.used() - charged_before;
         eprintln!("{s:?}: heap {heap} B, charged {charged} B");
         assert!(heap <= charged + charged / 10 + 20 * 512, "{s:?}: {heap} heap bytes, but {charged} charged");
@@ -123,7 +123,7 @@ async fn opening_many_databases_respects_budget(w: &World) {
         assert!(t.get(b"000001234").await.unwrap().is_some());
         drop(t);
         held.push(db);
-        peak = peak.max(heap_growth(before));
+        peak = peak.max(heap_change_bytes(before));
     }
     let peak = peak.max(0) as usize;
     let charged = reader.shared.memory.used();
@@ -138,7 +138,7 @@ async fn opening_many_databases_respects_budget(w: &World) {
 
 #[test]
 fn memory_charges_bound_real_heap_use() {
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
     rt.block_on(async {
         baserunna::log::set_level(Some(baserunna::log::Level::Warn));
@@ -152,7 +152,7 @@ fn memory_charges_bound_real_heap_use() {
 fn bulk_inserts_bound_memory_by_body_size() {
     use baserunna::sim::cost::{World, call_router, run_paused};
     use tower::ServiceExt;
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
         let t = w.signup(0, "mem@api.test").await;
@@ -171,9 +171,9 @@ fn bulk_inserts_bound_memory_by_body_size() {
             .header("content-type", "application/x-ndjson")
             .body(axum::body::Body::from(body.clone()))
             .unwrap();
-        let before = reset_peak();
+        let before = reset_peak_bytes();
         let resp = router.oneshot(req).await.unwrap();
-        let grown = peak_growth(before);
+        let grown = peak_growth_bytes(before);
         assert_eq!(resp.status(), 201);
         assert!(
             grown < 16 * body.len(),
@@ -190,7 +190,7 @@ fn corrupt_column_index_bounds_decoded_memory() {
     use baserunna::events::part::{ColIndex, ColMeta, ColRef, PartMeta};
     use baserunna::events::vector::Phys;
     use baserunna::util::codec::Writer;
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     let framed = |w: Writer| {
         let mut out = Vec::new();
         baserunna::engine::segment::frame(&w.into_inner(), baserunna::engine::segment::Compression::Zstd(1), &mut out);
@@ -214,9 +214,9 @@ fn corrupt_column_index_bounds_decoded_memory() {
         w.varint(0);
     }
     let meta = framed(w);
-    let before = reset_peak();
+    let before = reset_peak_bytes();
     let decoded = PartMeta::decode(&meta, n);
-    let grown = peak_growth(before);
+    let grown = peak_growth_bytes(before);
     let granules = decoded.map(|m| m.granule_count());
     assert!(
         grown < 256 * MIB,
@@ -256,9 +256,9 @@ fn corrupt_column_index_bounds_decoded_memory() {
     }
     w.varint(0);
     let index = framed(w);
-    let before = reset_peak();
+    let before = reset_peak_bytes();
     let decoded = ColIndex::decode(&index, &part, &part.cols[0]);
-    let grown = peak_growth(before);
+    let grown = peak_growth_bytes(before);
     let stats = decoded.map(|i| i.stats.len());
     assert!(
         grown < 256 * MIB,
@@ -270,7 +270,7 @@ fn corrupt_column_index_bounds_decoded_memory() {
 #[test]
 fn events_expanded_by_defaults_respect_request_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
         let t = w.signup(0, "mem@api.test").await;
@@ -287,9 +287,9 @@ fn events_expanded_by_defaults_respect_request_limit() {
         let bulk = format!("[{}]", events(400_000));
         let txn = format!(r#"{{"ops": [{{"op": "insert_events", "table": "ev", "rows": [{}]}}]}}"#, events(100_000));
         for (path, body) in [("/v1/dbs/d/events/ev/rows", bulk), ("/v1/dbs/d/txn", txn)] {
-            let before = reset_peak();
+            let before = reset_peak_bytes();
             let r = call_router(&router, "POST", path, &t, Bytes::from(body.clone())).await;
-            let grown = peak_growth(before);
+            let grown = peak_growth_bytes(before);
             assert_eq!(r.status, 413, "{path}: {}", String::from_utf8_lossy(&r.body));
             assert!(
                 grown < 192 * MIB,
@@ -327,14 +327,14 @@ async fn setup_unsealed_events_with_large_defaults(t: &str, router: &axum::Route
 #[test]
 fn sealing_events_with_added_defaults_bounds_memory() {
     use baserunna::sim::cost::{World, call_router, run_paused};
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
         let t = w.signup(0, "mem@api.test").await;
         w.create_db(0, &t, "d").await;
         let router = w.node(0).router().unwrap();
         let unsealed = setup_unsealed_events_with_large_defaults(&t, &router).await;
-        let before = reset_peak();
+        let before = reset_peak_bytes();
         let txn = r#"{"ops": [{"op": "insert_events", "table": "ev", "rows": [{}]}]}"#;
         let r = call_router(&router, "POST", "/v1/dbs/d/txn", &t, Bytes::from(txn)).await;
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
@@ -348,7 +348,7 @@ fn sealing_events_with_added_defaults_bounds_memory() {
                 break;
             }
         }
-        let grown = peak_growth(before);
+        let grown = peak_growth_bytes(before);
         assert!(sealed, "events were not sealed");
         assert!(
             grown < 256 * MIB,
@@ -362,7 +362,7 @@ fn sealing_events_with_added_defaults_bounds_memory() {
 #[test]
 fn queries_on_unsealed_events_with_added_defaults_respect_memory_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
         let t = w.signup(0, "mem@api.test").await;
@@ -370,9 +370,9 @@ fn queries_on_unsealed_events_with_added_defaults_respect_memory_limit() {
         let router = w.node(0).router().unwrap();
         let unsealed = setup_unsealed_events_with_large_defaults(&t, &router).await;
         let q = r#"{"from": 0, "to": 9999999999999, "limit": 1, "consistency": "strong"}"#;
-        let before = reset_peak();
+        let before = reset_peak_bytes();
         let r = call_router(&router, "POST", "/v1/dbs/d/events/ev/rows/query", &t, Bytes::from(q)).await;
-        let grown = peak_growth(before);
+        let grown = peak_growth_bytes(before);
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         assert!(
             grown < 256 * MIB,
@@ -386,7 +386,7 @@ fn queries_on_unsealed_events_with_added_defaults_respect_memory_limit() {
 #[test]
 fn queries_with_many_json_paths_respect_memory_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
         let t = w.signup(0, "mem@api.test").await;
@@ -411,9 +411,9 @@ fn queries_with_many_json_paths_respect_memory_limit() {
         let q = serde_json::json!({"from": 0, "to": 9_999_999_999_999i64, "consistency": "strong",
             "aggregates": {"r": {"fn": "retention", "conditions": conditions}}})
         .to_string();
-        let before = reset_peak();
+        let before = reset_peak_bytes();
         let r = call_router(&router, "POST", "/v1/dbs/d/events/ev/rows/query", &t, Bytes::from(q.clone())).await;
-        let grown = peak_growth(before);
+        let grown = peak_growth_bytes(before);
         assert!(
             grown < 256 * MIB,
             "{}-byte query on 4,400 unsealed events grew heap by {grown} bytes ({}): {}",
@@ -428,7 +428,7 @@ fn queries_with_many_json_paths_respect_memory_limit() {
 #[test]
 fn queries_with_many_shared_json_paths_respect_memory_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::with_config(1, 0, |c| {
             c.engine.event_json_max_paths = 1;
@@ -458,9 +458,9 @@ fn queries_with_many_shared_json_paths_respect_memory_limit() {
         let q = serde_json::json!({"from": 0, "to": 9_999_999_999_999i64, "consistency": "strong",
             "aggregates": {"r": {"fn": "retention", "conditions": conditions}}})
         .to_string();
-        let before = reset_peak();
+        let before = reset_peak_bytes();
         let r = call_router(&router, "POST", "/v1/dbs/d/events/ev/rows/query", &t, Bytes::from(q.clone())).await;
-        let grown = peak_growth(before);
+        let grown = peak_growth_bytes(before);
         let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(r.status, 200, "{body}");
         assert_eq!(body["stats"]["rows_read"], 4400, "events were read from part: {body}");
@@ -472,7 +472,7 @@ fn queries_with_many_shared_json_paths_respect_memory_limit() {
 #[test]
 fn query_lookups_respect_memory_limit() {
     use baserunna::sim::cost::{World, call_router, run_paused};
-    let _turn = HEAP_MEASUREMENT_LOCK.lock();
+    let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::with_config(1, 0, |c| c.query_limits.lookup_max_bytes = 8 * MIB).await;
         let t = w.signup(0, "mem@api.test").await;
@@ -518,9 +518,9 @@ fn query_lookups_respect_memory_limit() {
                 break;
             }
         }
-        let before = reset_peak();
+        let before = reset_peak_bytes();
         let r = call_router(&router, "POST", "/v1/dbs/d/events/ev/rows/query", &t, Bytes::from(q)).await;
-        let grown = peak_growth(before);
+        let grown = peak_growth_bytes(before);
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         assert!(
             grown < 2 * 8 * MIB,

@@ -49,7 +49,7 @@ checks for bugs. Answer these questions, in this order:
 2. Does the branch solve the problem in BRIEF.md for a real user? What will
    surprise a user?
 3. Would an expert choose this design if they started from nothing and
-   knew the planned work ahead? Read each plan that BRIEF.md names. If a better
+   knew the planned work? Read each plan listed in BRIEF.md. If a better
    design exists, describe it and state what you can delete.
 4. Is the cost in proportion to the value? Consider new concepts, options,
    failure modes, and lines of code.

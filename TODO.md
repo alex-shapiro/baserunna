@@ -645,5 +645,5 @@ only.
       the table layer accepts indexed values that produce keys longer than
       `MAX_USER_KEY`. The commit then fails with
       `500 internal: corrupt data: key too long`. The database stays readable.
-      The user receives a 500 error. The logs record a false corruption
+      The user receives a 500 error. The server logs a false corruption
       message.

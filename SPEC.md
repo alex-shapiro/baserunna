@@ -1121,10 +1121,11 @@ keys) check that user's rights inside their own transaction: whether
 the user still exists and is enabled, and their role. Authorization of
 metadata changes is therefore serializable with the changes themselves.
 
-Each text field in a metadata command has a maximum length of 1024 bytes. If
-any text field is longer than 1024 bytes, the lease holder rejects the command
-with `400 invalid_argument` before it reads any rows. This limit applies to all
-text fields from client inputs and external sources.
+Each text field in a metadata command has a maximum length of 1024 bytes. The
+lease holder checks all text fields before it reads any rows. If a field is
+longer than 1024 bytes, the lease holder rejects the command with
+`400 invalid_argument`. This limit applies to text fields from client inputs
+and external sources.
 
 Listings of users, sessions, API keys, organizations, members and
 databases are paginated (`limit`, default 100 and at most 1000, and
@@ -1169,12 +1170,13 @@ recreate a purged database.
   `GET /v1/auth/google/start` redirects to Google with `state`. The state is
   an HMAC-signed, 10-minute nonce that is also set as a cookie.
   `GET /v1/auth/google/callback` checks the state, exchanges the code at the
-  token endpoint, and verifies the ID token. Verification checks:
+  token endpoint, and verifies the ID token:
   - the RS256 signature against Google's cached JWKS
   - `iss` and `aud == client_id`
   - `exp`
   - `email_verified`
-  - a `sub` value of 1 to 255 ASCII characters, per OpenID Connect Core 1.0 §2
+  - a `sub` claim of 1 to 255 ASCII characters, as OpenID Connect Core 1.0 §2
+    requires
 
   A user is matched by `google_sub`, then by verified
   email, and is created if allowed by the signup policy. Matching by email

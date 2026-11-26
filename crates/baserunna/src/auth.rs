@@ -164,7 +164,9 @@ fn jwt_part(s: &str) -> Result<Json> {
     serde_json::from_slice(&b).map_err(|_| Error::Unauthenticated("malformed ID token".into()))
 }
 
-/// Maximum length in ASCII characters of an ID token `sub` claim, per OpenID Connect Core 1.0 §2.
+/// Maximum length in ASCII characters of an ID token `sub` claim.
+///
+/// OpenID Connect Core 1.0 §2 sets this limit.
 pub const OIDC_SUB_MAX_CHARS: usize = 255;
 
 /// Verifies an RS256 ID token against `jwks`.

@@ -12,6 +12,8 @@ use std::sync::Arc;
 const EMAIL_MAX: usize = 254;
 const API_KEY_NAME_MAX: usize = 100;
 const NOW_MS: i64 = 1_000;
+/// Most entries that one command reads and writes: `PAGE_MAX` rows of at most 16 entries each.
+const COMMAND_ENTRIES_MAX: usize = 16 * PAGE_MAX;
 const LIVE_UNTIL_MS: i64 = 1 << 50;
 
 fn member_limits(cfg: &NodeConfig) -> MemberLimits {
@@ -125,9 +127,9 @@ fn node(id: &str) -> NodeRecord {
 /// Fills every per-owner limit and every listing that a command can scan.
 ///
 /// - The user `victim` has `PAGE_MAX - 1` sessions and API keys and the maximum number of memberships.
-/// - The user `partner` owns the other organizations of `victim`.
+/// - The user `partner` owns every organization of `victim`.
 /// - The user `dbowner` has the maximum number of personal databases.
-/// - The organization `org-big` has the maximum number of members.
+/// - The organization `org-big` has the maximum number of members. The site administrator `admin` is not a member.
 /// - The user `m0` has more than `PAGE_MAX` sessions.
 /// - Other users have more than `PAGE_MAX` expired sessions.
 async fn fill_limits(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeConfig) {
@@ -139,7 +141,7 @@ async fn fill_limits(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeCon
     cmds.push(MetaCmd::CreateOrg {
         id: "org-big".into(),
         name: long_name("big", 0, ORG_NAME_MAX),
-        actor: "admin".into(),
+        actor: "partner".into(),
         max_orgs: cfg.max_orgs_per_user,
     });
     let add = |org_id: &str, actor: &str, user_id: &str, role: Role| MetaCmd::AddMember {
@@ -337,24 +339,30 @@ fn metadata_command_cost_does_not_grow_with_stored_data() {
         let measured: BTreeSet<&str> = costs_before.iter().map(|(name, _)| *name).collect();
         assert_eq!(measured, BTreeSet::from(COMMAND_NAMES), "every metadata command is measured");
         let mut report = format!("rows before: {rows_before:?}\nrows after: {rows_after:?}\n");
-        let mut grew = Vec::new();
+        let mut failures = Vec::new();
         for ((name, before), (_, after)) in costs_before.iter().zip(&costs_after) {
             report.push_str(&format!("{name:<16} {before:?}\n"));
             if (before.entries_read, before.entries_written) != (after.entries_read, after.entries_written) {
-                grew.push(format!("{name}: {before:?}, then {after:?}"));
+                failures.push(format!("{name}: {before:?}, then {after:?}"));
+            }
+            if after.entries_read + after.entries_written > COMMAND_ENTRIES_MAX {
+                failures.push(format!("{name}: {after:?} exceeds {COMMAND_ENTRIES_MAX} entries"));
             }
         }
         eprintln!("{report}");
-        assert!(grew.is_empty(), "{grew:#?}");
+        assert!(failures.is_empty(), "{failures:#?}");
     });
 }
 
 /// Runs `cmd` until its answer reports that no rows remain, and returns the number of runs.
+/// Checks integrity after each run, because a node can stop between runs.
 async fn run_until_done(db: &Arc<Db>, cmd: &MetaCmd) -> usize {
     for runs in 1.. {
         let mut t = begin(db).await;
         let answer = apply(&mut t, &BlobResolver { db }, cmd, NOW_MS).await.unwrap_or_else(|e| panic!("{cmd:?}: {e}"));
         db.commit(t.into_request()).await.unwrap();
+        let mut t = begin(db).await;
+        check_integrity(&mut t).await.unwrap_or_else(|e| panic!("after run {runs} of {cmd:?}: {e}"));
         if answer["more"] == json!(false) {
             return runs;
         }
@@ -371,7 +379,11 @@ fn batched_deletes_remove_owners_at_their_limits() {
         let cfg = NodeConfig::default();
         fill_limits(&db, &env, &cfg).await;
         let delete_org = MetaCmd::DeleteOrg { org_id: "org-big".into(), actor: "admin".into() };
-        assert_eq!(run_until_done(&db, &delete_org).await, 2, "1,000 members take two batches");
+        assert_eq!(
+            run_until_done(&db, &delete_org).await,
+            2,
+            "a site administrator deletes 1,000 members in two batches"
+        );
         for (user_id, batches) in [("victim", 3), ("dbowner", 2)] {
             let cmd = MetaCmd::DeleteUser { user_id: user_id.into() };
             assert_eq!(run_until_done(&db, &cmd).await, batches, "{user_id}");

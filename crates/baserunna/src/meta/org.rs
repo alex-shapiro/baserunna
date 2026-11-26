@@ -196,11 +196,15 @@ pub(super) async fn delete_org(w: &mut Write<'_, '_>, org_id: &str, actor: &str)
     }
     let p: Page<Member> = page(w.txn, "org_members", q_eq(None, vec![json!(org_id)]), PAGE_MAX, None).await?;
     let more = p.next_cursor.is_some();
-    // The actor's membership goes last, so the actor keeps its role for the next batch.
-    let doomed: Vec<Member> = p.items.into_iter().filter(|m| !more || m.user_id != actor).collect();
-    let deleted = doomed.len();
-    for m in doomed {
+    let mut deleted = 0;
+    for m in p.items {
+        // Until the last batch, the actor keeps its role and the organization keeps an owner.
+        let last_owner = m.role == Role::Owner && count(w.txn, Count::Owners, org_id).await? <= 1;
+        if more && (m.user_id == actor || last_owner) {
+            continue;
+        }
         change_membership(w, org_id, &m.user_id, Some(m.role), None).await?;
+        deleted += 1;
     }
     if !more {
         table::delete(w.txn, "orgs", &json!(org_id)).await?;

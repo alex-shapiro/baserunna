@@ -416,8 +416,8 @@ pub enum MetaCmd {
     DeleteDb {
         id: String,
     },
-    /// Deletes up to `PAGE_MAX` of a user's sessions, API keys, memberships,
-    /// and personal databases, then the user if none remain. Rejects deletion of
+    /// Deletes up to `PAGE_MAX` of a user's API keys, memberships, personal
+    /// databases, and sessions, then the user if none remain. Rejects deletion of
     /// the last enabled administrator or the sole owner of an organization.
     /// Returns [`UserDeletion`].
     DeleteUser {
@@ -1020,9 +1020,6 @@ async fn delete_user(w: &mut Write<'_, '_>, user_id: &str) -> Result<UserDeletio
         }
     }
     let mut left = baserunna_api::PAGE_MAX;
-    for s in take_rows::<Session>(w.txn, "sessions", by_user(user_id), &mut left).await? {
-        table::delete(w.txn, "sessions", &json!(s.token_hash)).await?;
-    }
     for k in take_rows::<ApiKey>(w.txn, "api_keys", by_user(user_id), &mut left).await? {
         table::delete(w.txn, "api_keys", &json!(k.id)).await?;
     }
@@ -1035,6 +1032,10 @@ async fn delete_user(w: &mut Write<'_, '_>, user_id: &str) -> Result<UserDeletio
     {
         dbs.push(d.id.clone());
         delete_db(w, d).await?;
+    }
+    // Sessions go last, so the caller can retry a stopped deletion without signing in again.
+    for s in take_rows::<Session>(w.txn, "sessions", by_user(user_id), &mut left).await? {
+        table::delete(w.txn, "sessions", &json!(s.token_hash)).await?;
     }
     if left == 0 {
         return Ok(UserDeletion { dbs, more: true });

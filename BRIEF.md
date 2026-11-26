@@ -43,11 +43,15 @@ We need a test of the maximum, not billing, so a counter on `Txn` is enough.
 ## Cost
 
 - New concepts: none for users.
-- Code: a small cost counter on `Txn` in the storage engine and one test.
+- Code: a small cost counter on `Txn` in the storage engine and two tests.
+- Failure mode: if a node stops during an account or organization deletion,
+  the account or organization keeps some rows until a retry. Each state
+  between batches obeys the metadata rules.
 
 ## Size
 
-About 40 lines in the engine and about 250 lines of test code.
+About 40 lines in the engine, about 250 lines of test code, and about 20
+lines for the batched deletes.
 
 ## Verdict
 
@@ -81,4 +85,14 @@ Round 1:
 - Design 3, SPEC text records test constants as design: accepted. SPEC now states the rule.
 - Design, outside question, the fair queue should charge measured cost instead of command count: reported to the user. It belongs to the next plan item.
 - Correctness 1, tombstones make scans slower and `Txn::cost` does not count them: real but rejected for this branch. The fix belongs to the storage engine. Added to `TODO.md`.
-- Correctness, `delete_user` can delete 1,000 sessions: rejected. The test shows that exactly 1,000 sessions return `TooManyCredentials`.
+- Correctness, `delete_user` can delete 1,000 sessions: rejected. A test showed that a page of exactly `PAGE_MAX` rows returns a cursor.
+
+Round 2:
+
+- Correctness 1, a site administrator's stopped `delete_org` leaves an organization with no owner: accepted. Each batch except the last keeps the actor's membership and the last owner. The test now checks integrity after each batch, and a non-member site administrator deletes `org-big`. The old filter fails it.
+- Design 1a, an exhaustive match forces a measurement of each new command: rejected. Rust cannot list enum variants, so the match cannot make the test fail for an unmeasured command.
+- Design 1b, assert a maximum for each command: accepted. Each command reads and writes at most `16 * PAGE_MAX` entries.
+- Design 2, a stopped account deletion deletes the caller's session first: accepted. Sessions now go last.
+- Design cleanups: moved the `delete_org` loop into `Node`, updated this brief, and rewrapped SPEC. Kept the byte counters because the test report prints them.
+- Design, outside question, record `Txn::cost` for each command in production: reported to the user. It is outside this branch.
+- Correctness, outside question, the simulator never runs a deletion of more than one batch: rejected. The integrity check after each batch covers every point where a node can stop between batches.

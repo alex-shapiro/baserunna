@@ -1243,6 +1243,16 @@ impl Node {
         Ok(hash == current)
     }
 
+    /// Deletes organization `org_id` and its memberships for `p`.
+    pub async fn delete_org(&self, p: &Principal, org_id: &str) -> Result<()> {
+        loop {
+            let cmd = MetaCmd::DeleteOrg { org_id: org_id.to_string(), actor: p.user.id.clone() };
+            if !self.run_meta_as::<Batch>(cmd).await?.more {
+                return Ok(());
+            }
+        }
+    }
+
     /// Deletes the signed-in user's account, credentials, memberships, and personal databases.
     pub async fn delete_account(&self, p: &Principal, password: Option<&str>) -> Result<()> {
         p.require_session()?;

@@ -1216,14 +1216,15 @@ recreate a purged database.
   the account's sign-in backoff) and ends every other session; the new
   hash is written only if the stored one is still the one checked, so two
   concurrent changes cannot both succeed. Deleting an account confirms the
-  password. Then the node removes the user's sessions, API keys,
-  memberships, and databases in system-DB transactions of at most
-  `PAGE_MAX` rows each, and removes the user in the last transaction. The
-  node flags the manifest of each deleted database and purges it later, as
-  for `DELETE /v1/dbs/{db}`. The node refuses the deletion for the last
+  password. Then the node removes the user's API keys, memberships,
+  databases, and sessions, in that order, in system-DB transactions of at
+  most `PAGE_MAX` rows each. It removes the user in the last transaction.
+  The node flags the manifest of each deleted database and purges it later,
+  as for `DELETE /v1/dbs/{db}`. The node refuses the deletion for the last
   enabled administrator and for the only owner of an organization. Each
   transaction checks these conditions again. If the node stops during the
-  deletion, the account keeps its remaining rows until the user retries. Administrators disable and re-enable accounts.
+  deletion, the account keeps its remaining rows, and the user can retry
+  with the same session. Administrators disable and re-enable accounts.
 - **Mailed links** (when the node has a mailer, §12): sign-up and
   `POST /v1/me/verify-email` mail a link that verifies the address;
   `POST /v1/auth/password-reset` mails a link that sets a new password,
@@ -1274,9 +1275,9 @@ recreate a purged database.
   demoted. Members are added by the email of an existing account, and
   leave by removing themselves. An organization is deleted only once it has
   no databases, so no database outlives its owner. The node removes its
-  members in transactions of at most `PAGE_MAX` rows each, and removes the
-  caller's membership and the organization in the last transaction. Organization names are
-  1-39 characters of `[a-z0-9_-]`, starting with a letter or digit; its
+  members in transactions of at most `PAGE_MAX` rows each. Until the last
+  transaction, the caller's membership and one owner stay. Organization
+  names are 1-39 characters of `[a-z0-9_-]`, starting with a letter or digit; its
   databases are addressed as
   `org.name`. To anyone outside an organization, it and its databases do
   not exist (404).

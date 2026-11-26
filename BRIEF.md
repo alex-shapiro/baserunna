@@ -54,8 +54,8 @@ Build it.
 ## Decisions by the user
 
 - Fairness among the users of an organization is not necessary for now.
-- The crate names are `baserunna-storage`, `baserunna-worker`, and
-  `baserunna-server`.
+- The crate names are `baserunna-util`, `baserunna-storage`,
+  `baserunna-worker`, and `baserunna-server`.
 - Tenant isolation is goal 4 of SPEC §1, above testability.
 
 ## Review round 1
@@ -86,3 +86,27 @@ called the model.
   temporary, and that section informs the reviewers.
 - Push `iso/base` and `iso/floor`, which the plan cites (Fable 5): pushed, at
   the request of the user.
+
+## Review round 2
+
+Reviewers: Opus 5.5, Fable 5.2, and Gemini Neon. All three verdicts: merge
+after changes.
+
+- Placement, capacity-aware routing, worker membership, and lease takeover
+  after a worker dies: rejected by the user as out of scope. Two changes from
+  round 1 caused these findings, and both are reverted. Workers belong to
+  nodes, and each tenant has limits, not guarantees.
+- The kernel OOM killer can stop the server (Fable, Gemini): accepted. All
+  owner cgroups go inside a `tenants` cgroup, with `memory.oom.group` on each.
+- Idle workers stop (all three): accepted.
+- A fourth crate for the shared modules (Gemini): accepted as
+  `baserunna-util`.
+- Milestone 0 holds a single PR, and the harness run is a rule for each
+  milestone: accepted.
+- A block cache sized from the worker's limit (Opus): rejected. Invariant 2
+  already covers caches.
+- Milestone 4 needs milestone 1 (Opus, Fable): rejected. The order already
+  holds.
+- In-process workers for `fs:` stores (Gemini): replaced by the user's
+  decision that macOS runs without enforcement.
+- Drop the WebAssembly candidate (all three): not decided in this round.

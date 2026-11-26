@@ -32,21 +32,25 @@ The contest taught these lessons:
 
 1. Each lease holder has its own lease identity. Today the identity belongs to
    the node (`Shared::node_id`).
-2. Each tenant can always use its guarantee of every resource. Resources are
-   memory, CPU, caches, disk, store requests, and the work of the trusted
-   process and the system database. If a node runs short, only the work of
-   tenants above their guarantee becomes slower or fails.
+2. No tenant uses more than its limit of any resource. Resources are memory,
+   CPU, caches, disk, store requests, and the work of the trusted process and
+   the system database. If a node runs short of memory, the work of the tenant
+   that uses the most memory stops first.
 
 ## Crate layout
 
-Split the `baserunna` crate into three crates:
+Split the `baserunna` crate into four crates:
 
-1. `baserunna-storage`: the storage engine and the database features.
-2. `baserunna-worker`: the request handlers and the background jobs of each
+1. `baserunna-util`: the modules that the other crates share: `error`, `log`,
+   `env`, `util`, `metrics`, `probe`, `timing`, `buggify`, and the `Transport`
+   trait.
+2. `baserunna-storage`: the storage engine and the database features. It
+   depends on `baserunna-util`.
+3. `baserunna-worker`: the request handlers and the background jobs of each
    tenant. All tenant work runs in this crate. It depends on
-   `baserunna-storage` and `baserunna-server`.
-3. `baserunna-server`: connections, authentication, and the routing of each
-   request to a worker through the `Transport` trait. It does not depend on
+   `baserunna-storage` and `baserunna-util`.
+4. `baserunna-server`: connections, authentication, and the routing of each
+   request to a worker. It depends on `baserunna-util`. It does not depend on
    `baserunna-storage`.
 
 `baserunna-server` and `baserunna-worker` each build their own binary. The
@@ -59,7 +63,8 @@ The split of the storage engine is easy. Today `engine/` imports only `store`,
 
 ## Milestones
 
-A milestone is a group of PRs. The PR counts are estimates.
+A milestone is a group of PRs. The PR counts are estimates. Each milestone ends
+with a run of the harness from milestone 0. Record the results in this file.
 
 Milestone 0 comes first. Milestones 1 to 3 do not depend on each other. Start
 them in any order. Milestone 4 needs milestone 3. Milestone 5 comes last.
@@ -80,8 +85,6 @@ workload passes if these conditions hold:
 
 - [ ] Move the harness and its pass conditions to `main`. Record the result for
       each workload on `main` today.
-- [ ] Run the harness at the end of each milestone, and record the results in
-      this file.
 
 ### 1. Make each operation fit in a fixed amount of memory
 
@@ -139,26 +142,31 @@ ceiling. This is a limit on scale, not on isolation.
 
 ### 3. Run tenant work in workers
 
-A worker is a node that serves the databases of a single owner. The server
-sends each request to the worker of its owner through the `Transport` trait
-(`cluster.rs`). Nodes already use this trait to forward requests to each
-other. So the boundary protocol is HTTP. The simulator already runs nodes,
-forwards requests between them, and kills them.
+A worker belongs to a node. It runs the databases of a single owner on that
+node. The server of the node sends each database request to the worker of its
+owner through the `Transport` trait (`cluster.rs`), which nodes already use to
+forward requests to each other. So the boundary protocol is HTTP. Peers see
+only nodes. The worker routes requests to peers and holds leases, as a node
+does today.
 
-Each worker has its own node ID, and the ID is new each time the worker
-starts. This keeps invariant 1. In this milestone, the workers run in the
-process of the server. Milestone 4 chooses the mechanism that separates them.
+The lease identity of a worker is the node ID plus a suffix that is new each
+time the worker starts. This keeps invariant 1, and a peer still finds the node
+from the identity. In this milestone, the workers run in the process of the
+server. Milestone 4 chooses the mechanism that separates them.
 
 If a worker stops, all requests in flight for that owner on that node fail.
 The writes of its databases pause until their leases expire, for at most one
 lease period. SPEC §1 allows the same pause after a node stops.
 
-- [ ] Move the storage engine and the database features into `baserunna-storage`.
+- [ ] Move the shared modules into `baserunna-util`, and the storage engine and
+      the database features into `baserunna-storage`.
 - [ ] Send each database request to an in-process worker for its owner. Each
-      worker has its own `Engine` and node ID. The background jobs of each
-      database run in its worker. The server sends the authenticated
+      worker has its own `Engine` and lease identity. The background jobs of
+      each database run in its worker. The server sends the authenticated
       principal with the request, and it streams each body. The simulator runs
-      each worker as a node.
+      the workers inside each simulated node.
+- [ ] Stop a worker after it is idle for a fixed time. It releases its leases
+      before it stops.
 - [ ] Add a store guard on the server side. It fails each read of a tenant
       object, in tests and in the simulator.
 - [ ] Run the system database in its own worker. Metadata commands and the
@@ -189,20 +197,32 @@ At this point the only difference between the designs is the boundary.
 - [ ] Build the chosen mechanism. It must see every allocation and all CPU use,
       including those of dependencies. A counter in our code cannot. The number
       of PRs depends on the mechanism.
-- [ ] Give each worker a guarantee and a limit. With cgroups, these are
-      `memory.low` and `memory.max`, and `cpu.weight` and `cpu.max`. A node
-      starts a worker only if the guarantees of its running workers and the new
-      worker fit in the node. Otherwise it returns a retryable 503.
+- [ ] Give each worker a limit. With cgroups, these are `memory.max` and
+      `cpu.max`, and each worker has the same `cpu.weight`. On a host without
+      cgroup v2, such as macOS, workers run without limits, and the server logs
+      a warning at start.
+- [ ] Give each limit a default, and let an administrator override the limits
+      of each owner. The system database stores each override. If an
+      administrator changes a limit, the server writes the new value to the
+      cgroup of the running worker at once. Choose the defaults from the
+      harness results. Today a single event query can use 1 GiB. In the
+      contest, the worker pool at 512 MiB returned an error for a query in 19
+      of 40 runs, and today's code answered all 40.
 - [ ] Add the soft memory limit: a gauge at the admission point of each worker.
       The gauge reads live heap bytes from a counting global allocator. A new
-      request gets a retryable 503 if its tenant is near its limit, or if the
-      node runs short and its tenant is above its guarantee. Do not use
+      request gets a retryable 503 if its tenant is near its limit. Do not use
       `memory.high`: in `iso3/cgroup` it stalled work for 120 s.
-- [ ] Test the guarantees and limits with workloads that nobody reviewed.
+- [ ] Put the cgroup of each owner inside a single `tenants` cgroup. Its
+      `memory.max` is the memory of the node minus a reserve for the server and
+      the system worker. Set `memory.oom.group` on the cgroup of each owner. If
+      the tenants together run short of memory, the kernel stops the worker
+      that uses the most memory. It cannot stop the server or the system
+      worker, because they are outside the `tenants` cgroup.
+- [ ] Test the limits with workloads that nobody reviewed.
 - [ ] Remove the memory counter (`engine/memory.rs`). This also removes the
       fair share of memory among the users of an organization.
 
-### 5. Give each tenant a guarantee and a limit for the caches and the store
+### 5. Give each tenant a limit for the caches and the store
 
 The right method depends on the mechanism from milestone 4.
 
@@ -217,32 +237,26 @@ The right method depends on the mechanism from milestone 4.
   that algorithm.
 - The plan has no fixed time limit.
 
-## Decisions for the user
+## Decisions
 
-- The guarantee and the limit of each tenant. A larger guarantee lets fewer
-  tenants run on a node. A larger limit lets larger operations succeed, but a
-  tenant above its guarantee can then hold more idle capacity. The contest used
-  a limit of 512 MiB. Also decide whether the numbers apply to each tenant on
-  each node, or to each tenant across the cluster. Today a single event query
-  can use 1 GiB.
-  In the contest, the worker pool at 512 MiB returned an error for a query in
-  19 of 40 runs, and today's code answered all 40.
-- The deployment requirement. The worker pool needs Linux with a delegated
-  cgroup v2 subtree.
-
-Decided:
-
+- Each limit has a default, and an administrator can override the limits of
+  each owner (2026-11-25). For example, a paying customer can get larger limits
+  than a free customer.
+- Only Linux enforces the limits (2026-11-25). Enforcement needs a delegated
+  cgroup v2 subtree. macOS stays supported for development, without
+  enforcement.
 - Fairness among the users of an organization is not necessary for now
-  (2026-11-25). All users of an organization share the guarantee and the
-  limit of the organization. One user can fill them, and then the other users
-  get retryable 503s.
-- Each owner gets a guarantee and a limit (2026-11-25). A user can create up
-  to 100 organizations, and each organization is an owner. This is not a
-  problem in practice: each installation has a single organization, or it
-  charges for each organization.
-- A tenant's resources follow the industry model of guarantees and limits
-  (2026-11-25), as in the requests and limits of Kubernetes. Guarantees are
-  never overcommitted. Limits can be overcommitted.
+  (2026-11-25). All users of an organization share the limit of the
+  organization. One user can fill it, and then the other users get retryable
+  503s.
+- Each owner gets a limit (2026-11-25). A user can create up to 100
+  organizations, and each organization is an owner. This is not a problem in
+  practice: each installation has a single organization, or it charges for each
+  organization.
+- Workers belong to nodes (2026-11-25). Peers see only nodes, and membership,
+  routing, and placement do not change.
+- Each tenant has limits, not guarantees (2026-11-25). A guarantee needs a
+  scheduler that places work by capacity, and the nodes do not have one.
 - The goal isolates resources, not data access (2026-11-25). Every worker uses
   the same store credentials. The goal is named "Tenant resource isolation", so
   that it makes no promise about data.

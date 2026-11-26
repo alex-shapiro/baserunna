@@ -30,8 +30,10 @@ scope for v1.
 4. **Tenant resource isolation**
 
 - A tenant is the owner of a database: a user or an organization.
-- Each tenant has a guarantee and a limit for each resource. A tenant can always use its guarantee, and it can use idle capacity up to its limit.
-- If a node runs short of a resource, only the requests of tenants above their guarantee become slower or fail.
+- Each tenant has a limit for each resource. A tenant cannot use more than its limit, and it cannot crash a node.
+- Each limit has a default. An administrator can change the limits of each tenant.
+- If a node runs short of memory, the work of the tenant that uses the most memory stops first.
+- Linux enforces the limits. Other systems, such as macOS for development, run without enforcement.
 
 5. **Testability.**
 

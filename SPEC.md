@@ -33,12 +33,12 @@ scope for v1.
 - Each tenant has a limit for each resource. The node keeps each tenant within its limits. A tenant cannot crash a node.
 - Each limit has a default value. An administrator can change the limits for each tenant.
 - If a node does not have enough memory, it stops the tenant that uses the most memory first.
-- Linux enforces these limits. Other operating systems, such as macOS for development, run without enforcement.
+- The node enforces these limits on Linux. On other operating systems, such as macOS for development, the node runs without enforcement.
 
 5. **Testability.**
 
 - The service runs and is tested inside a deterministic simulator with fault injection.
-- The simulator tests isolation recovery by stopping tenant work at any time. A separate test harness tests kernel resource limits outside the simulator.
+- The simulator tests isolation recovery by stopping tenant work at any time. A separate harness checks kernel resource limits outside the simulator.
 
 6. **Perf, within reason.**
 

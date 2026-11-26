@@ -273,6 +273,7 @@ impl<S: Send + Sync> FromRequestParts<S> for ClientAddr {
 
 /// Resolves the client IP, extracting the address `hops` positions from the end of
 /// `X-Forwarded-For` if behind trusted proxies, or falling back to the peer socket.
+/// Ignores a forwarded entry that is not an IP address or a socket address.
 fn client_addr(headers: &HeaderMap, peer: Option<std::net::SocketAddr>, hops: usize) -> String {
     if hops > 0 {
         let forwarded: Vec<&str> = headers
@@ -284,11 +285,15 @@ fn client_addr(headers: &HeaderMap, peer: Option<std::net::SocketAddr>, hops: us
             .filter(|a| !a.is_empty())
             .collect();
         // Ignore client-supplied headers before the trusted proxy hops.
-        if let Some(a) = forwarded.len().checked_sub(hops).and_then(|i| forwarded.get(i)) {
-            return a.to_string();
+        if let Some(ip) = forwarded.len().checked_sub(hops).and_then(|i| forwarded.get(i)).and_then(|a| parse_ip(a)) {
+            return ip.to_string();
         }
     }
     peer.map_or_else(|| "unknown".into(), |p| p.ip().to_string())
+}
+
+fn parse_ip(s: &str) -> Option<std::net::IpAddr> {
+    s.parse().ok().or_else(|| s.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()))
 }
 
 async fn tag_client(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
@@ -1285,6 +1290,12 @@ mod tests {
         h.append("x-forwarded-for", HeaderValue::from_static("5.5.5.5"));
         assert_eq!(client_addr(&h, Some(peer), 2), "1.2.3.4", "two proxies");
         assert_eq!(client_addr(&h, Some(peer), 4), "10.0.0.9", "fewer entries than proxies");
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4:5678"));
+        assert_eq!(client_addr(&h, Some(peer), 1), "1.2.3.4", "a socket address");
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", HeaderValue::from_static("not-an-address"));
+        assert_eq!(client_addr(&h, Some(peer), 1), "10.0.0.9", "not an address: the peer");
         assert_eq!(client_addr(&HeaderMap::new(), None, 0), "unknown");
     }
 

@@ -1133,6 +1133,10 @@ that is over its length limit with `400 invalid_argument`:
 - Organization names: 39 bytes
 - IDs in a URL path: 64 bytes (`ID_MAX`)
 
+The client address in a session must parse as an IP address. If a trusted
+proxy sends an entry in `X-Forwarded-For` that is not an IP address, the node
+uses the peer address.
+
 Listings of users, sessions, API keys, organizations, members and
 databases are paginated (`limit`, default 100 and at most 1000, and
 `cursor`): they are table queries, whose cursors only resume inside the

@@ -1,6 +1,6 @@
-# Tenant Isolation Plan
+# Tenant Resource Isolation Plan
 
-This plan builds the tenant isolation goal in SPEC §1. The work is a series of
+This plan builds the tenant resource isolation goal in SPEC §1. The work is a series of
 small PRs to `main`. Each PR is useful by itself, passes the simulator, and leaves
 `main` in a working state.
 
@@ -228,3 +228,10 @@ Decided:
   (2026-11-25). All users of an organization share the bound of the
   organization. One user can fill it, and then the other users get retryable
   503s.
+- Each owner gets a share (2026-11-25). A user can create up to 100
+  organizations, and each organization is an owner. This is not a problem in
+  practice: each installation has a single organization, or it charges for each
+  organization.
+- The goal isolates resources, not data access (2026-11-25). Every worker uses
+  the same store credentials. The goal is named "Tenant resource isolation", so
+  that it makes no promise about data.

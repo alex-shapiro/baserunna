@@ -30,9 +30,9 @@ Multi-tenant services isolate tenants in two common ways:
 - Run tenant code in a sandboxed runtime, such as V8 isolates in Cloudflare
   Workers.
 
-Shared components, such as front proxies and metadata services, limit
-per-request cost and enforce fair admission. This plan runs a separate process
-per owner under Linux cgroups.
+Shared components like front proxies and metadata services limit per-request
+cost and enforce fair admission. This plan runs a separate process per owner
+under Linux cgroups.
 
 ## Cost
 
@@ -77,8 +77,8 @@ called the model.
   and Fable 1.
 - **Data access isolation.** Decided by the user after Fable's note.
 - **Separate crate for frames and `cargo tree` coverage.** Rejected from Opus
-  5. The frame protocol is gone, and the `cargo tree` check covers each crate,
-  including the simulator.
+  5. The frame protocol was removed, and the `cargo tree` check covers each
+  crate, including the simulator.
 - **No-process-boundary candidate.** Rejected from Fable 3. Counters failed
   hidden workloads in all three contest rounds because counters cannot track
   every allocation.

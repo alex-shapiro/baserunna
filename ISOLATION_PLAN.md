@@ -72,8 +72,8 @@ order. Milestone 4 depends on milestone 3. Milestone 5 comes last.
 
 ### 0. Measure isolation on `main`
 
-The isolation harness checks whether the node keeps serving a victim tenant
-while an attacker tenant runs a heavy workload. The harness is on branch
+The isolation harness checks whether the node continues to serve a victim
+tenant while an attacker tenant runs a heavy workload. The harness is on branch
 `iso/base` at `crates/baserunna/examples/isolation/` and
 `scripts/isolation/run.sh`.
 
@@ -98,7 +98,7 @@ tenant limit. These changes also protect users on `main` today. Process
 isolation does not require this milestone. Under cgroup limits, an unbounded
 operation fails at the tenant limit while the node continues to run.
 
-Each PR adds a test verifying that a request of size `N` uses at most
+Each PR adds a test that verifies a request of size `N` uses at most
 `k * N + C` bytes.
 
 - [ ] Move the counting allocator into `tests/support/` to remove duplicate
@@ -109,7 +109,7 @@ Each PR adds a test verifying that a request of size `N` uses at most
       memory".
 - [ ] Stream-parse JSON request bodies for event rows. Part of the same
       `TODO.md` item.
-- [ ] Bound the rows buffered by a bulk insert before a flush. Completes the
+- [ ] Limit the rows buffered by a bulk insert before a flush. Completes the
       same `TODO.md` item.
 - [ ] Limit partitions per bulk insert. Removes this item from `TODO.md`.
 - [ ] Merge parts block by block. Split into two PRs if needed. Removes the
@@ -119,9 +119,9 @@ Each PR adds a test verifying that a request of size `N` uses at most
 - [ ] Estimate string column memory from actual string lengths. Removes the
       `TODO.md` item "Estimate granule run memory from actual string lengths".
 - [ ] Compare blob values chunk by chunk in `check` operations in `ops.rs`.
-- [ ] Bound total result bytes held by a transaction in `ops.rs`.
+- [ ] Limit total result bytes held by a transaction in `ops.rs`.
 - [ ] Limit concurrent buffered blob chunks during downloads in `api/body.rs`.
-- [ ] Stream forwarded request and response bodies through the node. Bound
+- [ ] Stream forwarded request and response bodies through the node. Limit
       `BUFFER_FORWARD_MAX` and cached responses in `ForwardDedup`.
 - [ ] Add connection, Hyper header, and Hyper buffer limits in `main.rs`.
 - [ ] Time out stalled request bodies. Removes this item from `TODO.md`.
@@ -130,12 +130,12 @@ Each PR adds a test verifying that a request of size `N` uses at most
 
 The system database lease holder runs all metadata commands. It limits the cost
 of each command and schedules tenants fairly. Per-tenant workers cannot isolate
-metadata commands. A single lease holder runs all metadata commands, and many
-commands read data from multiple owners. For example, `create_db` for an
-organization reads the caller's role in that organization.
+metadata commands because many commands read data from multiple owners. For
+example, `create_db` for an organization reads the caller's role in that
+organization.
 
 The cluster still has an upper limit on total metadata write throughput. That
-limit bounds scale rather than isolation.
+limit affects scale, not isolation.
 
 - [ ] Enforce a length limit on every metadata command field, including the
       Google `sub` field.
@@ -208,7 +208,7 @@ outside our tracking code.
       per-owner overrides in the system database. Apply limit updates
       immediately to the running worker's cgroup. A single event query can use
       1 GiB today. In the contest, a 512 MiB worker limit caused 19 of 40 event
-      query runs to fail, while `main` answered all 40.
+      query runs to fail. Today `main` answers all 40.
 - [ ] Add a soft memory limit at worker request admission. Read live heap bytes
       from a counting global allocator. Return HTTP 503 if the worker is near
       its memory limit. Do not use cgroup `memory.high`. In `iso3/cgroup`,

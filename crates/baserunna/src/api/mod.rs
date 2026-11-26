@@ -47,6 +47,9 @@ pub fn error_json(e: &Error) -> Json {
 /// Maximum body size for `/internal/v1/events/bind`.
 const BIND_BODY_MAX: usize = 1 << 30;
 
+/// Maximum request body size in bytes for routes that run metadata commands.
+pub(crate) const META_BODY_MAX: usize = 64 * 1024;
+
 /// Reconstructs an [`Error`] from a JSON error response, falling back to `status`
 /// if the `error` object is missing.
 pub fn error_from_json(status: u16, j: &Json) -> Error {
@@ -270,6 +273,7 @@ impl<S: Send + Sync> FromRequestParts<S> for ClientAddr {
 
 /// Resolves the client IP, extracting the address `hops` positions from the end of
 /// `X-Forwarded-For` if behind trusted proxies, or falling back to the peer socket.
+/// Ignores a forwarded entry that is not an IP address or a socket address.
 fn client_addr(headers: &HeaderMap, peer: Option<std::net::SocketAddr>, hops: usize) -> String {
     if hops > 0 {
         let forwarded: Vec<&str> = headers
@@ -281,11 +285,15 @@ fn client_addr(headers: &HeaderMap, peer: Option<std::net::SocketAddr>, hops: us
             .filter(|a| !a.is_empty())
             .collect();
         // Ignore client-supplied headers before the trusted proxy hops.
-        if let Some(a) = forwarded.len().checked_sub(hops).and_then(|i| forwarded.get(i)) {
-            return a.to_string();
+        if let Some(ip) = forwarded.len().checked_sub(hops).and_then(|i| forwarded.get(i)).and_then(|a| parse_ip(a)) {
+            return ip.to_string();
         }
     }
     peer.map_or_else(|| "unknown".into(), |p| p.ip().to_string())
+}
+
+fn parse_ip(s: &str) -> Option<std::net::IpAddr> {
+    s.parse().ok().or_else(|| s.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()))
 }
 
 async fn tag_client(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
@@ -1111,17 +1119,19 @@ pub fn router(node: Arc<Node>) -> Router {
         .merge(events::routes())
         .route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
     let internal = Router::new()
-        .route("/internal/v1/meta", post(account::internal_meta))
+        .route("/internal/v1/meta", post(account::internal_meta).layer(DefaultBodyLimit::max(META_BODY_MAX)))
         .route("/internal/v1/notice", post(commit_notice))
         .route("/internal/v1/events/bind", post(events::internal_bind).layer(DefaultBodyLimit::max(BIND_BODY_MAX)))
         .route_layer(middleware::from_fn_with_state(node.clone(), internal_auth));
+    let meta_routes = account::routes()
+        .merge(orgs::routes())
+        .route(api::ListDbs::ROUTE, get(data::list_dbs).post(data::create_db))
+        .layer(DefaultBodyLimit::max(META_BODY_MAX));
     let r = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/openapi.json", get(openapi))
         .endpoint::<api::GetLimits, _>(limits)
-        .merge(account::routes())
-        .merge(orgs::routes())
-        .route(api::ListDbs::ROUTE, get(data::list_dbs).post(data::create_db))
+        .merge(meta_routes)
         .merge(db_routes)
         .merge(internal)
         .merge(crate::console::routes())
@@ -1280,6 +1290,12 @@ mod tests {
         h.append("x-forwarded-for", HeaderValue::from_static("5.5.5.5"));
         assert_eq!(client_addr(&h, Some(peer), 2), "1.2.3.4", "two proxies");
         assert_eq!(client_addr(&h, Some(peer), 4), "10.0.0.9", "fewer entries than proxies");
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4:5678"));
+        assert_eq!(client_addr(&h, Some(peer), 1), "1.2.3.4", "a socket address");
+        let mut h = HeaderMap::new();
+        h.append("x-forwarded-for", HeaderValue::from_static("not-an-address"));
+        assert_eq!(client_addr(&h, Some(peer), 1), "10.0.0.9", "not an address: the peer");
         assert_eq!(client_addr(&HeaderMap::new(), None, 0), "unknown");
     }
 
@@ -1361,6 +1377,9 @@ mod tests {
 
 #[cfg(test)]
 mod events_tests;
+
+#[cfg(test)]
+mod meta_tests;
 
 #[cfg(test)]
 mod txns_tests;

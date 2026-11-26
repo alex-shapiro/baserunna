@@ -638,3 +638,10 @@ only.
       campaign had 1 failure in 23,571 runs (`delete_events` deadline defect,
       seed 11581). Main fails 588 of 122,174 `register` runs with the same
       setting.
+- [ ] [untriaged · Tables] **Reject table keys longer than the engine key
+      limit.** Check the length of each primary key and index key in
+      `table::insert` and `table::update`. If a key is longer than the
+      4,096-byte `MAX_USER_KEY` limit, return `400 invalid_argument`. In a
+      probe test, the table layer accepts a 5,000-byte indexed value. The
+      commit then fails with `500 internal: corrupt data: key too long`. The
+      database stays readable. The server logs a false corruption message.

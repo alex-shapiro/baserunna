@@ -121,7 +121,7 @@ organization.
 The cluster still has a limit on metadata write throughput. That limit affects
 scale, not isolation.
 
-- [ ] Set a length limit on every field in a metadata command, including the
+- [x] Set a length limit on every field in a metadata command, including the
       Google `sub` field.
 - [ ] Test that every metadata command reads and writes at most a fixed number
       of rows and bytes. Multi-row deletes already run in batches of `PAGE_MAX`

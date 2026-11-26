@@ -288,6 +288,7 @@ async fn revoke_other_sessions(State(node): State<Arc<Node>>, Auth(p): Auth) -> 
 }
 
 async fn revoke_session(State(node): State<Arc<Node>>, Auth(p): Auth, Path(id): Path<String>) -> Result<Response> {
+    meta::check_id(&id)?;
     let current = node.revoke_session(&p, &id).await?;
     let resp = axum::Json(json!({"current": current})).into_response();
     Ok(if current { with_cookie(resp, session_cookie(&node, "", 0)) } else { resp })
@@ -349,6 +350,7 @@ async fn delete_key(
     _: Req<api::DeleteApiKey>,
 ) -> Result<Reply<api::DeleteApiKey>> {
     p.require_session()?;
+    meta::check_id(&id)?;
     node.run_meta(MetaCmd::DeleteApiKey { id: id.clone(), user_id: p.user.id.clone() }).await?;
     node.forget_api_key(&id);
     Ok(Reply::new(api::Empty {}))
@@ -384,6 +386,7 @@ async fn admin_disable(
     p.require_admin()?;
     p.require_writable()?;
     p.require_unscoped()?;
+    meta::check_id(&id)?;
     node.run_meta(MetaCmd::SetDisabled { actor: p.user.id.clone(), user_id: id.clone(), disabled: d.disabled }).await?;
     node.forget_user(&id);
     Ok(axum::Json(json!({})))

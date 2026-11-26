@@ -1121,6 +1121,22 @@ keys) check that user's rights inside their own transaction: whether
 the user still exists and is enabled, and their role. Authorization of
 metadata changes is therefore serializable with the changes themselves.
 
+Routes that run metadata commands accept a request body of at most 64 KiB
+(`META_BODY_MAX`). The node stops reading a longer body and returns
+`413 too_large`. After the node parses the request, it rejects a text field
+that is over its length limit with `400 invalid_argument`:
+
+- Emails: 254 bytes
+- Passwords: 256 bytes
+- API key names: 100 bytes
+- Database names: 63 bytes
+- Organization names: 39 bytes
+- IDs in a URL path: 64 bytes (`ID_MAX`)
+
+The client address in a session must parse as an IP address. If a trusted
+proxy sends an entry in `X-Forwarded-For` that is not an IP address, the node
+uses the peer address.
+
 Listings of users, sessions, API keys, organizations, members and
 databases are paginated (`limit`, default 100 and at most 1000, and
 `cursor`): they are table queries, whose cursors only resume inside the
@@ -1164,9 +1180,15 @@ recreate a purged database.
   `GET /v1/auth/google/start` redirects to Google with `state`. The state is
   an HMAC-signed, 10-minute nonce that is also set as a cookie.
   `GET /v1/auth/google/callback` checks the state, exchanges the code at the
-  token endpoint, and verifies the ID token. The checks are the RS256
-  signature against Google's JWKS (cached), `iss`, `aud == client_id`, `exp`,
-  and `email_verified`. A user is matched by `google_sub`, then by verified
+  token endpoint, and verifies the ID token. The node checks:
+  - the RS256 signature against Google's cached JWKS
+  - `iss` and `aud == client_id`
+  - `exp`
+  - `email_verified`
+  - a `sub` claim with 1 to 255 ASCII characters, as defined in OpenID Connect
+    Core 1.0 §2
+
+  A user is matched by `google_sub`, then by verified
   email, and is created if allowed by the signup policy. Matching by email
   links Google to the existing account only if that account does not have a
   password or has verified its address: otherwise whoever signed up with

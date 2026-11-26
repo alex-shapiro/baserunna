@@ -144,4 +144,19 @@ mod tests {
             assert!(verify_id_token(&tok, &jwks, CLIENT_ID, g.issuers(), 1_700_000_000_000).is_err(), "{t:?}");
         }
     }
+
+    #[tokio::test]
+    async fn verify_id_token_requires_1_to_255_ascii_sub() {
+        let google = FakeGoogle::new(Box::new(|| 1_700_000_000_000));
+        let jwks = google.jwks().await.unwrap();
+        for (sub, expect_ok) in
+            [("a".repeat(255), true), ("a".repeat(256), false), (String::new(), false), ("é".into(), false)]
+        {
+            let identity =
+                Identity { sub: sub.clone(), email: "u@x.io".into(), email_verified: true, tamper: Tamper::None };
+            let token = google.exchange_code(&google.issue_code(identity), "").await.unwrap();
+            let result = verify_id_token(&token, &jwks, CLIENT_ID, google.issuers(), 1_700_000_000_000);
+            assert_eq!(result.is_ok(), expect_ok, "sub of {} bytes: {result:?}", sub.len());
+        }
+    }
 }

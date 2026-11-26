@@ -191,6 +191,17 @@ pub fn is_org_id(owner_id: &str) -> bool {
     owner_id.starts_with(ORG_ID_PREFIX)
 }
 
+/// Maximum length in bytes of a user, session, API key, or database ID in a request.
+pub const ID_MAX: usize = 64;
+
+/// Rejects an ID from a request that is longer than [`ID_MAX`] bytes.
+pub fn check_id(id: &str) -> Result<()> {
+    match id.len() <= ID_MAX {
+        true => Ok(()),
+        false => Err(Error::invalid(format!("IDs are at most {ID_MAX} bytes"))),
+    }
+}
+
 pub fn valid_db_name(s: &str) -> bool {
     valid_slug(s, 63)
 }
@@ -214,7 +225,7 @@ pub enum DbRef {
 impl DbRef {
     pub fn parse(s: &str) -> Option<DbRef> {
         if let Some(id) = s.strip_prefix("id:") {
-            return (!id.is_empty() && id.len() <= 64).then(|| DbRef::Id(id.to_string()));
+            return (!id.is_empty() && id.len() <= ID_MAX).then(|| DbRef::Id(id.to_string()));
         }
         match s.split_once('.') {
             Some((org, name)) => (org::valid_org_name(org) && valid_db_name(name))

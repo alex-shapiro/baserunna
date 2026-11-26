@@ -22,7 +22,7 @@ const RECORDS_PER_APPEND: usize = 20_000;
 const PAD_BYTES: usize = 200;
 /// Concurrent attack clients, set to 8 per vCPU to keep all VM cores busy.
 const ATTACK_CLIENTS: usize = 32;
-/// Duration of each attack round. Keeps the attack active while victim requests run.
+/// Duration of each attack round so the attack overlaps with victim requests.
 const ATTACK_DURATION: Duration = Duration::from_secs(10);
 /// Sequential queries sent by a single client in the small variant.
 const SMALL_QUERIES: usize = 10;

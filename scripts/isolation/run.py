@@ -93,7 +93,7 @@ def node_environment(workload, s3_env, node_port):
             BASERUNNA_SIGNUPS_PER_HOUR_PER_CLIENT="0",
         )
     if workload == "idle_cost":
-        # Setup creates 1,000 owners from a single client IP.
+        # The idle cost benchmark creates 1,000 owners from a single client IP.
         # Set the authentication rate limit to `inf` to disable it.
         # Use fewer PBKDF2 iterations so the node hashes passwords quickly.
         env.update(

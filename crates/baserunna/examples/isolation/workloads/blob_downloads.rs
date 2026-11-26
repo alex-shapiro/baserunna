@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 const BLOB_BYTES: usize = 24 << 20;
 /// Concurrent attack clients. Together they buffer up to 1 GiB of 8 MiB chunks.
 const ATTACK_CLIENTS: usize = 128;
-/// Duration of each attack round. Keeps the attack active while victim requests run.
+/// Duration of each attack round so the attack overlaps with victim requests.
 const ATTACK_DURATION: Duration = Duration::from_secs(10);
 /// Sequential downloads sent by a single client in the small variant.
 const SMALL_DOWNLOADS: usize = 4;

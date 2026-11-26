@@ -1,7 +1,8 @@
 //! Distinct-count query over a 60 KB string column.
 //!
 //! The attack variant loads 8 days with 8 bulk inserts per day, then queries all 8 days.
-//! The small variant loads 1 day with 1 bulk insert of 500 rows, or 30 MB of strings.
+//! The small variant loads 1 day with 1 bulk insert of 500 rows. Those rows contain 30 MB of
+//! strings.
 //! On `main`, a full 8-insert day exceeds the 256 MiB node memory budget, so the node returns
 //! HTTP 413.
 //! A single bulk insert fits within that budget, so a healthy node completes the small variant.

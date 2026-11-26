@@ -1,7 +1,8 @@
 //! Single-request transactions that repeat full scan pages of maximum-size inline values.
 //!
 //! `Op::Scan` in `ops.rs` returns up to `PAGE_MAX` key-value pairs per operation.
-//! The transaction charges only the scanned range to its read set, excluding the returned values.
+//! The transaction charges only the scanned range to its read set. It does not charge the returned
+//! values.
 //! `exec_ops` holds all operation results in memory until the handler serializes them into a single
 //! HTTP response.
 //! Repeating scan operations up to `MAX_TXN_OPS` multiplies per-request node memory use.

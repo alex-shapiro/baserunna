@@ -82,7 +82,7 @@ fn header(name: &str, desc: &str) -> Value {
 }
 
 fn ttl() -> Value {
-    json!({"type": "integer", "minimum": 1, "maximum": crate::ops::MAX_TTL_MS})
+    json!({"type": "integer", "minimum": 1, "maximum": baserunna_storage::ops::MAX_TTL_MS})
 }
 
 fn enum_of(values: &[&str]) -> Value {
@@ -105,7 +105,7 @@ fn filter_schema(name: &str, comparisons: Vec<Value>, desc: &str) -> Value {
 /// Builds a comparison leaf schema for the operand field `key`.
 fn comparison(key: &str, operand: Value) -> Value {
     let value = json!({"description": "Omitted for `exists`, an array of at most 1000 elements for `in`, or a non-null scalar."});
-    obj(json!({(key): operand, "op": enum_of(&crate::filter::OPS), "value": value}), &[key, "op"])
+    obj(json!({(key): operand, "op": enum_of(&baserunna_storage::filter::OPS), "value": value}), &[key, "op"])
 }
 
 #[derive(Default)]
@@ -164,7 +164,7 @@ fn paging() -> Vec<Value> {
         query(
             "limit",
             json!({"type": "integer", "minimum": 1, "maximum": baserunna_api::PAGE_MAX}),
-            &format!("Page size (default {})", crate::ops::PAGE_DEFAULT),
+            &format!("Page size (default {})", baserunna_storage::ops::PAGE_DEFAULT),
         ),
         query("cursor", s(), "From a previous next_cursor"),
     ]

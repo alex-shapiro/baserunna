@@ -1,11 +1,11 @@
 //! End-to-end tests for `baserunna-client` against an in-process node.
 //! Covers dropped requests, lost responses, slow responses, and concurrent transactions.
 
-use baserunna::env::Env;
 use baserunna::node::{Node, NodeConfig, Services};
-use baserunna::store::MemStore;
 use baserunna_api::{self as api, ColumnType, Endpoint as _, NewColumn, NewTable, Outcome};
 use baserunna_client::{BoxFuture, Client, Db, Error, Expect, Op, OpResult, Route, Row, Transport, TransportError};
+use baserunna_storage::store::MemStore;
+use baserunna_util::env::Env;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -94,7 +94,7 @@ async fn node(fail_route: &'static str) -> (Db, Arc<Router>) {
 }
 
 async fn node_with(fail_route: &'static str, configure: impl FnOnce(&mut NodeConfig)) -> (Db, Arc<Router>) {
-    baserunna::log::set_level(Some(baserunna::log::Level::Warn));
+    baserunna_util::log::set_level(Some(baserunna_util::log::Level::Warn));
     let mut cfg = NodeConfig {
         pbkdf2_iterations: 1000,
         limits: baserunna::limits::LimitConfig::unlimited(),

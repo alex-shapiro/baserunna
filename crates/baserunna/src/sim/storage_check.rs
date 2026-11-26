@@ -1,10 +1,10 @@
 //! Storage invariants checked after every simulation run.
 
 use super::Sim;
-use crate::engine::manifest::{Levels, Manifest};
-use crate::engine::range_delete::RangeDeletes;
-use crate::engine::stream::{self, Stored};
-use crate::engine::{Value, segment};
+use baserunna_storage::engine::manifest::{Levels, Manifest};
+use baserunna_storage::engine::range_delete::RangeDeletes;
+use baserunna_storage::engine::stream::{self, Stored};
+use baserunna_storage::engine::{Value, segment};
 use bytes::Bytes;
 use std::collections::BTreeSet;
 
@@ -26,7 +26,7 @@ impl Sim {
                 continue;
             }
             if let Some(id) = m.levels.clone() {
-                let lk = crate::engine::levels_key(db, &id);
+                let lk = baserunna_storage::engine::levels_key(db, &id);
                 let l = self
                     .mem
                     .get_sync(&lk, &Default::default())
@@ -37,7 +37,7 @@ impl Sim {
             }
             let mut entries = m.tail.clone();
             for s in &m.segments {
-                let sk = crate::engine::seg_key(db, &s.id);
+                let sk = baserunna_storage::engine::seg_key(db, &s.id);
                 let d = self
                     .mem
                     .get_sync(&sk, &Default::default())
@@ -51,23 +51,23 @@ impl Sim {
             }
             // Shadowed or deleted blob references may be garbage-collected.
             let deletes = RangeDeletes::new(&m.range_deletes);
-            let mut newest: std::collections::BTreeMap<Bytes, &crate::engine::Entry> =
+            let mut newest: std::collections::BTreeMap<Bytes, &baserunna_storage::engine::Entry> =
                 std::collections::BTreeMap::new();
             for e in &entries {
                 if newest.get(&e.key).is_none_or(|x| e.seq > x.seq) {
                     newest.insert(e.key.clone(), e);
                 }
             }
-            let mut positions: std::collections::BTreeMap<(u32, crate::engine::events::Pos), String> =
+            let mut positions: std::collections::BTreeMap<(u32, baserunna_storage::engine::events::Pos), String> =
                 Default::default();
             let mut part_bytes = 0u64;
             let mut referenced_parts: BTreeSet<String> = BTreeSet::new();
             let live = || newest.values().filter(|e| deletes.seq_at(&e.key) <= e.seq && !e.value.is_tombstone());
             let schemas: std::collections::BTreeMap<u32, String> = live()
-                .filter(|e| e.key.starts_with(crate::events::SCHEMAS))
+                .filter(|e| e.key.starts_with(baserunna_storage::events::SCHEMAS))
                 .filter_map(|e| match &e.value {
-                    crate::engine::Value::Inline(b) => {
-                        serde_json::from_slice::<crate::events::schema::EventSchema>(b).ok()
+                    baserunna_storage::engine::Value::Inline(b) => {
+                        serde_json::from_slice::<baserunna_storage::events::schema::EventSchema>(b).ok()
                     }
                     _ => None,
                 })
@@ -75,8 +75,8 @@ impl Sim {
                 .collect();
             let names: std::collections::BTreeMap<u32, String> = live()
                 .filter_map(|e| {
-                    let id = u32::from_be_bytes(e.key.strip_prefix(crate::events::NAMES)?.try_into().ok()?);
-                    let crate::engine::Value::Inline(b) = &e.value else { return None };
+                    let id = u32::from_be_bytes(e.key.strip_prefix(baserunna_storage::events::NAMES)?.try_into().ok()?);
+                    let baserunna_storage::engine::Value::Inline(b) = &e.value else { return None };
                     Some((id, String::from_utf8_lossy(b).into_owned()))
                 })
                 .collect();
@@ -84,21 +84,23 @@ impl Sim {
                 return Err(format!("db {db}: event table names by id {names:?} do not match schemas {schemas:?}"));
             }
             let tables: std::collections::BTreeSet<u32> = schemas.into_keys().collect();
-            let mut states: std::collections::BTreeMap<u32, crate::engine::events::TableState> = Default::default();
-            let mut counted: std::collections::BTreeMap<u32, crate::engine::events::TableState> = Default::default();
+            let mut states: std::collections::BTreeMap<u32, baserunna_storage::engine::events::TableState> =
+                Default::default();
+            let mut counted: std::collections::BTreeMap<u32, baserunna_storage::engine::events::TableState> =
+                Default::default();
             for e in live() {
-                let table = if let Some((t, _)) = crate::engine::events::parse_row_key(&e.key) {
-                    let crate::engine::Value::Inline(row) = &e.value else {
+                let table = if let Some((t, _)) = baserunna_storage::engine::events::parse_row_key(&e.key) {
+                    let baserunna_storage::engine::Value::Inline(row) = &e.value else {
                         return Err(format!("db {db}: unsealed row {:?} is not inline", e.key));
                     };
                     let c = counted.entry(t).or_default();
                     c.unsealed_rows += 1;
                     c.unsealed_bytes += (e.key.len() + row.len()) as u64;
                     t
-                } else if let Some((t, st)) = crate::engine::events::state_of(e) {
+                } else if let Some((t, st)) = baserunna_storage::engine::events::state_of(e) {
                     states.insert(t, st);
                     t
-                } else if let Some(r) = crate::engine::events::ref_of(e) {
+                } else if let Some(r) = baserunna_storage::engine::events::ref_of(e) {
                     counted.entry(r.table).or_default().part_bytes += r.stored_bytes();
                     r.table
                 } else {
@@ -126,11 +128,11 @@ impl Sim {
                 ));
             }
             for e in live() {
-                let place = if let Some((table, pos)) = crate::engine::events::parse_row_key(&e.key) {
+                let place = if let Some((table, pos)) = baserunna_storage::engine::events::parse_row_key(&e.key) {
                     vec![((table, pos), "unsealed row".to_string())]
-                } else if e.key.first() == Some(&crate::engine::events::PARTS) {
-                    let r =
-                        crate::engine::events::ref_of(e).ok_or_else(|| format!("db {db}: corrupt part reference"))?;
+                } else if e.key.first() == Some(&baserunna_storage::engine::events::PARTS) {
+                    let r = baserunna_storage::engine::events::ref_of(e)
+                        .ok_or_else(|| format!("db {db}: corrupt part reference"))?;
                     part_bytes += r.stored_bytes();
                     referenced_parts.insert(r.id.clone());
                     referenced_parts.extend(r.mask_object().map(str::to_string));
@@ -200,7 +202,7 @@ impl Sim {
                 if let Value::Blob(b) = &e.value {
                     let n = b.size.div_ceil(chunk);
                     for c in 0..n {
-                        let ck = crate::engine::blob_chunk_key(db, &b.id, c);
+                        let ck = baserunna_storage::engine::blob_chunk_key(db, &b.id, c);
                         if !keys.contains(&ck) {
                             return Err(format!("db {db}: blob {} chunk {c} missing", b.id));
                         }
@@ -215,24 +217,26 @@ impl Sim {
 }
 
 fn check_part(
-    mem: &crate::store::MemStore,
+    mem: &baserunna_storage::store::MemStore,
     db: &str,
-    r: &crate::engine::events::PartRef,
-) -> Result<Vec<crate::engine::events::Pos>, String> {
+    r: &baserunna_storage::engine::events::PartRef,
+) -> Result<Vec<baserunna_storage::engine::events::Pos>, String> {
     let mut stream = Vec::with_capacity(r.size as usize);
     for i in 0..r.chunks() {
-        let k = crate::engine::part_chunk_key(db, &r.id, i);
+        let k = baserunna_storage::engine::part_chunk_key(db, &r.id, i);
         let g = mem.get_sync(&k, &Default::default()).map_err(|e| format!("db {db}: part chunk {k} missing: {e}"))?;
         stream.extend_from_slice(&g.data);
     }
-    let (_, pos) = crate::events::part::inspect(&Bytes::from(stream), r).map_err(|e| format!("db {db}: {e}"))?;
+    let (_, pos) =
+        baserunna_storage::events::part::inspect(&Bytes::from(stream), r).map_err(|e| format!("db {db}: {e}"))?;
     let mask = match &r.mask {
-        None => crate::engine::events::Runs::default(),
-        Some(crate::engine::events::Mask::Inline(m)) => m.clone(),
-        Some(crate::engine::events::Mask::Object { id, .. }) => {
-            let k = crate::engine::part_chunk_key(db, id, 0);
+        None => baserunna_storage::engine::events::Runs::default(),
+        Some(baserunna_storage::engine::events::Mask::Inline(m)) => m.clone(),
+        Some(baserunna_storage::engine::events::Mask::Object { id, .. }) => {
+            let k = baserunna_storage::engine::part_chunk_key(db, id, 0);
             let g = mem.get_sync(&k, &Default::default()).map_err(|e| format!("db {db}: mask {k} missing: {e}"))?;
-            crate::engine::events::decode_mask_object(&g.data).map_err(|e| format!("db {db}: mask {k}: {e}"))?
+            baserunna_storage::engine::events::decode_mask_object(&g.data)
+                .map_err(|e| format!("db {db}: mask {k}: {e}"))?
         }
     };
     if mask.count() != r.deleted {
@@ -246,8 +250,13 @@ fn check_part(
     Ok(pos.into_iter().enumerate().filter(|(i, _)| !mask.contains(*i as u32)).map(|(_, p)| p).collect())
 }
 
-fn check_chunk(mem: &crate::store::MemStore, db: &str, id: u64, c: &stream::ChunkRef) -> Result<(), String> {
-    let k = crate::engine::seg_key(db, &c.id);
+fn check_chunk(
+    mem: &baserunna_storage::store::MemStore,
+    db: &str,
+    id: u64,
+    c: &stream::ChunkRef,
+) -> Result<(), String> {
+    let k = baserunna_storage::engine::seg_key(db, &c.id);
     let g = mem.get_sync(&k, &Default::default()).map_err(|e| format!("db {db}: chunk {} missing: {e}", c.id))?;
     let entries = segment::read_all(&g.data).map_err(|e| format!("chunk {k}: {e}"))?;
     let mut seq = c.first_seq;

@@ -1,6 +1,6 @@
 //! Object-store conformance tests.
 //!
-//! Runs `baserunna::store::conformance` against `MemStore`, `FsStore`, `CloudStore` backed by an
+//! Runs `baserunna_storage::store::conformance` against `MemStore`, `FsStore`, `CloudStore` backed by an
 //! in-process S3 server, and a live S3 store if `BASERUNNA_TEST_STORE` is set. Also verifies that
 //! each conformance check detects its corresponding contract violation.
 
@@ -8,8 +8,9 @@
 mod fake_s3;
 
 use axum::http::Method;
-use baserunna::store::conformance::{self, Config};
-use baserunna::store::*;
+use baserunna_storage::store::conformance::{self, Config};
+use baserunna_storage::store::*;
+use baserunna_util::BoxFut;
 use bytes::Bytes;
 use fake_s3::{FakeS3, Fault};
 use parking_lot::Mutex;
@@ -50,7 +51,7 @@ fn model_sequences_agree_on_mem_and_fs_stores() {
     let _ = std::fs::remove_dir_all(&dir);
     let fs: DynStore = Arc::new(FsStore::new(&dir).unwrap());
     let rt = rt();
-    baserunna::util::prop::check(
+    baserunna_util::prop::check(
         "store_model",
         40,
         |r| r.next_u64(),

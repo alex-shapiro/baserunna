@@ -6,9 +6,9 @@
 //! cargo run --release --example amplification [scale]
 //! ```
 
-use baserunna::engine::EngineConfig;
-use baserunna::engine::segment::Compression;
 use baserunna::sim::amp::{measure_all, measure_streams, stream_table, table};
+use baserunna_storage::engine::EngineConfig;
+use baserunna_storage::engine::segment::Compression;
 
 fn main() {
     let scale: f64 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(1.0);

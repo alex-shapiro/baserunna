@@ -157,8 +157,8 @@ pub fn encode(boundary: &str, parts: &[Part]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::prop;
-    use crate::util::rng::Rng;
+    use baserunna_util::prop;
+    use baserunna_util::rng::Rng;
 
     const CT: &str = "multipart/form-data; boundary=----b0undary";
 

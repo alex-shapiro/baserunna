@@ -3,9 +3,9 @@
 #[path = "support/counting_alloc.rs"]
 mod counting_alloc;
 
-use baserunna::engine::{Consistency, Engine, EngineConfig, Isolation, KeyRange, Value};
-use baserunna::env::Env;
-use baserunna::store::{DynStore, MemStore};
+use baserunna_storage::engine::{Consistency, Engine, EngineConfig, Isolation, KeyRange, Value};
+use baserunna_storage::store::{DynStore, MemStore};
+use baserunna_util::env::Env;
 use bytes::Bytes;
 use counting_alloc::{HEAP_MEASUREMENT_LOCK, allocated_bytes, heap_change_bytes, peak_growth_bytes, reset_peak_bytes};
 use std::sync::Arc;
@@ -141,7 +141,7 @@ fn memory_charges_bound_real_heap_use() {
     let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().unwrap();
     rt.block_on(async {
-        baserunna::log::set_level(Some(baserunna::log::Level::Warn));
+        baserunna_util::log::set_level(Some(baserunna_util::log::Level::Warn));
         let w = World::new();
         charges_cover_decoded_manifests(&w).await;
         opening_many_databases_respects_budget(&w).await;
@@ -150,7 +150,8 @@ fn memory_charges_bound_real_heap_use() {
 
 #[test]
 fn bulk_inserts_bound_memory_by_body_size() {
-    use baserunna::sim::cost::{World, call_router, run_paused};
+    use baserunna::sim::cost::{World, call_router};
+    use baserunna_util::run_paused;
     use tower::ServiceExt;
     let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
@@ -187,13 +188,17 @@ fn bulk_inserts_bound_memory_by_body_size() {
 
 #[test]
 fn corrupt_column_index_bounds_decoded_memory() {
-    use baserunna::events::part::{ColIndex, ColMeta, ColRef, PartMeta};
-    use baserunna::events::vector::Phys;
-    use baserunna::util::codec::Writer;
+    use baserunna_storage::events::part::{ColIndex, ColMeta, ColRef, PartMeta};
+    use baserunna_storage::events::vector::Phys;
+    use baserunna_util::codec::Writer;
     let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     let framed = |w: Writer| {
         let mut out = Vec::new();
-        baserunna::engine::segment::frame(&w.into_inner(), baserunna::engine::segment::Compression::Zstd(1), &mut out);
+        baserunna_storage::engine::segment::frame(
+            &w.into_inner(),
+            baserunna_storage::engine::segment::Compression::Zstd(1),
+            &mut out,
+        );
         Bytes::from(out)
     };
     let n = 30_000_000u64;
@@ -269,14 +274,15 @@ fn corrupt_column_index_bounds_decoded_memory() {
 
 #[test]
 fn events_expanded_by_defaults_respect_request_limit() {
-    use baserunna::sim::cost::{World, call_router, run_paused};
+    use baserunna::sim::cost::{World, call_router};
+    use baserunna_util::run_paused;
     let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
         let t = w.signup(0, "mem@api.test").await;
         w.create_db(0, &t, "d").await;
         let router = w.node(0).router().unwrap();
-        let pad = "x".repeat(baserunna::events::schema::DEFAULT_MAX_BYTES - 2);
+        let pad = "x".repeat(baserunna_storage::events::schema::DEFAULT_MAX_BYTES - 2);
         let table = format!(
             r#"{{"name": "ev", "columns": [{{"name": "time", "type": "time", "default": "now"}},
             {{"name": "pad", "type": "string", "default": "{pad}"}}], "time_column": "time", "order_by": ["time"]}}"#
@@ -312,7 +318,7 @@ async fn setup_unsealed_events_with_large_defaults(t: &str, router: &axum::Route
     let txn = format!(r#"{{"ops": [{{"op": "insert_events", "table": "ev", "rows": [{rows}]}}]}}"#);
     let r = call_router(router, "POST", "/v1/dbs/d/txn", t, Bytes::from(txn)).await;
     assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
-    let pad = "x".repeat(baserunna::events::schema::DEFAULT_MAX_BYTES - 2);
+    let pad = "x".repeat(baserunna_storage::events::schema::DEFAULT_MAX_BYTES - 2);
     for i in 0..254 {
         let col = format!(r#"{{"name": "c{i}", "type": "string", "default": "{pad}"}}"#);
         let r = call_router(router, "POST", "/v1/dbs/d/events/ev/columns", t, Bytes::from(col)).await;
@@ -326,7 +332,8 @@ async fn setup_unsealed_events_with_large_defaults(t: &str, router: &axum::Route
 
 #[test]
 fn sealing_events_with_added_defaults_bounds_memory() {
-    use baserunna::sim::cost::{World, call_router, run_paused};
+    use baserunna::sim::cost::{World, call_router};
+    use baserunna_util::run_paused;
     let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
@@ -361,7 +368,8 @@ fn sealing_events_with_added_defaults_bounds_memory() {
 
 #[test]
 fn queries_on_unsealed_events_with_added_defaults_respect_memory_limit() {
-    use baserunna::sim::cost::{World, call_router, run_paused};
+    use baserunna::sim::cost::{World, call_router};
+    use baserunna_util::run_paused;
     let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
@@ -385,7 +393,8 @@ fn queries_on_unsealed_events_with_added_defaults_respect_memory_limit() {
 
 #[test]
 fn queries_with_many_json_paths_respect_memory_limit() {
-    use baserunna::sim::cost::{World, call_router, run_paused};
+    use baserunna::sim::cost::{World, call_router};
+    use baserunna_util::run_paused;
     let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::new(1, 0).await;
@@ -427,7 +436,8 @@ fn queries_with_many_json_paths_respect_memory_limit() {
 
 #[test]
 fn queries_with_many_shared_json_paths_respect_memory_limit() {
-    use baserunna::sim::cost::{World, call_router, run_paused};
+    use baserunna::sim::cost::{World, call_router};
+    use baserunna_util::run_paused;
     let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::with_config(1, 0, |c| {
@@ -471,7 +481,8 @@ fn queries_with_many_shared_json_paths_respect_memory_limit() {
 
 #[test]
 fn query_lookups_respect_memory_limit() {
-    use baserunna::sim::cost::{World, call_router, run_paused};
+    use baserunna::sim::cost::{World, call_router};
+    use baserunna_util::run_paused;
     let _heap_lock = HEAP_MEASUREMENT_LOCK.lock();
     run_paused(async {
         let w = World::with_config(1, 0, |c| c.query_limits.lookup_max_bytes = 8 * MIB).await;

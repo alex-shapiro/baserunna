@@ -1,13 +1,13 @@
 #![no_main]
 //! Fuzzes event part decoding, table state, deletion masks, binds, aggregate
 //! states, and query parsing.
-use baserunna::engine::events::{Bind, PartRef, Runs, TableState, decode_mask_object, encode_mask_object, ref_key};
-use baserunna::engine::segment::{Compression, frame};
-use baserunna::events::agg::State;
-use baserunna::events::part::{ColIndex, ColMeta, ColRef, PartMeta, decode_block, inspect};
-use baserunna::events::query::Query;
-use baserunna::events::vector::Phys;
-use baserunna::util::codec::Reader;
+use baserunna_storage::engine::events::{Bind, PartRef, Runs, TableState, decode_mask_object, encode_mask_object, ref_key};
+use baserunna_storage::engine::segment::{Compression, frame};
+use baserunna_storage::events::agg::State;
+use baserunna_storage::events::part::{ColIndex, ColMeta, ColRef, PartMeta, decode_block, inspect};
+use baserunna_storage::events::query::Query;
+use baserunna_storage::events::vector::Phys;
+use baserunna_util::codec::Reader;
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 

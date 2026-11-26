@@ -55,8 +55,8 @@ pub async fn chaos_step(sim: &Arc<Sim>) {
     let Some(action) = r.weighted(&weights.map(|w| w as f64)) else {
         return;
     };
-    let pick_up = |r: &mut crate::util::rng::Rng| up[r.usize(up.len())];
-    let pair = |r: &mut crate::util::rng::Rng| {
+    let pick_up = |r: &mut baserunna_util::rng::Rng| up[r.usize(up.len())];
+    let pair = |r: &mut baserunna_util::rng::Rng| {
         let a = r.usize(n);
         (a, (a + 1 + r.usize(n - 1)) % n)
     };
@@ -200,7 +200,7 @@ pub fn chaos_phase(sim: &Arc<Sim>) -> ChaosPhase {
     let mut st = sim.chaos.lock();
     st.active += 1;
     if st.task.is_none() {
-        crate::buggify::set_quiet(false);
+        baserunna_util::buggify::set_quiet(false);
         st.task = Some(spawn_chaos(sim));
     }
     ChaosPhase { sim: sim.clone(), open: true }
@@ -217,7 +217,7 @@ impl ChaosPhase {
         if let Some(t) = &st.task {
             t.abort();
         }
-        crate::buggify::set_quiet(true);
+        baserunna_util::buggify::set_quiet(true);
         Some(st.ended)
     }
 

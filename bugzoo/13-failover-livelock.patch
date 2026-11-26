@@ -1,10 +1,10 @@
-diff --git a/crates/baserunna/src/engine/mod.rs b/crates/baserunna/src/engine/mod.rs
+diff --git a/crates/baserunna-storage/src/engine/mod.rs b/crates/baserunna-storage/src/engine/mod.rs
 index f97f714..b2379f1 100644
---- a/crates/baserunna/src/engine/mod.rs
-+++ b/crates/baserunna/src/engine/mod.rs
+--- a/crates/baserunna-storage/src/engine/mod.rs
++++ b/crates/baserunna-storage/src/engine/mod.rs
 @@ -245,6 +245,8 @@ impl Engine {
          let mut g = self.dbs.lock().unwrap_or_else(|e| e.into_inner());
-         let idle_ms = if crate::buggify::buggify() { 0 } else { idle_ms };
+         let idle_ms = if baserunna_util::buggify::buggify() { 0 } else { idle_ms };
          g.retain(|_, db| Arc::strong_count(db) > 1 || !db.idle_for(idle_ms));
 +        let mut seen = self.shared.lease_sightings.lock().unwrap_or_else(|e| e.into_inner());
 +        seen.retain(|id, _| g.contains_key(id));

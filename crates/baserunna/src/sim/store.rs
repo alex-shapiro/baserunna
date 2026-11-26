@@ -1,8 +1,9 @@
 //! Simulated object store with fault injection and optional list lag.
 
 use super::Trace;
-use crate::store::*;
-use crate::util::rng::Rng;
+use baserunna_storage::store::*;
+use baserunna_util::BoxFut;
+use baserunna_util::rng::Rng;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;

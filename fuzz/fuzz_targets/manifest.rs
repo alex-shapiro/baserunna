@@ -1,7 +1,7 @@
 #![no_main]
 //! Manifest and levels object decoding must never panic; valid inputs must
 //! round-trip.
-use baserunna::engine::manifest::{Levels, Manifest};
+use baserunna_storage::engine::manifest::{Levels, Manifest};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {

@@ -17,11 +17,11 @@
 //! | `LAT_RAW_BYTES`    | `1024,16384,…`     | object sizes for raw `PUT` and `GET` measurements     |
 //! | `LAT_RAW_COUNT`    | 20                 | requests per size in raw measurements                 |
 
-use baserunna::engine::{Consistency, Engine, EngineConfig, Isolation, Value};
-use baserunna::env::Env;
-use baserunna::sim::cost::MeteredStore;
-use baserunna::store::{CloudStore, DynStore, MemStore, PutMode};
-use baserunna::util::rng::Rng;
+use baserunna_storage::engine::{Consistency, Engine, EngineConfig, Isolation, Value};
+use baserunna_storage::store::metered::MeteredStore;
+use baserunna_storage::store::{CloudStore, DynStore, MemStore, PutMode};
+use baserunna_util::env::Env;
+use baserunna_util::rng::Rng;
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,7 +53,7 @@ async fn run() {
         "mem:" => Arc::new(MemStore::with_system_clock()),
         _ => Arc::new(CloudStore::from_url(&format!("{}/{prefix}", url.trim_end_matches('/'))).expect("store url")),
     };
-    baserunna::log::set_level(Some(baserunna::log::Level::Error));
+    baserunna_util::log::set_level(Some(baserunna_util::log::Level::Error));
     println!("store {url}/{prefix}");
 
     println!("\nraw latency by object size ({} each)", num("LAT_RAW_COUNT", 20));

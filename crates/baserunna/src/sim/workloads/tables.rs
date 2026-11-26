@@ -3,7 +3,7 @@
 
 use super::super::Sim;
 use super::super::client::Client;
-use crate::engine::{Consistency, Isolation};
+use baserunna_storage::engine::{Consistency, Isolation};
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -105,13 +105,13 @@ pub async fn check_all_indexes(sim: &Arc<Sim>, db_id: &str) -> Result<(), String
     // Storage faults are still active, so retry transient read errors.
     crate::node::retry_unavailable(|| async {
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await?;
-        for s in crate::table::all_tables(&mut t).await? {
-            crate::table::check_indexes(&mut t, &s.name).await.map_err(|e| match e.retryable() {
+        for s in baserunna_storage::table::all_tables(&mut t).await? {
+            baserunna_storage::table::check_indexes(&mut t, &s.name).await.map_err(|e| match e.retryable() {
                 true => e,
-                false => crate::error::Error::internal(format!("table {}: {e}", s.name)),
+                false => baserunna_util::error::Error::internal(format!("table {}: {e}", s.name)),
             })?;
         }
-        crate::table::check_no_orphans(&mut t).await
+        baserunna_storage::table::check_no_orphans(&mut t).await
     })
     .await
     .map_err(|e| e.to_string())

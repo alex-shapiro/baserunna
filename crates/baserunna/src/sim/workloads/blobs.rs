@@ -5,10 +5,10 @@
 
 use super::super::Sim;
 use super::super::client::{Client, Resp, ZOMBIE_WAIT_MS};
-use crate::engine::manifest::{Levels, Manifest, ObjKind};
-use crate::engine::{Value, segment};
-use crate::util::sha256;
 use baserunna_api::b64;
+use baserunna_storage::engine::manifest::{Levels, Manifest, ObjKind};
+use baserunna_storage::engine::{Value, segment};
+use baserunna_util::sha256;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -18,19 +18,26 @@ type IdSets = (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>);
 /// Returns referenced blob IDs, manifest-listed obsolete IDs, and live segment IDs
 /// read directly from the store.
 pub fn db_objects(sim: &Sim, db_id: &str) -> Result<IdSets, String> {
-    let g = sim.mem.get_sync(&crate::engine::manifest_key(db_id), &Default::default()).map_err(|e| e.to_string())?;
+    let g = sim
+        .mem
+        .get_sync(&baserunna_storage::engine::manifest_key(db_id), &Default::default())
+        .map_err(|e| e.to_string())?;
     let mut m = Manifest::decode(&g.data).map_err(|e| e.to_string())?;
     let mut segs = BTreeSet::new();
     if let Some(id) = m.levels.clone() {
-        let l =
-            sim.mem.get_sync(&crate::engine::levels_key(db_id, &id), &Default::default()).map_err(|e| e.to_string())?;
+        let l = sim
+            .mem
+            .get_sync(&baserunna_storage::engine::levels_key(db_id, &id), &Default::default())
+            .map_err(|e| e.to_string())?;
         m.attach_levels(&Levels::decode(&l.data).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        segs.insert(format!("{id}{}", crate::engine::LEVELS_SUFFIX));
+        segs.insert(format!("{id}{}", baserunna_storage::engine::LEVELS_SUFFIX));
     }
     let mut entries = m.tail.clone();
     for s in &m.segments {
-        let d =
-            sim.mem.get_sync(&crate::engine::seg_key(db_id, &s.id), &Default::default()).map_err(|e| e.to_string())?;
+        let d = sim
+            .mem
+            .get_sync(&baserunna_storage::engine::seg_key(db_id, &s.id), &Default::default())
+            .map_err(|e| e.to_string())?;
         entries.extend(segment::read_all(&d.data).map_err(|e| e.to_string())?);
         segs.insert(s.id.clone());
     }
@@ -54,7 +61,7 @@ pub fn db_objects(sim: &Sim, db_id: &str) -> Result<IdSets, String> {
         .map(|o| match o.kind {
             ObjKind::Blob => format!("blob:{}", o.id),
             ObjKind::Segment => format!("seg:{}", o.id),
-            ObjKind::Levels => format!("seg:{}{}", o.id, crate::engine::LEVELS_SUFFIX),
+            ObjKind::Levels => format!("seg:{}{}", o.id, baserunna_storage::engine::LEVELS_SUFFIX),
             ObjKind::Part => format!("part:{}", o.id),
         })
         .collect();
@@ -264,7 +271,7 @@ async fn verify(
     base: &str,
     kv: &BTreeMap<String, Vec<u8>>,
     rows: &BTreeMap<String, Vec<u8>>,
-    rng: &mut crate::util::rng::Rng,
+    rng: &mut baserunna_util::rng::Rng,
 ) -> Result<(), String> {
     for (k, v) in kv {
         let path = format!("{base}/kv/{k}");

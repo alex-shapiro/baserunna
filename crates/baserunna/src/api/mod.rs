@@ -14,13 +14,8 @@ pub(crate) use events::{ForwardedBind, bind_results_from_json};
 use crate::cluster::{
     CLUSTER_KEY_HEADER, DEADLINE_HEADER, Delivery, FORWARD_ID_HEADER, FORWARD_TO_HEADER, HOPS_HEADER, ReplayedResponse,
 };
-use crate::engine::{Committed, Consistency, Db, Txn};
-use crate::error::{Error, Result};
-use crate::log::{self, REQUEST_ID_HEADER};
-use crate::meta::{Access, DbRecord};
+use crate::meta::DbRecord;
 use crate::node::{Deadline, Meter, Node, Principal};
-use crate::probe::{self, Probe};
-use crate::timing;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, FromRequest, FromRequestParts, MatchedPath, Request, State};
@@ -28,6 +23,12 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use baserunna_api::{self as api, Body as _, Endpoint};
+use baserunna_storage::engine::{Committed, Consistency, Db, Txn};
+use baserunna_storage::timing;
+use baserunna_util::access::Access;
+use baserunna_util::error::{Error, Result};
+use baserunna_util::log::{self, REQUEST_ID_HEADER};
+use baserunna_util::probe::{self, Probe};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::Deserialize;
@@ -38,54 +39,9 @@ use std::time::Duration;
 
 pub const SESSION_COOKIE: &str = "brs_session";
 
-impl IntoResponse for Error {
-    fn into_response(self) -> Response {
-        let status = StatusCode::from_u16(self.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        let retry_after = match &self {
-            Error::NotOwner { retry_after_ms, .. } | Error::RateLimited { retry_after_ms, .. } => Some(*retry_after_ms),
-            Error::Unavailable { retry_after_ms, .. } => *retry_after_ms,
-            _ => None,
-        };
-        if let Error::Internal(m) = &self {
-            crate::warn!("internal error: {m}");
-        }
-        let mut resp = (status, axum::Json(api::ErrorBody { error: api_error(&self) })).into_response();
-        if let Some(ms) = retry_after {
-            let secs = ms.div_ceil(1000).max(1);
-            if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {
-                resp.headers_mut().insert(http::header::RETRY_AFTER, v);
-            }
-        }
-        resp
-    }
-}
-
-/// Converts an [`Error`] to the `error` object of an HTTP error response.
-pub fn api_error(e: &Error) -> api::ApiError {
-    let details = |d: api::ErrorDetails| Some(d);
-    let details = match e {
-        Error::PreconditionFailed { op_index: Some(i), .. } => {
-            details(api::ErrorDetails { op_index: Some(*i), ..api::ErrorDetails::default() })
-        }
-        Error::NotOwner { holder, .. } => {
-            details(api::ErrorDetails { lease_holder: Some(holder.clone()), ..api::ErrorDetails::default() })
-        }
-        Error::Unavailable { outcome_unknown, .. } => {
-            let outcome = if *outcome_unknown { api::Outcome::Unknown } else { api::Outcome::NotApplied };
-            details(api::ErrorDetails { outcome: Some(outcome), ..api::ErrorDetails::default() })
-        }
-        Error::RateLimited { retry_after_ms, .. } => {
-            details(api::ErrorDetails { retry_after_ms: Some(*retry_after_ms), ..api::ErrorDetails::default() })
-        }
-        Error::Missing(kind, _) => details(api::ErrorDetails { missing: Some(*kind), ..api::ErrorDetails::default() }),
-        _ => None,
-    };
-    api::ApiError { code: e.api_code(), message: e.message(), retryable: e.retryable(), details }
-}
-
 /// Serializes an [`Error`] as the `error` object of an HTTP error response.
 pub fn error_json(e: &Error) -> Json {
-    serde_json::to_value(api_error(e)).expect("errors serialize")
+    serde_json::to_value(e.to_api_error()).expect("errors serialize")
 }
 
 /// Maximum body size for `/internal/v1/events/bind`.
@@ -257,7 +213,7 @@ impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for JsonBody<T> {
 
 /// Deserializes `text` as JSON after rejecting out-of-range integer literals.
 pub(crate) fn parse_json<T: DeserializeOwned>(text: &[u8]) -> std::result::Result<T, String> {
-    crate::util::json::reject_inexact_integers(text)?;
+    baserunna_util::json::reject_inexact_integers(text)?;
     serde_json::from_slice(text).map_err(|e| e.to_string())
 }
 
@@ -448,7 +404,7 @@ fn is_long_poll(req: &Request) -> bool {
 /// Authenticates database-scoped requests and routes them to the target node or handles them locally.
 async fn db_routing(State(node): State<Arc<Node>>, mut req: Request, next: Next) -> Response {
     let arrived = tokio::time::Instant::now();
-    let res: Result<Response> = crate::engine::db::invoked_at(arrived, async {
+    let res: Result<Response> = baserunna_storage::engine::db::invoked_at(arrived, async {
         let deadline =
             crate::node::current_deadline().unwrap_or_else(|| Deadline::new(request_deadline(&node, req.headers())));
         let name = db_name_from_path(req.uri().path()).ok_or_else(|| Error::not_found("no such route"))?;
@@ -740,12 +696,12 @@ async fn dedup_forwarded(State(node): State<Arc<Node>>, req: Request, next: Next
     scope.extend_from_slice(req.method().as_str().as_bytes());
     scope.push(0);
     scope.extend_from_slice(req.uri().to_string().as_bytes());
-    let key = format!("{id}:{}", api::b64::hex(&crate::util::sha256(&scope)));
+    let key = format!("{id}:{}", api::b64::hex(&baserunna_util::sha256(&scope)));
     match node.forwards.deliver(&key) {
         Delivery::First(slot) => {
             let (parts, body) = next.run(req).await.into_parts();
             match http_body_util::BodyExt::collect(body).await.map_err(|e| e.to_string()) {
-                Ok(_) if crate::buggify::fault(0.01) => {
+                Ok(_) if baserunna_util::buggify::fault(0.01) => {
                     slot.finish(None);
                     unknown_outcome("response failed: buggified".into())
                 }
@@ -788,7 +744,7 @@ fn unknown_outcome(message: String) -> Response {
 fn is_from_peer(node: &Node, headers: &HeaderMap) -> bool {
     let given = headers.get(CLUSTER_KEY_HEADER).and_then(|v| v.to_str().ok());
     match (node.cluster_key(), given) {
-        (Some(k), Some(v)) => crate::util::ct_eq(v.as_bytes(), k.as_bytes()),
+        (Some(k), Some(v)) => baserunna_util::ct_eq(v.as_bytes(), k.as_bytes()),
         _ => false,
     }
 }
@@ -854,8 +810,8 @@ macro_rules! run_txn {
         let ran_ = match crate::api::earlier_attempt(ctx_, commit_id_, key_).await? {
             Some(c) => crate::api::Ran::Replayed(c),
             None => {
-                if crate::buggify::fires(0.2) {
-                    let ms = crate::buggify::below(200);
+                if baserunna_util::buggify::fires(0.2) {
+                    let ms = baserunna_util::buggify::below(200);
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
                 let mut attempt_ = 0u32;
@@ -864,7 +820,7 @@ macro_rules! run_txn {
                     let mut txn_ = crate::api::begin_txn(ctx_, $isolation, $consistency, optimistic_).await?;
                     txn_.commit_id = commit_id_;
                     let out_ = {
-                        let $t: &mut crate::engine::Txn = &mut txn_;
+                        let $t: &mut baserunna_storage::engine::Txn = &mut txn_;
                         async { $body }.await
                     };
                     let txn_ = match txn_ {
@@ -902,11 +858,11 @@ pub(crate) use run_txn;
 /// Starts optimistically for strong serializable transactions if `optimistic` is true.
 pub(crate) async fn begin_txn(
     ctx: &DbCtx,
-    isolation: crate::engine::Isolation,
+    isolation: baserunna_storage::engine::Isolation,
     c: Consistency,
     optimistic: bool,
 ) -> Result<Txn> {
-    if optimistic && c == Consistency::Strong && isolation == crate::engine::Isolation::Serializable {
+    if optimistic && c == Consistency::Strong && isolation == baserunna_storage::engine::Isolation::Serializable {
         ctx.db.begin_optimistic().await
     } else {
         ctx.db.begin(isolation, c).await
@@ -927,8 +883,8 @@ pub(crate) async fn earlier_attempt(ctx: &DbCtx, commit_id: u64, key: Option<&st
         return Ok(None);
     }
     match ctx.db.commit_status(commit_id).await? {
-        Some(crate::engine::CommitState::Applied(c)) => Ok(Some(c)),
-        Some(crate::engine::CommitState::Aborted) => Err(crate::engine::db::aborted(commit_id)),
+        Some(baserunna_storage::engine::CommitState::Applied(c)) => Ok(Some(c)),
+        Some(baserunna_storage::engine::CommitState::Aborted) => Err(baserunna_storage::engine::db::aborted(commit_id)),
         None => Ok(None),
     }
 }
@@ -1021,8 +977,8 @@ macro_rules! with_txn {
         let (_, ran_) = crate::api::run_txn!(
             $node,
             $ctx,
-            crate::engine::Isolation::Serializable,
-            crate::engine::Consistency::Strong,
+            baserunna_storage::engine::Isolation::Serializable,
+            baserunna_storage::engine::Consistency::Strong,
             None,
             |$t| $body
         );
@@ -1030,7 +986,9 @@ macro_rules! with_txn {
             crate::api::Ran::Read { out, version } => (out, version),
             crate::api::Ran::Committed { out, commit } => (out, commit.version),
             crate::api::Ran::Replayed(_) => {
-                return Err(crate::error::Error::internal("a transaction without an idempotency key replayed"));
+                return Err(baserunna_util::error::Error::internal(
+                    "a transaction without an idempotency key replayed",
+                ));
             }
         }
     }};
@@ -1040,10 +998,10 @@ pub(crate) use with_txn;
 /// Runs `$body` on a read snapshot and returns `(output, read_version)`.
 macro_rules! with_read {
     ($db:expr, $c:expr, |$t:ident| $body:expr) => {{
-        let mut txn_ = $db.begin(crate::engine::Isolation::Serializable, $c).await?;
+        let mut txn_ = $db.begin(baserunna_storage::engine::Isolation::Serializable, $c).await?;
         let v_ = txn_.read_version();
         let out_ = {
-            let $t: &mut crate::engine::Txn = &mut txn_;
+            let $t: &mut baserunna_storage::engine::Txn = &mut txn_;
             $body
         }?;
         (out_, v_)
@@ -1071,7 +1029,7 @@ pub(crate) fn next_poll_delay(node: &Node, db: &Db, c: Consistency, until: tokio
 }
 
 /// Evaluates `$read` in a loop until [`Found::found`] is true, `$wait` elapses, or
-/// [`Shared::waits_ended`](crate::engine::Shared::waits_ended) is set, waiting between
+/// [`Shared::waits_ended`](baserunna_storage::engine::Shared::waits_ended) is set, waiting between
 /// attempts with [`Db::wait_for_change`] for up to [`next_poll_delay`].
 macro_rules! watch {
     ($node:expr, $db:expr, $c:expr, $wait:expr, |$t:ident| $read:expr) => {{
@@ -1124,7 +1082,7 @@ async fn healthz(State(node): State<Arc<Node>>) -> Response {
 async fn limits(State(node): State<Arc<Node>>, _: Req<api::GetLimits>) -> Result<Reply<api::GetLimits>> {
     let engine_cfg = &node.engine.shared.cfg;
     Ok(Reply::new(api::Limits {
-        txn_max_ops: crate::ops::MAX_TXN_OPS as u64,
+        txn_max_ops: baserunna_storage::ops::MAX_TXN_OPS as u64,
         txn_max_write_bytes: engine_cfg.txn_max_write_bytes as u64,
         txn_max_read_bytes: engine_cfg.txn_max_read_bytes as u64,
         txn_max_open_per_user: node.cfg.txns_per_user as u64,
@@ -1184,8 +1142,8 @@ pub(crate) type Params = QueryParams<std::collections::BTreeMap<String, String>>
 
 /// Extracts `limit` and `cursor` query parameters.
 pub(crate) fn paging(q: &Params) -> Result<(usize, Option<String>)> {
-    let limit = q.get("limit").map(|l| l.parse().map_err(|_| crate::ops::limit_error())).transpose()?;
-    Ok((crate::ops::page_limit(limit)?, q.get("cursor").filter(|c| !c.is_empty()).cloned()))
+    let limit = q.get("limit").map(|l| l.parse().map_err(|_| baserunna_storage::ops::limit_error())).transpose()?;
+    Ok((baserunna_storage::ops::page_limit(limit)?, q.get("cursor").filter(|c| !c.is_empty()).cloned()))
 }
 
 /// Extracts `prefix`, `limit`, and `cursor` query parameters.
@@ -1341,7 +1299,7 @@ mod tests {
 
     #[test]
     fn cancels_request_at_deadline() {
-        crate::sim::cost::run_paused(async {
+        baserunna_util::run_paused(async {
             let w = crate::sim::cost::World::new(1, 1).await;
             let token = w.signup(0, "late@x.io").await;
             w.create_db(0, &token, "d").await;
@@ -1359,7 +1317,7 @@ mod tests {
 
     #[test]
     fn pauses_deadline_while_waiting_for_request_body() {
-        crate::sim::cost::run_paused(async {
+        baserunna_util::run_paused(async {
             let w = crate::sim::cost::World::new(1, 1).await;
             let token = w.signup(0, "slow@x.io").await;
             w.create_db(0, &token, "d").await;
@@ -1387,7 +1345,7 @@ mod tests {
 
     #[test]
     fn long_poll_extends_deadline_by_wait_ms() {
-        crate::sim::cost::run_paused(async {
+        baserunna_util::run_paused(async {
             let w = crate::sim::cost::World::new(1, 1).await;
             let token = w.signup(0, "patient@x.io").await;
             w.create_db(0, &token, "d").await;
@@ -1403,3 +1361,6 @@ mod tests {
 
 #[cfg(test)]
 mod events_tests;
+
+#[cfg(test)]
+mod txns_tests;

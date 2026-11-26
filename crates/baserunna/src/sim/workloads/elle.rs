@@ -22,7 +22,7 @@
 
 use super::super::client::Client;
 use super::super::{NetError, Sim};
-use crate::util::rng::Rng;
+use baserunna_util::rng::Rng;
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;

@@ -3,8 +3,8 @@
 //! Enforces token-bucket rate limits per user, API key, and client address,
 //! with exponential backoff on consecutive authentication failures.
 
-use crate::error::Error;
-use crate::util::DetHashMap;
+use baserunna_util::DetHashMap;
+use baserunna_util::error::Error;
 use parking_lot::Mutex;
 use std::time::Duration;
 use tokio::time::Instant;

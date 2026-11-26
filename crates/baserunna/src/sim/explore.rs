@@ -8,8 +8,8 @@
 use super::SimOutcome;
 use super::campaign::{Job, Report, default_threads, run_jobs};
 use super::workloads::Scenario;
-use crate::probe::{Hits, Probe};
-use crate::util::rng::Rng;
+use baserunna_util::probe::{Hits, Probe};
+use baserunna_util::rng::Rng;
 use parking_lot::Mutex;
 use std::time::Instant;
 

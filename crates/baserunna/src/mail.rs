@@ -1,7 +1,7 @@
 //! Outbound email delivery.
 
-use crate::error::Result;
-use crate::store::BoxFut;
+use baserunna_util::BoxFut;
+use baserunna_util::error::Result;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Mail {
@@ -40,9 +40,10 @@ impl Mailer for WebhookMailer {
             req = req.bearer_auth(t);
         }
         Box::pin(async move {
-            let resp = req.send().await.map_err(|e| crate::Error::unavailable(format!("mail webhook: {e}")))?;
+            let resp =
+                req.send().await.map_err(|e| baserunna_util::Error::unavailable(format!("mail webhook: {e}")))?;
             if !resp.status().is_success() {
-                return Err(crate::Error::unavailable(format!("mail webhook answered {}", resp.status())));
+                return Err(baserunna_util::Error::unavailable(format!("mail webhook answered {}", resp.status())));
             }
             Ok(())
         })

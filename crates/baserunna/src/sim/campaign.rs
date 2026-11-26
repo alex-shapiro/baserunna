@@ -2,7 +2,7 @@
 
 use super::workloads::Scenario;
 use super::{SimOutcome, run};
-use crate::probe::{Hits, Probe};
+use baserunna_util::probe::{Hits, Probe};
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};

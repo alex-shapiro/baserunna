@@ -2,20 +2,21 @@
 
 use crate::auth::{self, OidcProvider};
 use crate::cluster::{self, CLUSTER_KEY_HEADER, DEADLINE_HEADER, NoTransport, Transport};
-use crate::engine::{Consistency, Db, Engine, EngineConfig, Isolation, Txn};
-use crate::env::Env;
-use crate::error::{Error, Result};
 use crate::limits::{LimitConfig, Limiter, Rate};
 use crate::mail::{Mail, Mailer};
 use crate::meta::{
-    self, Access, ApiKey, Batch, DbRecord, DbRef, MetaCmd, NodeRecord, Org, Role, SYS_DB, SignInMethod, SignedUp,
-    SignupPolicy, User, UserDeletion,
+    self, ApiKey, Batch, DbRecord, DbRef, MetaCmd, NodeRecord, Org, SYS_DB, SignInMethod, SignedUp, SignupPolicy, User,
+    UserDeletion,
 };
-use crate::store::DynStore;
-use crate::table::BlobResolver;
-use crate::txns::{OpenTxns, TxnLimits};
-use crate::util::{DetHashMap, TtlCache};
 use axum::body::Body;
+use baserunna_storage::engine::{Consistency, Db, Engine, EngineConfig, Isolation, Txn};
+use baserunna_storage::store::DynStore;
+use baserunna_storage::table::BlobResolver;
+use baserunna_storage::txns::{OpenTxns, TxnLimits};
+use baserunna_util::access::{Access, Role};
+use baserunna_util::env::Env;
+use baserunna_util::error::{Error, Result};
+use baserunna_util::{DetHashMap, TtlCache};
 use http::Request;
 use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
@@ -69,7 +70,7 @@ pub struct NodeConfig {
     /// Byte threshold at which a bulk insert buffer is flushed.
     pub event_insert_buffer_bytes: usize,
     /// Resource limits for an event query.
-    pub query_limits: crate::events::exec::Limits,
+    pub query_limits: baserunna_storage::events::exec::Limits,
     /// Maximum number of concurrent event queries per node.
     pub query_concurrency: usize,
 }
@@ -118,7 +119,7 @@ impl Default for NodeConfig {
             engine: EngineConfig { db_max_bytes: 10 << 30, ..EngineConfig::default() },
             event_insert_buffer_ms: 200,
             event_insert_buffer_bytes: 16 << 20,
-            query_limits: crate::events::exec::Limits::default(),
+            query_limits: baserunna_storage::events::exec::Limits::default(),
             query_concurrency: std::thread::available_parallelism().map_or(4, |n| n.get()),
         }
     }
@@ -304,12 +305,12 @@ pub struct Node {
     /// HTTP router for this node. [`Node::stop`] clears this field to break the reference cycle.
     router: Mutex<Option<axum::Router>>,
     pub limiter: Limiter,
-    pub metrics: crate::metrics::ServerMetrics,
+    pub metrics: baserunna_storage::metrics::ServerMetrics,
     hash_slots: tokio::sync::Semaphore,
-    pub queries: Arc<crate::queries::Queries>,
+    pub queries: Arc<baserunna_storage::queries::Queries>,
     draining: std::sync::atomic::AtomicBool,
-    event_buffers: OnceLock<Arc<crate::events::bulk::Buffers>>,
-    pub maintainer: Arc<crate::events::maint::Maintainer>,
+    event_buffers: OnceLock<Arc<baserunna_storage::events::bulk::Buffers>>,
+    pub maintainer: Arc<baserunna_storage::events::maint::Maintainer>,
 }
 
 /// Tracks backoff state for a peer after an undelivered forward.
@@ -335,7 +336,7 @@ impl Node {
         cfg.engine.validate().map_err(|e| Error::invalid(format!("engine configuration: {e}")))?;
         let id = format!("{}-{}", cfg.name, env.random_hex(4));
         let engine = Engine::new(store, env.clone(), cfg.engine.clone(), id.clone());
-        let queries = crate::queries::Queries::new(cfg.query_concurrency, engine.shared.memory.clone());
+        let queries = baserunna_storage::queries::Queries::new(cfg.query_concurrency, engine.shared.memory.clone());
         let txns = OpenTxns::new(engine.clone(), cfg.txn_limits(), queries.clone());
         engine.mark_system(SYS_DB);
         let node = Arc::new(Node {
@@ -367,7 +368,7 @@ impl Node {
             cfg,
         });
         let weak = Arc::downgrade(&node);
-        let bind: crate::events::bulk::BindFn = Arc::new(move |db, b| {
+        let bind: baserunna_storage::events::bulk::BindFn = Arc::new(move |db, b| {
             let weak = weak.clone();
             Box::pin(async move {
                 match weak.upgrade() {
@@ -376,11 +377,11 @@ impl Node {
                 }
             })
         });
-        let buffer_cfg = crate::events::bulk::BufferConfig {
+        let buffer_cfg = baserunna_storage::events::bulk::BufferConfig {
             wait_ms: node.cfg.event_insert_buffer_ms,
             max_bytes: node.cfg.event_insert_buffer_bytes,
         };
-        let _ = node.event_buffers.set(crate::events::bulk::Buffers::new(buffer_cfg, bind));
+        let _ = node.event_buffers.set(baserunna_storage::events::bulk::Buffers::new(buffer_cfg, bind));
         let maintainer = node.maintainer.clone();
         node.engine.set_event_hook(Box::new(move |db, tables| {
             if db.id != SYS_DB {
@@ -467,7 +468,7 @@ impl Node {
 
     async fn bootstrap(self: &Arc<Self>) -> Result<()> {
         if let Err(e) = self.engine.shared.store_time_ms().await {
-            crate::warn!("{}: could not measure the store clock yet: {e}", self.id);
+            baserunna_util::warn!("{}: could not measure the store clock yet: {e}", self.id);
         }
         let sys = self.engine.db(SYS_DB);
         retry_unavailable(|| sys.open(true)).await?;
@@ -526,7 +527,7 @@ impl Node {
                 at = match n.heartbeat().await {
                     Ok(()) => next_tick(at, hb),
                     Err(e) => {
-                        crate::debug!("{}: heartbeat failed: {e}", n.id);
+                        baserunna_util::debug!("{}: heartbeat failed: {e}", n.id);
                         Instant::now() + period
                     }
                 };
@@ -556,7 +557,7 @@ impl Node {
                 tokio::time::sleep(Duration::from_millis(REAP_INTERVAL_MS)).await;
                 let Some(n) = me.upgrade() else { return };
                 if let Err(e) = n.reap_deleted().await {
-                    crate::debug!("{}: reaper: {e}", n.id);
+                    baserunna_util::debug!("{}: reaper: {e}", n.id);
                 }
             }
         });
@@ -686,7 +687,7 @@ impl Node {
             due
         };
         if due {
-            crate::probe::hit(crate::probe::Probe::MembersRefreshedForUnknownPeer);
+            baserunna_util::probe::hit(baserunna_util::probe::Probe::MembersRefreshedForUnknownPeer);
             let _ = self.refresh_members_at(true).await;
         }
         self.addr_of(node_id)
@@ -700,7 +701,7 @@ impl Node {
         let strikes = g.get(node_id).map_or(1, |s| s.strikes.saturating_add(1));
         let max = Duration::from_millis(3 * self.cfg.heartbeat_ms).max(SUSPECT_MIN);
         let backoff = SUSPECT_MIN.saturating_mul(1u32 << (strikes - 1).min(16)).min(max);
-        crate::probe::hit(crate::probe::Probe::PeerSuspected);
+        baserunna_util::probe::hit(baserunna_util::probe::Probe::PeerSuspected);
         g.insert(node_id.to_string(), Suspect { started_at, heartbeat_at, strikes, until: Instant::now() + backoff });
     }
 
@@ -716,7 +717,7 @@ impl Node {
     /// acquires the lease. All other requests are routed to the lease holder if a lease holder is
     /// known, or to the rendezvous home node otherwise.
     pub async fn route(&self, db_id: &str, is_long_poll: bool) -> Option<(String, String)> {
-        if crate::buggify::fault(0.02) {
+        if baserunna_util::buggify::fault(0.02) {
             return None;
         }
         let db = self.engine.db(db_id);
@@ -740,7 +741,7 @@ impl Node {
             return None;
         };
         if addr == self.cfg.addr {
-            crate::probe::hit(crate::probe::Probe::OwnAddressIgnored);
+            baserunna_util::probe::hit(baserunna_util::probe::Probe::OwnAddressIgnored);
             return None;
         }
         Some((target, addr))
@@ -790,7 +791,7 @@ impl Node {
                 None => None,
             };
             if let Some((addr, holder)) = forward_to {
-                crate::probe::hit(crate::probe::Probe::MetaForwarded);
+                baserunna_util::probe::hit(baserunna_util::probe::Probe::MetaForwarded);
                 match self.forward_meta(&holder, &addr, &cmd, deadline).await {
                     Ok(r) => return Ok(r),
                     // Reload the cluster key if it was initialized by another node after we started.
@@ -850,22 +851,17 @@ impl Node {
         Ok(r)
     }
 
-    pub fn event_buffers(&self) -> &Arc<crate::events::bulk::Buffers> {
+    pub fn event_buffers(&self) -> &Arc<baserunna_storage::events::bulk::Buffers> {
         self.event_buffers.get().expect("event buffers are set at start")
-    }
-
-    /// Admits an event query of `user_id`, waiting up to 5 s for a query slot.
-    pub async fn start_query(&self, user_id: &str) -> Result<crate::queries::QueryGrant> {
-        self.queries.start(user_id, &self.txns).await
     }
 
     /// Binds staged event parts on the lease holder, forwarding if another node
     /// holds the lease.
     pub async fn bind_events(
         self: &Arc<Self>,
-        db: Arc<crate::engine::Db>,
-        bind: crate::engine::events::Bind,
-    ) -> Result<Vec<Result<crate::engine::Committed>>> {
+        db: Arc<baserunna_storage::engine::Db>,
+        bind: baserunna_storage::engine::events::Bind,
+    ) -> Result<Vec<Result<baserunna_storage::engine::Committed>>> {
         let n = bind.slots.len();
         let mut last = Error::unavailable("the database's lease holder is unavailable");
         for attempt in 0..6u32 {
@@ -878,7 +874,7 @@ impl Node {
             };
             let rs = match forward_to {
                 Some((addr, holder)) => {
-                    crate::probe::hit(crate::probe::Probe::BindForwarded);
+                    baserunna_util::probe::hit(baserunna_util::probe::Probe::BindForwarded);
                     let body = crate::api::ForwardedBind {
                         db: db.id.clone(),
                         bind: baserunna_api::b64::encode(&bind.encode()),
@@ -963,10 +959,10 @@ impl Node {
         }
         let remaining = deadline.saturating_duration_since(Instant::now()).as_millis() as u64;
         req.headers_mut().insert(DEADLINE_HEADER, (self.now_ms() + remaining).into());
-        if let Some(rid) = crate::log::request_id()
+        if let Some(rid) = baserunna_util::log::request_id()
             && let Ok(v) = rid.parse()
         {
-            req.headers_mut().insert(crate::log::REQUEST_ID_HEADER, v);
+            req.headers_mut().insert(baserunna_util::log::REQUEST_ID_HEADER, v);
         }
         let resp = self.services.transport.call(addr, req).await.map_err(Err)?;
         let status = resp.status();
@@ -1006,7 +1002,7 @@ impl Node {
 
     async fn principal(&self, token: &str) -> Result<Principal> {
         let cache_key = auth::secret_hash(token);
-        if let Some(p) = self.auth_cache.get(&cache_key).filter(|_| !crate::buggify::fires(0.1)) {
+        if let Some(p) = self.auth_cache.get(&cache_key).filter(|_| !baserunna_util::buggify::fires(0.1)) {
             return Ok(p);
         }
         let read_at = Instant::now();
@@ -1216,7 +1212,7 @@ impl Node {
 
     async fn delete_ended_sessions(&self, user_id: &str, keep: Option<&str>) {
         if let Err(e) = self.revoke_sessions(user_id, keep).await {
-            crate::warn!("deleting sessions ended by a password change: {e}");
+            baserunna_util::warn!("deleting sessions ended by a password change: {e}");
         }
     }
 
@@ -1276,7 +1272,7 @@ impl Node {
             if db.open(false).await.is_ok()
                 && let Err(e) = db.mark_deleted().await
             {
-                crate::warn!("flagging database {id} of a deleted account: {e}");
+                baserunna_util::warn!("flagging database {id} of a deleted account: {e}");
             }
             self.engine.forget(&id);
         }
@@ -1298,7 +1294,7 @@ impl Node {
             for attempt in 0..5u32 {
                 match mailer.send(&mail).await {
                     Ok(()) => return,
-                    Err(e) => crate::warn!("sending mail (attempt {}): {e}", attempt + 1),
+                    Err(e) => baserunna_util::warn!("sending mail (attempt {}): {e}", attempt + 1),
                 }
                 tokio::time::sleep(Duration::from_millis(1_000 << attempt)).await;
             }
@@ -1427,7 +1423,7 @@ impl Node {
             self.limiter.failed(&account, lim.account_free_failures, lim);
             return Err(used());
         }
-        crate::probe::hit(crate::probe::Probe::PasswordResetFinished);
+        baserunna_util::probe::hit(baserunna_util::probe::Probe::PasswordResetFinished);
         self.finish_reset(client, user).await
     }
 
@@ -1484,7 +1480,7 @@ impl Node {
     }
 
     async fn role_for(&self, user: &User, owner_id: &str, strong: bool) -> Result<Option<Role>> {
-        if let Some(r) = Role::of_site_admin(user) {
+        if let Some(r) = user.site_admin_role() {
             return Ok(Some(r));
         }
         if !meta::is_org_id(owner_id) {
@@ -1651,8 +1647,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use crate::engine::{Consistency, Isolation};
-    use crate::sim::cost::{World, run_paused};
+    use crate::sim::cost::World;
+    use baserunna_storage::engine::{Consistency, Isolation};
+    use baserunna_util::run_paused;
     use bytes::Bytes;
     use std::time::Duration;
 
@@ -1662,7 +1659,7 @@ mod tests {
         rt.block_on(async {
             use super::{Env, Node, NodeConfig, Services};
             use std::sync::Arc;
-            let store = Arc::new(crate::store::MemStore::with_system_clock());
+            let store = Arc::new(baserunna_storage::store::MemStore::with_system_clock());
             let cfg = NodeConfig { pbkdf2_iterations: 1000, ..NodeConfig::default() };
             let node = Node::start(cfg, Arc::new(Env::real()), store, Services::local()).await.unwrap();
             drop(crate::api::router(node.clone()));
@@ -1684,9 +1681,9 @@ mod tests {
             let slots = n.cfg.limits.hash_concurrency;
             let held = n.hash_slots.acquire_many(slots as u32).await.unwrap();
             let e = n.hash_password("password-1").await.unwrap_err();
-            assert!(matches!(e, crate::error::Error::Unavailable { outcome_unknown: false, .. }), "{e:?}");
+            assert!(matches!(e, baserunna_util::error::Error::Unavailable { outcome_unknown: false, .. }), "{e:?}");
             let r = n.password_login("1.2.3.4", "nobody@x.io", "password-1").await.unwrap_err();
-            assert!(matches!(r, crate::error::Error::Unavailable { .. }), "{r:?}");
+            assert!(matches!(r, baserunna_util::error::Error::Unavailable { .. }), "{r:?}");
             let (tx, waiting) = tokio::sync::oneshot::channel();
             let n2 = n.clone();
             n.env.spawn(async move {
@@ -1866,7 +1863,11 @@ mod tests {
             let db = w.node(1 - home).engine.db(&id);
             let commit = || async {
                 let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-                txn.put(crate::ops::user_key(b"k").unwrap(), crate::engine::Value::Inline(Bytes::new())).unwrap();
+                txn.put(
+                    baserunna_storage::ops::user_key(b"k").unwrap(),
+                    baserunna_storage::engine::Value::Inline(Bytes::new()),
+                )
+                .unwrap();
                 db.commit(txn.into_request()).await.unwrap();
             };
             let notices = || w.peer_calls("/internal/v1/notice");
@@ -1897,7 +1898,7 @@ mod tests {
             let node = world.node(0);
             let limits = world.json(0, "GET", "/v1/limits", "", serde_json::Value::Null).await;
             assert_eq!(limits["long_poll_max_ms"], crate::api::LONG_POLL_MAX_MS, "{limits}");
-            assert_eq!(limits["txn_max_ops"], crate::ops::MAX_TXN_OPS);
+            assert_eq!(limits["txn_max_ops"], baserunna_storage::ops::MAX_TXN_OPS);
             assert_eq!(limits["scan_limit_max"], baserunna_api::PAGE_MAX);
             assert_eq!(limits["value_inline_max"], node.engine.shared.cfg.value_inline_max);
             assert_eq!(limits["txn_max_write_bytes"], node.engine.shared.cfg.txn_max_write_bytes);
@@ -1926,8 +1927,11 @@ mod tests {
                 let db = world.node(i).engine.db(&db_id);
                 async move {
                     let mut txn = db.begin(Isolation::Serializable, Consistency::Strong).await.unwrap();
-                    txn.put(crate::ops::user_key(b"k").unwrap(), crate::engine::Value::Inline(Bytes::from(value)))
-                        .unwrap();
+                    txn.put(
+                        baserunna_storage::ops::user_key(b"k").unwrap(),
+                        baserunna_storage::engine::Value::Inline(Bytes::from(value)),
+                    )
+                    .unwrap();
                     db.commit(txn.into_request()).await.unwrap()
                 }
             };

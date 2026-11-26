@@ -2,21 +2,21 @@
 
 use crate::api;
 use crate::cluster::{Transport, TransportError};
-use crate::engine::local::{LocalTier, MemLocal};
-use crate::engine::{Consistency, EngineConfig};
-use crate::env::Env;
 use crate::meta::SignupPolicy;
 use crate::node::{Node, NodeConfig};
-use crate::store::{BoxFut, DynStore, GetOpts, GetResult, ListPage, MemStore, ObjectStore, PutMode, SResult};
 use axum::body::Body;
+use baserunna_storage::engine::local::{LocalTier, MemLocal};
+use baserunna_storage::engine::{Consistency, EngineConfig};
+use baserunna_storage::store::metered::{MeteredStore, StoreCounts};
+use baserunna_storage::store::{DynStore, MemStore};
+use baserunna_util::env::Env;
+use baserunna_util::{BoxFut, run_paused};
 use bytes::Bytes;
 use http::{Request, Response};
 use parking_lot::Mutex;
 use serde_json::{Value as Json, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 use tower::ServiceExt;
@@ -30,143 +30,12 @@ pub mod prices {
     pub const STORAGE_GB_MONTH: f64 = 0.023;
 }
 
-/// Object-store request and byte counts.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Counts {
-    pub gets: f64,
-    pub puts: f64,
-    pub lists: f64,
-    pub deletes: f64,
-    pub put_bytes: f64,
-}
-
-impl Counts {
-    pub fn total(&self) -> f64 {
-        self.gets + self.puts + self.lists + self.deletes
-    }
-
-    pub fn dollars(&self) -> f64 {
-        self.gets * prices::GET + self.puts * prices::PUT + self.lists * prices::LIST + self.deletes * prices::DELETE
-    }
-
-    pub fn per(&self, n: f64) -> Counts {
-        Counts {
-            gets: self.gets / n,
-            puts: self.puts / n,
-            lists: self.lists / n,
-            deletes: self.deletes / n,
-            put_bytes: self.put_bytes / n,
-        }
-    }
-
-    fn minus(&self, o: &Counts) -> Counts {
-        Counts {
-            gets: self.gets - o.gets,
-            puts: self.puts - o.puts,
-            lists: self.lists - o.lists,
-            deletes: self.deletes - o.deletes,
-            put_bytes: self.put_bytes - o.put_bytes,
-        }
-    }
-
-    fn plus(&self, o: &Counts) -> Counts {
-        Counts {
-            gets: self.gets + o.gets,
-            puts: self.puts + o.puts,
-            lists: self.lists + o.lists,
-            deletes: self.deletes + o.deletes,
-            put_bytes: self.put_bytes + o.put_bytes,
-        }
-    }
-}
-
-/// Returns the database ID for a store key, `"sys"`, or `""` for keys outside `dbs/`.
-pub fn scope_of(key: &str) -> &str {
-    key.strip_prefix("dbs/").and_then(|r| r.split('/').next()).unwrap_or("")
-}
-
-/// Object store wrapper that counts requests per database and injects fixed latency.
-pub struct MeteredStore {
-    inner: DynStore,
-    latency_ms: AtomicU64,
-    counts: Mutex<BTreeMap<String, Counts>>,
-}
-
-impl MeteredStore {
-    pub fn new(inner: DynStore, latency_ms: u64) -> MeteredStore {
-        MeteredStore { inner, latency_ms: AtomicU64::new(latency_ms), counts: Mutex::new(BTreeMap::new()) }
-    }
-
-    pub fn set_latency_ms(&self, ms: u64) {
-        self.latency_ms.store(ms, Ordering::Relaxed);
-    }
-
-    fn count(&self, key: &str, f: impl FnOnce(&mut Counts)) {
-        let mut g = self.counts.lock();
-        f(g.entry(scope_of(key).to_string()).or_default());
-    }
-
-    async fn delay(&self) {
-        let ms = self.latency_ms.load(Ordering::Relaxed);
-        if ms > 0 {
-            tokio::time::sleep(Duration::from_millis(ms)).await;
-        }
-    }
-
-    pub fn scope(&self, scope: &str) -> Counts {
-        self.counts.lock().get(scope).copied().unwrap_or_default()
-    }
-
-    pub fn total(&self) -> Counts {
-        self.counts.lock().values().fold(Counts::default(), |a, c| a.plus(c))
-    }
-}
-
-impl ObjectStore for MeteredStore {
-    fn get<'a>(&'a self, key: &'a str, opts: GetOpts) -> BoxFut<'a, SResult<GetResult>> {
-        Box::pin(async move {
-            self.count(key, |c| c.gets += 1.0);
-            self.delay().await;
-            self.inner.get(key, opts).await
-        })
-    }
-
-    fn put<'a>(&'a self, key: &'a str, data: Bytes, mode: PutMode) -> BoxFut<'a, SResult<String>> {
-        Box::pin(async move {
-            let n = data.len() as f64;
-            self.count(key, |c| {
-                c.puts += 1.0;
-                c.put_bytes += n;
-            });
-            self.delay().await;
-            self.inner.put(key, data, mode).await
-        })
-    }
-
-    fn delete<'a>(&'a self, key: &'a str) -> BoxFut<'a, SResult<()>> {
-        Box::pin(async move {
-            self.count(key, |c| c.deletes += 1.0);
-            self.delay().await;
-            self.inner.delete(key).await
-        })
-    }
-
-    fn list<'a>(
-        &'a self,
-        prefix: &'a str,
-        start_after: Option<&'a str>,
-        limit: usize,
-    ) -> BoxFut<'a, SResult<ListPage>> {
-        Box::pin(async move {
-            self.count(prefix, |c| c.lists += 1.0);
-            self.delay().await;
-            self.inner.list(prefix, start_after, limit).await
-        })
-    }
-
-    fn time_precision_ms(&self) -> u64 {
-        self.inner.time_precision_ms()
-    }
+/// Returns the S3 request cost for `counts` in USD.
+pub fn request_cost_usd(counts: &StoreCounts) -> f64 {
+    counts.gets * prices::GET
+        + counts.puts * prices::PUT
+        + counts.lists * prices::LIST
+        + counts.deletes * prices::DELETE
 }
 
 #[derive(Default)]
@@ -381,15 +250,6 @@ pub async fn call_router(router: &axum::Router, method: &str, path: &str, token:
     Resp { status: parts.status.as_u16(), headers: parts.headers, body }
 }
 
-pub fn run_paused<F: Future>(f: F) -> F::Output {
-    let lvl = crate::log::level();
-    crate::log::set_level(Some(crate::log::Level::Error));
-    let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");
-    let out = rt.block_on(f);
-    crate::log::set_level(lvl);
-    out
-}
-
 pub const LATENCY_MS: u64 = 20;
 
 /// Per-unit store request counts and latency for a benchmarked operation.
@@ -397,7 +257,7 @@ pub const LATENCY_MS: u64 = 20;
 pub struct Measurement {
     pub name: &'static str,
     pub unit: &'static str,
-    pub per_unit: Counts,
+    pub per_unit: StoreCounts,
     pub latency_ms: Option<f64>,
 }
 
@@ -429,7 +289,7 @@ impl Report {
                 c.puts,
                 c.lists,
                 c.deletes,
-                c.dollars() * 1e6,
+                request_cost_usd(c) * 1e6,
                 m.latency_ms.map(|l| format!("{l:.0} ms")).unwrap_or_default(),
             ));
         }
@@ -444,7 +304,7 @@ impl Report {
 struct Recorder<'a> {
     store: &'a MeteredStore,
     scope: String,
-    before: Counts,
+    before: StoreCounts,
     started: Instant,
 }
 
@@ -461,7 +321,7 @@ impl<'a> Recorder<'a> {
 }
 
 fn value(n: usize, seed: usize) -> Bytes {
-    let mut r = crate::util::rng::Rng::new(seed as u64);
+    let mut r = baserunna_util::rng::Rng::new(seed as u64);
     Bytes::from((0..n).map(|_| b'a' + r.below(26) as u8).collect::<Vec<u8>>())
 }
 
@@ -581,7 +441,7 @@ async fn steady_writes(w: &World, out: &mut Vec<Measurement>) -> f64 {
     let t = w.signup(0, "steady@cost.test").await;
     let id = w.create_db(0, &t, "steady").await;
     let mut live: BTreeMap<usize, usize> = BTreeMap::new();
-    let mut rng = crate::util::rng::Rng::new(7);
+    let mut rng = baserunna_util::rng::Rng::new(7);
     let r = Recorder::start(&w.store, &id);
     let n = 3600;
     let (mut amp_sum, mut samples) = (0.0, 0);
@@ -616,7 +476,7 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     }
     tokio::time::sleep(Duration::from_secs(5)).await;
     let other = w.start_node().await;
-    let key = crate::ops::user_key(b"b000").expect("key");
+    let key = baserunna_storage::ops::user_key(b"b000").expect("key");
     let db = w.node(other).engine.db(&id);
 
     let r = Recorder::start(&w.store, &id);
@@ -626,7 +486,8 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     out.push(r.stop("cold_open_point_read", "open", 1.0, true));
 
     let r = Recorder::start(&w.store, &id);
-    let all = v.scan(&crate::engine::KeyRange::data(), false, usize::MAX, v.read_time()).await.expect("scan");
+    let all =
+        v.scan(&baserunna_storage::engine::KeyRange::data(), false, usize::MAX, v.read_time()).await.expect("scan");
     assert_eq!(all.len(), 128);
     out.push(r.stop("cold_full_scan", "scan", 1.0, true));
 
@@ -665,8 +526,13 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     });
     tokio::time::sleep(Duration::from_secs(1)).await;
     let wdb = w.node(writer).engine.db(&id);
-    let mut txn = wdb.begin(crate::engine::Isolation::Serializable, Consistency::Strong).await.expect("begin");
-    txn.put(crate::ops::user_key(b"woken").expect("key"), crate::engine::Value::Inline(value(8, 9))).expect("put");
+    let mut txn =
+        wdb.begin(baserunna_storage::engine::Isolation::Serializable, Consistency::Strong).await.expect("begin");
+    txn.put(
+        baserunna_storage::ops::user_key(b"woken").expect("key"),
+        baserunna_storage::engine::Value::Inline(value(8, 9)),
+    )
+    .expect("put");
     let r = Recorder::start(&w.store, &id);
     let committed = Instant::now();
     wdb.commit(txn.into_request()).await.expect("commit");
@@ -681,7 +547,8 @@ async fn multi_node(w: &mut World, out: &mut Vec<Measurement>) -> usize {
     let r = Recorder::start(&w.store, &id);
     let v = db.read_version(Consistency::Strong).await.expect("open after restart");
     assert!(v.get(&key, v.read_time()).await.expect("read").is_some());
-    let all = v.scan(&crate::engine::KeyRange::data(), false, usize::MAX, v.read_time()).await.expect("scan");
+    let all =
+        v.scan(&baserunna_storage::engine::KeyRange::data(), false, usize::MAX, v.read_time()).await.expect("scan");
     assert_eq!(all.len(), 129);
     out.push(r.stop("restart_open_and_scan", "open", 1.0, true));
     segs
@@ -732,13 +599,13 @@ async fn streams(w: &mut World, out: &mut Vec<Measurement>) {
     let db = w.node(other).engine.db(&id);
     let r = Recorder::start(&w.store, &id);
     let v = db.read_version(Consistency::Strong).await.expect("cold open");
-    let mut t = crate::engine::Txn::new(
-        crate::engine::Snapshot { time_ms: v.read_time(), version: v.clone() },
-        crate::engine::Isolation::Serializable,
+    let mut t = baserunna_storage::engine::Txn::new(
+        baserunna_storage::engine::Snapshot { time_ms: v.read_time(), version: v.clone() },
+        baserunna_storage::engine::Isolation::Serializable,
         0,
         usize::MAX,
     );
-    let (c, st) = crate::stream::info(&mut t, "app").await.expect("info");
+    let (c, st) = baserunna_storage::stream::info(&mut t, "app").await.expect("info");
     let mut it = v.stream_iter(c.id, st.first_seq, st.next_seq, false);
     let mut bytes = 0;
     while let Some(rec) = it.next().await.expect("read") {
@@ -913,7 +780,7 @@ pub const HOT_READS_PER_HOUR: u64 = 36_000;
 pub fn monthly_cost(r: &Report, p: &Profile) -> Bill {
     let cfg = EngineConfig::default();
     let days = 30.0;
-    let writes = p.writes_per_day * r.get("steady_write").per_unit.dollars() * days;
+    let writes = p.writes_per_day * request_cost_usd(&r.get("steady_write").per_unit) * days;
     let reads = if p.reads_per_day == 0.0 || p.active_hours == 0.0 {
         0.0
     } else {
@@ -922,17 +789,17 @@ pub fn monthly_cost(r: &Report, p: &Profile) -> Bill {
         let per_period = p.reads_per_day / periods;
         let period_cost = if per_period >= cfg.lease_read_threshold as f64 {
             let hot = r.get("hot_reads_10_per_s").per_unit;
-            let per_hour = Counts { gets: 0.0, ..hot }.dollars();
+            let per_hour = request_cost_usd(&StoreCounts { gets: 0.0, ..hot });
             let per_read = hot.gets / HOT_READS_PER_HOUR as f64 * prices::GET;
             per_hour * lease_s / 3600.0 + per_period * per_read
         } else {
-            per_period * r.get("strong_read_unleased").per_unit.dollars()
+            per_period * request_cost_usd(&r.get("strong_read_unleased").per_unit)
         };
         periods * period_cost * days
     };
     let mib = (1u64 << 20) as f64;
-    let blobs = (p.blob_upload_bytes_per_day / mib * r.get("blob_upload").per_unit.dollars()
-        + p.blob_download_bytes_per_day / mib * r.get("blob_download").per_unit.dollars())
+    let blobs = (p.blob_upload_bytes_per_day / mib * request_cost_usd(&r.get("blob_upload").per_unit)
+        + p.blob_download_bytes_per_day / mib * request_cost_usd(&r.get("blob_download").per_unit))
         * days;
     let storage = (p.data_bytes * r.space_amplification + p.blob_bytes) / GB * prices::STORAGE_GB_MONTH;
     Bill { writes, reads, blobs, storage }
@@ -960,7 +827,7 @@ pub fn cost_table(r: &Report) -> String {
     }
     for name in ["node_overhead_1_node", "node_overhead_3_nodes"] {
         let m = r.get(name);
-        s.push_str(&format!("{name}: ${:.2} per node-month\n", m.per_unit.dollars() * 24.0 * 30.0));
+        s.push_str(&format!("{name}: ${:.2} per node-month\n", request_cost_usd(&m.per_unit) * 24.0 * 30.0));
     }
     s
 }

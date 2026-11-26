@@ -6,7 +6,8 @@
 //! Each test drives a single node with production defaults through the HTTP API. The store adds
 //! [`STORE_LATENCY_MS`] to each request so that concurrent requests can overlap in test-clock time.
 
-use baserunna::sim::cost::{Resp, World, call_router, run_paused};
+use baserunna::sim::cost::{Resp, World, call_router};
+use baserunna_util::run_paused;
 use bytes::Bytes;
 use serde_json::{Value as Json, json};
 use std::time::Duration;

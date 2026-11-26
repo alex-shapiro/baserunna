@@ -4,17 +4,17 @@ use super::data::{
     PathMap, commit_hex, content_type, idempotency_header, one_idempotency_key, param, split_consistency,
 };
 use super::{DbCtx, JsonBody, Params, consistency_of, name_paging, with_read, with_txn};
-use crate::engine::{Committed, Consistency};
-use crate::error::{Error, Result};
-use crate::events::exec;
-use crate::events::query::{Filter, Query};
-use crate::events::schema::SkipIndex;
-use crate::events::{self, ColumnSpec, CreateEvents};
 use crate::node::Node;
 use axum::Router;
 use axum::extract::{Extension, Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
+use baserunna_storage::engine::{Committed, Consistency};
+use baserunna_storage::events::exec;
+use baserunna_storage::events::query::{Filter, Query};
+use baserunna_storage::events::schema::SkipIndex;
+use baserunna_storage::events::{self, ColumnSpec, CreateEvents};
+use baserunna_util::error::{Error, Result};
 use http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
@@ -170,7 +170,7 @@ const BODY_SHAPE: &str = "the body is {\"rows\": [...]}, an array of events, or 
 /// Streams events from a JSON or NDJSON insert body into `f` without buffering
 /// the parsed array, and returns the body's `idempotency_key` if present.
 fn each_event(content_type: &str, data: &[u8], f: &mut dyn FnMut(Json) -> Result<()>) -> Result<Option<String>> {
-    crate::util::json::reject_inexact_integers(data).map_err(Error::invalid)?;
+    baserunna_util::json::reject_inexact_integers(data).map_err(Error::invalid)?;
     match content_type {
         "" | "application/json" => {
             let mut failed = None;
@@ -355,7 +355,7 @@ async fn query(
     let (b, c) = query_consistency(b)?;
     let q = Query::parse(b)?;
     let limits = node.cfg.query_limits;
-    let mut grant = node.start_query(&ctx.principal.user.id).await?;
+    let mut grant = node.txns.start_query(&ctx.principal.user.id).await?;
     let mut run = async |c: Consistency| -> Result<(exec::Output, u64)> {
         let db = ctx.db.clone();
         Ok(with_read!(ctx.db, c, |t| {
@@ -411,7 +411,7 @@ async fn delete_rows(
 #[derive(serde::Serialize, Deserialize)]
 pub(crate) struct ForwardedBind {
     pub db: String,
-    /// Base64-encoded [`crate::engine::events::Bind`].
+    /// Base64-encoded [`baserunna_storage::engine::events::Bind`].
     pub bind: String,
 }
 
@@ -453,7 +453,7 @@ pub(super) async fn internal_bind(
     axum::Json(b): axum::Json<ForwardedBind>,
 ) -> Result<J> {
     let data = baserunna_api::b64::decode(&b.bind).ok_or_else(|| Error::invalid("bad bind encoding"))?;
-    let bind = crate::engine::events::Bind::decode(&data).map_err(|e| Error::invalid(e.to_string()))?;
+    let bind = baserunna_storage::engine::events::Bind::decode(&data).map_err(|e| Error::invalid(e.to_string()))?;
     let db = node.engine.db(&b.db);
     db.open(false).await?;
     let rs = db.bind(bind).await?;

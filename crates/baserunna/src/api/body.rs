@@ -1,11 +1,11 @@
 //! Streaming blob request/response bodies and HTTP Range parsing.
 
-use crate::engine::blob::{self, BlobWriter, chunk_plan, read_chunk};
-use crate::engine::{BlobRef, Shared};
-use crate::error::{Error, Result};
 use crate::node::Deadline;
-use crate::store::BoxFut;
 use axum::body::Body;
+use baserunna_storage::engine::blob::{self, BlobWriter, chunk_plan, read_chunk};
+use baserunna_storage::engine::{BlobRef, Shared};
+use baserunna_util::BoxFut;
+use baserunna_util::error::{Error, Result};
 use bytes::Bytes;
 use http_body::Frame;
 use http_body_util::BodyExt;
@@ -87,7 +87,7 @@ impl http_body::Body for BlobBody {
                     }
                     this.fut = Some(Box::pin(async move {
                         if pin && let Err(e) = blob::pin(&shared, &db, &blob.id).await {
-                            crate::warn!("could not pin blob {} of {db} for a long read: {e}", blob.id);
+                            baserunna_util::warn!("could not pin blob {} of {db} for a long read: {e}", blob.id);
                         }
                         read_chunk(&shared, &db, &blob, ci, r).await
                     }));

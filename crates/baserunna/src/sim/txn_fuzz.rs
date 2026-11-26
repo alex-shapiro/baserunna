@@ -1,10 +1,10 @@
 //! Structure-aware HTTP fuzzing of the transaction API against a reference model.
 
 use super::{Sim, SimConfig, SimResponse, openapi_check};
-use crate::engine::KeyRange;
-use crate::table::tuple::Key as TKey;
-use crate::util::sha256;
 use baserunna_api::{Encoding, RangeSpec, b64};
+use baserunna_storage::engine::KeyRange;
+use baserunna_storage::table::tuple::Key as TKey;
+use baserunna_util::sha256;
 use bytes::Bytes;
 use serde::Deserialize;
 use serde_json::{Map, Value as Json, json};
@@ -385,8 +385,8 @@ const TTL_BEYOND_RUN_MS: u64 = 1_000_000_000;
 fn ttl(ttl_ms: Option<u64>) -> MResult<Expiry> {
     match ttl_ms {
         None => Ok(Expiry::Never),
-        Some(t) if (TTL_BEYOND_RUN_MS..=crate::ops::MAX_TTL_MS).contains(&t) => Ok(Expiry::Pending),
-        Some(t) if (1..=crate::ops::MAX_TTL_MS).contains(&t) => Err(Fail::Unmodeled),
+        Some(t) if (TTL_BEYOND_RUN_MS..=baserunna_storage::ops::MAX_TTL_MS).contains(&t) => Ok(Expiry::Pending),
+        Some(t) if (1..=baserunna_storage::ops::MAX_TTL_MS).contains(&t) => Err(Fail::Unmodeled),
         Some(_) => Err(Fail::Invalid),
     }
 }
@@ -1033,7 +1033,7 @@ fn decode(enc: Encoding, s: &str) -> MResult<Vec<u8>> {
 }
 
 fn user_key(k: Vec<u8>) -> MResult<Vec<u8>> {
-    if k.is_empty() || k.len() > crate::ops::MAX_USER_KEY { Err(Fail::Invalid) } else { Ok(k) }
+    if k.is_empty() || k.len() > baserunna_storage::ops::MAX_USER_KEY { Err(Fail::Invalid) } else { Ok(k) }
 }
 
 fn user_range(
@@ -1047,7 +1047,7 @@ fn user_range(
     }
     if let Some(p) = prefix {
         let p = decode(enc, p)?;
-        let e = crate::util::prefix_end(&p).map(|e| Bound::Excluded(Bytes::from(e))).unwrap_or(Bound::Unbounded);
+        let e = baserunna_util::prefix_end(&p).map(|e| Bound::Excluded(Bytes::from(e))).unwrap_or(Bound::Unbounded);
         return Ok(KeyRange::new(Bound::Included(Bytes::from(p)), e));
     }
     let s = match start {
@@ -1150,7 +1150,7 @@ impl World {
                 let v = match (value, blob_id) {
                     (Some(v), None) => self.make_value(decode(enc, v)?),
                     (None, Some(id)) => {
-                        if !crate::engine::types::valid_object_id(id) {
+                        if !baserunna_storage::engine::types::valid_object_id(id) {
                             return Err(Fail::Invalid);
                         }
                         let (data, ct) = self.staged.get(id).ok_or(Fail::NotFound)?;
@@ -2084,7 +2084,7 @@ impl Gen<'_, '_> {
                 json!(3_600_000_000u64),
                 json!(3_600_000_000u64),
                 json!(0),
-                json!(crate::ops::MAX_TTL_MS + 1),
+                json!(baserunna_storage::ops::MAX_TTL_MS + 1),
             ]);
         }
     }
@@ -3034,7 +3034,7 @@ pub struct Harness {
 impl Harness {
     pub fn new(seed: u64) -> Harness {
         if std::env::var("BASERUNNA_LOG").is_err() {
-            crate::log::set_level(Some(crate::log::Level::Error));
+            baserunna_util::log::set_level(Some(baserunna_util::log::Level::Error));
         }
         let rt =
             tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");

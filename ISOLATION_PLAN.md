@@ -60,8 +60,10 @@ Because `baserunna-server` does not link `baserunna-storage`, the server
 process cannot open a database. A `cargo tree` check in CI enforces this rule.
 That check replaces the store guard from milestone 3.
 
-We can move the storage engine with few changes. Today `engine/` depends only
-on `store` and the shared modules we will put in `baserunna-util`.
+`baserunna-util` and `baserunna-storage` are now separate crates.
+`baserunna-storage` contains the object store client. `baserunna-util` contains
+`Role` and `Access`. The server will send an `Access` value to the worker with
+each request.
 
 ## Milestones
 
@@ -146,7 +148,7 @@ fail. Clients cannot write to that worker's databases until the leases expire.
 That wait takes at most one lease period. SPEC §1 allows the same pause after a
 node is killed.
 
-- [ ] Move shared modules into `baserunna-util`. Move the storage engine and
+- [x] Move shared modules into `baserunna-util`. Move the storage engine and
       database features into `baserunna-storage`.
 - [ ] Route each database request to an in-process worker for its owner. Give
       each worker its own `Engine`, lease identity, and background jobs. Pass
@@ -160,8 +162,8 @@ node is killed.
       account routes, and organization routes in that worker. Read metadata
       records from it for authentication and routing.
 - [ ] Move connections, authentication, and routing into `baserunna-server`.
-      Add the `cargo tree` CI check. Rename the remaining `baserunna` crate to
-      `baserunna-worker`.
+      Move the `Transport` trait into `baserunna-util`. Add the `cargo tree` CI
+      check. Rename the remaining `baserunna` crate to `baserunna-worker`.
 
 ### 4. Run each worker in its own process
 

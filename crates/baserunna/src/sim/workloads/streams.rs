@@ -909,7 +909,7 @@ pub async fn run(sim: Arc<Sim>, steps: usize, chaos: bool) -> Result<(), String>
     append(&c, &w, "ret", 1_000_000, 1, Format::Json, None).await?;
     c.pause(2_000).await;
     let eps = 2 * sim.cfg.engine.clock_sync_max_error_ms;
-    let due = crate::engine::Retention { retention_ms: Some(RET_MS), max_bytes: Some(RET_BYTES) }.due_at();
+    let due = baserunna_storage::engine::Retention { retention_ms: Some(RET_MS), max_bytes: Some(RET_BYTES) }.due_at();
     let (due_ms, due_bytes) = (due.retention_ms.unwrap_or(RET_MS), due.max_bytes.unwrap_or(RET_BYTES));
     let deadline = c.sim.now_ms() + 60_000;
     loop {
@@ -1011,8 +1011,10 @@ async fn check_integrity(sim: &Arc<Sim>) -> Result<(), String> {
     let db = node.engine.db(&id);
     // Storage faults are still active, so retry transient read errors.
     crate::node::retry_unavailable(|| async {
-        let mut t = db.begin(crate::engine::Isolation::Serializable, crate::engine::Consistency::Strong).await?;
-        crate::stream::check_integrity(&mut t).await
+        let mut t = db
+            .begin(baserunna_storage::engine::Isolation::Serializable, baserunna_storage::engine::Consistency::Strong)
+            .await?;
+        baserunna_storage::stream::check_integrity(&mut t).await
     })
     .await
     .map_err(|e| format!("stream integrity: {e}"))

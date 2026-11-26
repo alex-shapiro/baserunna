@@ -1,9 +1,10 @@
 //! Storage engine write, space, and read amplification benchmarks.
 
-use crate::engine::{Consistency, Engine, EngineConfig, Isolation};
-use crate::env::Env;
-use crate::store::{BoxFut, DynStore, GetOpts, GetResult, ListPage, MemStore, ObjectStore, PutMode, SResult};
-use crate::util::rng::Rng;
+use baserunna_storage::engine::{Consistency, Engine, EngineConfig, Isolation};
+use baserunna_storage::store::{DynStore, GetOpts, GetResult, ListPage, MemStore, ObjectStore, PutMode, SResult};
+use baserunna_util::BoxFut;
+use baserunna_util::env::Env;
+use baserunna_util::rng::Rng;
 use bytes::Bytes;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -189,7 +190,7 @@ pub async fn measure(w: Workload, scale: f64, cfg: EngineConfig) -> Amplificatio
                 Some(v) => {
                     logical += v.len() as u64;
                     live.insert(k, (kb.len() + v.len()) as u64);
-                    t.put(kb, crate::engine::Value::Inline(Bytes::from(v))).expect("put");
+                    t.put(kb, baserunna_storage::engine::Value::Inline(Bytes::from(v))).expect("put");
                 }
                 None => {
                     live.remove(&k);
@@ -236,7 +237,7 @@ pub async fn measure(w: Workload, scale: f64, cfg: EngineConfig) -> Amplificatio
 }
 
 pub fn measure_all(scale: f64, cfg: &EngineConfig) -> Vec<Amplification> {
-    super::cost::run_paused(async {
+    baserunna_util::run_paused(async {
         let mut out = Vec::new();
         for w in Workload::ALL {
             out.push(measure(w, scale, cfg.clone()).await);
@@ -306,7 +307,7 @@ pub struct StreamAmplification {
 }
 
 pub async fn measure_stream(w: StreamWorkload, scale: f64, cfg: EngineConfig) -> StreamAmplification {
-    use crate::engine::stream::{self as es, Stored};
+    use baserunna_storage::engine::stream::{self as es, Stored};
     let origin = tokio::time::Instant::now();
     let env = Arc::new(Env::sim(43, 1_750_000_000_000, origin, 0));
     let env2 = env.clone();
@@ -323,8 +324,8 @@ pub async fn measure_stream(w: StreamWorkload, scale: f64, cfg: EngineConfig) ->
     };
     let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.expect("begin");
     for s in 0..streams {
-        let r = crate::engine::Retention::default();
-        crate::stream::create(&mut t, &format!("s{s}"), r, 1 + s as u64, 0).await.expect("create");
+        let r = baserunna_storage::engine::Retention::default();
+        baserunna_storage::stream::create(&mut t, &format!("s{s}"), r, 1 + s as u64, 0).await.expect("create");
     }
     db.commit(t.into_request()).await.expect("create streams");
     let mut rng = Rng::new(11);
@@ -338,7 +339,7 @@ pub async fn measure_stream(w: StreamWorkload, scale: f64, cfg: EngineConfig) ->
         let mut t = db.begin(Isolation::Serializable, Consistency::Strong).await.expect("begin");
         for _ in 0..per_commit {
             let s = rng.usize(streams);
-            let body = crate::stream::Body::text(value(&mut rng, s as u64));
+            let body = baserunna_storage::stream::Body::text(value(&mut rng, s as u64));
             let payload = body.encode();
             logical += payload.len() as u64;
             t.append(1 + s as u64, vec![payload], None, None).expect("append");
@@ -354,7 +355,7 @@ pub async fn measure_stream(w: StreamWorkload, scale: f64, cfg: EngineConfig) ->
     db.maintenance_now().await.expect("gc");
     tokio::time::sleep(Duration::from_secs(10)).await;
     let v = db.current().expect("current");
-    let mut it = v.iter(&crate::engine::KeyRange::prefix(&[es::RECORDS]), false, false, None);
+    let mut it = v.iter(&baserunna_storage::engine::KeyRange::prefix(&[es::RECORDS]), false, false, None);
     let (mut sealed, mut loose, mut chunks) = (0u64, 0u64, 0);
     while let Some(e) = it.next().await.expect("scan") {
         match es::stored(&e).map(|(_, s)| s) {
@@ -379,7 +380,7 @@ pub async fn measure_stream(w: StreamWorkload, scale: f64, cfg: EngineConfig) ->
 }
 
 pub fn measure_streams(scale: f64, cfg: &EngineConfig) -> Vec<StreamAmplification> {
-    super::cost::run_paused(async {
+    baserunna_util::run_paused(async {
         let mut out = Vec::new();
         for w in StreamWorkload::ALL {
             out.push(measure_stream(w, scale, cfg.clone()).await);

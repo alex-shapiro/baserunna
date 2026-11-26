@@ -14,13 +14,13 @@ use crate::api::{ClientAddr, SESSION_COOKIE, cookie};
 use crate::auth;
 use crate::meta::SignInMethod;
 use crate::node::Node;
-use crate::util::hmac_sha256;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Form, FromRequest, FromRequestParts, Query, Request, State};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use baserunna_api::b64;
+use baserunna_util::hmac_sha256;
 use http::StatusCode;
 use serde::de::DeserializeOwned;
 use serde_json::{Value as Json, json};
@@ -258,7 +258,7 @@ impl Session {
     }
 
     fn check_csrf(&self, token: Option<&str>) -> Result<(), Response> {
-        if token.is_some_and(|c| crate::util::ct_eq(c.as_bytes(), self.csrf.as_bytes())) {
+        if token.is_some_and(|c| baserunna_util::ct_eq(c.as_bytes(), self.csrf.as_bytes())) {
             Ok(())
         } else {
             Err((StatusCode::FORBIDDEN, "invalid CSRF token").into_response())
@@ -287,8 +287,8 @@ impl Session {
             if let Some(ct) = content_type {
                 b = b.header("content-type", ct);
             }
-            if let Some(rid) = crate::log::request_id() {
-                b = b.header(crate::log::REQUEST_ID_HEADER, rid.as_ref());
+            if let Some(rid) = baserunna_util::log::request_id() {
+                b = b.header(baserunna_util::log::REQUEST_ID_HEADER, rid.as_ref());
             }
             let Ok(req) = b.body(Body::from(body.clone())) else {
                 return (StatusCode::BAD_REQUEST, "bad request").into_response();
@@ -416,7 +416,7 @@ fn format_duration(ms: u64) -> String {
 }
 
 fn format_timestamp(ms: impl TryInto<i64>) -> String {
-    crate::log::rfc3339(ms.try_into().unwrap_or(i64::MAX))[..19].replace('T', " ")
+    baserunna_util::log::rfc3339(ms.try_into().unwrap_or(i64::MAX))[..19].replace('T', " ")
 }
 
 use self::format_timestamp as when;

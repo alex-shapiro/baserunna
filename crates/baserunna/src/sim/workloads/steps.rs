@@ -4,7 +4,7 @@
 use super::super::Sim;
 use super::super::client::Client;
 use super::{cache_expiry, expect};
-use crate::meta::Role;
+use baserunna_util::access::Role;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 use std::sync::Arc;

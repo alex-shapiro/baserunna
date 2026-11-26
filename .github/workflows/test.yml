@@ -24,6 +24,9 @@ jobs:
       - name: Build each library crate with only its own features
         run: |
           cargo check -p baserunna-api --all-targets
+          cargo check -p baserunna-util --all-targets
+          cargo check -p baserunna-storage --no-default-features --all-targets
+          cargo check -p baserunna-storage --all-targets
           cargo check -p baserunna-client --no-default-features --all-targets
           cargo check -p baserunna-client --all-targets
       - run: cargo test --release

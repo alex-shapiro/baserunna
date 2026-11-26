@@ -4,8 +4,6 @@ use super::{
     Auth, ClientAddr, Endpoints as _, JsonBody, Params, QueryOf, Reply, Req, SESSION_COOKIE, cookie, credential, paging,
 };
 use crate::auth;
-use crate::engine::Txn;
-use crate::error::{Error, Result};
 use crate::meta::{self, ApiKey, MetaCmd, SignInMethod, SignedUp};
 use crate::node::{Credential, Node, Principal};
 use axum::Router;
@@ -13,6 +11,8 @@ use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use baserunna_api::{self as api, Endpoint};
+use baserunna_storage::engine::Txn;
+use baserunna_util::error::{Error, Result};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
@@ -300,7 +300,7 @@ async fn list_keys(
     _: Req<api::ListApiKeys>,
 ) -> Result<Reply<api::ListApiKeys>> {
     p.require_session()?;
-    let limit = crate::ops::page_limit(q.limit)?;
+    let limit = baserunna_storage::ops::page_limit(q.limit)?;
     let mut t = node.sys_read_strong().await?;
     let page = meta::api_keys_page(&mut t, &p.user.id, limit, q.cursor.filter(|c| !c.is_empty())).await?;
     let mut api_keys = Vec::new();

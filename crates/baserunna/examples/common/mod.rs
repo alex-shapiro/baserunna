@@ -2,10 +2,10 @@
 #![allow(dead_code)]
 
 use baserunna::cluster::HttpTransport;
-use baserunna::env::Env;
 use baserunna::meta::SignupPolicy;
 use baserunna::node::{Node, NodeConfig, Services};
-use baserunna::store::{DynStore, MemStore};
+use baserunna_storage::store::{DynStore, MemStore};
+use baserunna_util::env::Env;
 use std::sync::Arc;
 
 pub struct Server {
@@ -48,7 +48,7 @@ pub async fn start(store: DynStore, name: &str, signup: SignupPolicy) -> Server 
         ..NodeConfig::default()
     };
     if std::env::var("BASERUNNA_LOG").is_err() {
-        baserunna::log::set_level(Some(baserunna::log::Level::Warn));
+        baserunna_util::log::set_level(Some(baserunna_util::log::Level::Warn));
     }
     let services = Services { transport: Arc::new(HttpTransport::new()), oidc: None, mailer: None };
     let node = Node::start(cfg, Arc::new(Env::real()), store, services).await.expect("node start");

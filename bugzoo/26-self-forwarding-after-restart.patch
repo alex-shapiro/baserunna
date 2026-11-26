@@ -16,7 +16,7 @@ index 0bbaa62..ba6297b 100644
              return None;
          };
 -        if addr == self.cfg.addr {
--            crate::probe::hit(crate::probe::Probe::OwnAddressIgnored);
+-            baserunna_util::probe::hit(baserunna_util::probe::Probe::OwnAddressIgnored);
 -            return None;
 -        }
          Some((target, addr))

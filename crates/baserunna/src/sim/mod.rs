@@ -18,16 +18,17 @@ pub use storage_check::StorageReport;
 
 use crate::api;
 use crate::cluster::{Transport, TransportError};
-use crate::engine::EngineConfig;
-use crate::engine::local::{LocalTier, MemLocal};
-use crate::env::Env;
 use crate::meta::SignupPolicy;
 use crate::node::{Node, NodeConfig, Services};
-use crate::store::{
-    BoxFut, DynStore, GetOpts, GetResult, ListPage, MemStore, ObjectStore, PutMode, SResult, StoreError,
-};
-use crate::util::rng::Rng;
 use axum::body::Body;
+use baserunna_storage::engine::EngineConfig;
+use baserunna_storage::engine::local::{LocalTier, MemLocal};
+use baserunna_storage::store::{
+    DynStore, GetOpts, GetResult, ListPage, MemStore, ObjectStore, PutMode, SResult, StoreError,
+};
+use baserunna_util::BoxFut;
+use baserunna_util::env::Env;
+use baserunna_util::rng::Rng;
 use bytes::Bytes;
 use http::{Request, Response};
 use parking_lot::Mutex;
@@ -211,7 +212,7 @@ impl SimConfig {
                 },
                 engine: engine.clone(),
                 // Below request_timeout_ms so timed-out client queries release their execution slot first.
-                query_limits: crate::events::exec::Limits { max_ms: 20_000, ..Default::default() },
+                query_limits: baserunna_storage::events::exec::Limits { max_ms: 20_000, ..Default::default() },
                 ..NodeConfig::default()
             },
             engine,
@@ -323,7 +324,7 @@ pub struct DiskFaults {
     pub p_corrupt: f64,
 }
 
-impl crate::engine::local::LocalStore for SimDisk {
+impl baserunna_storage::engine::local::LocalStore for SimDisk {
     fn get<'a>(&'a self, key: &'a str) -> BoxFut<'a, Option<Bytes>> {
         Box::pin(async move {
             let got = self.inner.get(key).await?;
@@ -356,7 +357,7 @@ impl crate::engine::local::LocalStore for SimDisk {
         self.inner.contains(key)
     }
 
-    fn stats(&self) -> crate::engine::local::LocalStats {
+    fn stats(&self) -> baserunna_storage::engine::local::LocalStats {
         self.inner.stats()
     }
 }
@@ -685,8 +686,10 @@ impl Sim {
         self.trace.event(&format!("stop n{i} ({})", n.node.id));
         let released = n.node.shutdown().await;
         for db in released {
-            let Ok(g) = self.mem.get_sync(&crate::engine::manifest_key(&db), &GetOpts::default()) else { continue };
-            let lease = crate::engine::manifest::Manifest::decode(&g.data).ok().and_then(|m| m.lease);
+            let Ok(g) = self.mem.get_sync(&baserunna_storage::engine::manifest_key(&db), &GetOpts::default()) else {
+                continue;
+            };
+            let lease = baserunna_storage::engine::manifest::Manifest::decode(&g.data).ok().and_then(|m| m.lease);
             if lease.is_some_and(|l| l.node == n.node.id) {
                 let e = format!("n{i} released its lease on {db} as it stopped, but storage still holds it");
                 self.trace.event(&format!("oracle: {e}"));
@@ -719,11 +722,11 @@ impl Sim {
                 if in_flight {
                     continue;
                 }
-                let stored = self.mem.get_sync(&crate::engine::manifest_key(&db.id), &GetOpts::default());
+                let stored = self.mem.get_sync(&baserunna_storage::engine::manifest_key(&db.id), &GetOpts::default());
                 if let Ok(g) = stored
                     && g.etag != etag
                 {
-                    let ws = crate::engine::manifest::Manifest::decode(&g.data).map_or(0, |m| m.write_seq);
+                    let ws = baserunna_storage::engine::manifest::Manifest::decode(&g.data).map_or(0, |m| m.write_seq);
                     return Err(format!(
                         "n{i} holds lease on {} at write {write_seq}, but store has write {ws}",
                         db.id
@@ -889,8 +892,8 @@ pub struct SimOutcome {
     pub injected_faults: u64,
     pub crashes: u64,
     pub storage: StorageReport,
-    pub probes: crate::probe::Hits,
-    pub buggify: crate::buggify::Report,
+    pub probes: baserunna_util::probe::Hits,
+    pub buggify: baserunna_util::buggify::Report,
     pub knobs: Vec<(&'static str, String)>,
     pub trace_tail: Vec<String>,
 }
@@ -915,24 +918,24 @@ where
     Fut: Future<Output = Result<(), String>>,
 {
     if std::env::var("BASERUNNA_LOG").is_err() {
-        crate::log::set_level(Some(crate::log::Level::Error));
+        baserunna_util::log::set_level(Some(baserunna_util::log::Level::Error));
     }
     let rt = tokio::runtime::Builder::new_current_thread().enable_time().start_paused(true).build().expect("runtime");
     let full_trace = cfg.full_trace;
-    let b = crate::buggify::Config {
+    let b = baserunna_util::buggify::Config {
         p_active: cfg.buggify,
         faults: cfg.chaos.enabled,
         crashes: cfg.crash_points,
         p_reorder: cfg.reorder,
     };
-    crate::buggify::enable(seed ^ 0xb066_1f1e, b);
+    baserunna_util::buggify::enable(seed ^ 0xb066_1f1e, b);
     let branches = cfg.branches.clone();
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         rt.block_on(async move {
-            crate::probe::record();
-            crate::probe::set_branch_time(branches.last().map_or(0, |(ms, _)| *ms));
+            baserunna_util::probe::record();
+            baserunna_util::probe::set_branch_time(branches.last().map_or(0, |(ms, _)| *ms));
             let start = Instant::now();
-            crate::util::rng::branch(
+            baserunna_util::rng::branch(
                 branches.iter().map(|(ms, salt)| (start + Duration::from_millis(*ms), *salt)).collect(),
             );
             let sim = Sim::new(seed, cfg).await;
@@ -940,17 +943,17 @@ where
             let mut workload = CatchPanic(Box::pin(f(sim.clone())));
             let mut oracles_or_deadline = Box::pin(async {
                 let deadline = tokio::time::sleep(Duration::from_millis(MAX_VIRTUAL_MS));
-                match crate::util::race(&mut oracles, &mut Box::pin(deadline)).await {
-                    crate::util::Either::Left(_) => Ok(()),
-                    crate::util::Either::Right(()) => {
+                match baserunna_util::race(&mut oracles, &mut Box::pin(deadline)).await {
+                    baserunna_util::Either::Left(_) => Ok(()),
+                    baserunna_util::Either::Right(()) => {
                         Err(format!("workload timed out after {} s of virtual time", MAX_VIRTUAL_MS / 1000))
                     }
                 }
             });
-            let mut result = match crate::util::race(&mut workload, &mut oracles_or_deadline).await {
-                crate::util::Either::Left(Ok(r)) => r,
-                crate::util::Either::Left(Err(())) => Err("workload panicked".into()),
-                crate::util::Either::Right(r) => r,
+            let mut result = match baserunna_util::race(&mut workload, &mut oracles_or_deadline).await {
+                baserunna_util::Either::Left(Ok(r)) => r,
+                baserunna_util::Either::Left(Err(())) => Err("workload panicked".into()),
+                baserunna_util::Either::Right(r) => r,
             };
             drop(oracles_or_deadline);
             drop(workload);
@@ -988,15 +991,15 @@ where
                 injected_faults: sim.store.stats.injected_failures.load(Ordering::Relaxed),
                 crashes: sim.crashes.load(Ordering::Relaxed),
                 storage,
-                probes: crate::probe::Hits::default(),
+                probes: baserunna_util::probe::Hits::default(),
                 buggify: Default::default(),
                 knobs: sim.knobs.drawn(),
                 trace_tail,
             }
         })
     }));
-    crate::util::rng::branch(Vec::new());
-    let (probes, buggify) = (crate::probe::finish(), crate::buggify::disable());
+    baserunna_util::rng::branch(Vec::new());
+    let (probes, buggify) = (baserunna_util::probe::finish(), baserunna_util::buggify::disable());
     let out = out.unwrap_or_else(|_| SimOutcome {
         seed,
         result: Err(format!("panic outside the workload: {}", take_panic().unwrap_or_default())),
@@ -1022,10 +1025,10 @@ pub fn purge_wait_ms(cfg: &SimConfig) -> u64 {
 
 /// Returns the seed list from `SIM_SEED`, `SIM_SEEDS`, or `default_count` starting from `base`.
 pub fn seeds(base: u64, default_count: u64) -> Vec<u64> {
-    if let Some(s) = crate::util::prop::env_u64("SIM_SEED") {
+    if let Some(s) = baserunna_util::prop::env_u64("SIM_SEED") {
         return vec![s];
     }
-    let n = crate::util::prop::env_u64("SIM_SEEDS").unwrap_or(default_count);
+    let n = baserunna_util::prop::env_u64("SIM_SEEDS").unwrap_or(default_count);
     (0..n).map(|i| base.wrapping_mul(1_000_003).wrapping_add(i)).collect()
 }
 

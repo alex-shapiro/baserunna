@@ -18,7 +18,7 @@ fn simulation_exercises_every_documented_operation_and_probe() {
     let unreached: Vec<String> = report
         .unreached()
         .iter()
-        .filter(|p| !baserunna::probe::Probe::RARE.contains(p))
+        .filter(|p| !baserunna_util::probe::Probe::RARE.contains(p))
         .map(|p| format!("{} ({})", p.name(), p.doc()))
         .collect();
     assert!(unreached.is_empty(), "unreached probes:\n{}\n{}", unreached.join("\n"), report.coverage_table());

@@ -4,7 +4,8 @@
 mod counting_alloc;
 
 use baserunna::node::NodeConfig;
-use baserunna::sim::cost::{Resp, World, call_router, run_paused};
+use baserunna::sim::cost::{Resp, World, call_router};
+use baserunna_util::run_paused;
 use bytes::Bytes;
 use counting_alloc::{HEAP_MEASUREMENT_LOCK, peak_growth_bytes, reset_peak_bytes};
 use serde_json::{Value as Json, json};

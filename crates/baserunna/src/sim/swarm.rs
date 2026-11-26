@@ -7,8 +7,8 @@
 
 use super::store::StoreFaults;
 use super::{ChaosFaults, DiskFaults, NetFaults, SimConfig};
-use crate::engine::segment::Compression;
-use crate::util::rng::Rng;
+use baserunna_storage::engine::segment::Compression;
+use baserunna_util::rng::Rng;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::fmt::Debug;

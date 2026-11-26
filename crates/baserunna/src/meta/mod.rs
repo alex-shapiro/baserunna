@@ -1042,13 +1042,9 @@ async fn delete_user(w: &mut Write<'_, '_>, user_id: &str) -> Result<UserDeletio
         org::change_membership(w, &m.org_id, user_id, Some(m.role), None).await?;
     }
     let mut deleted_db_ids = Vec::new();
-    for d in take_rows::<DbRecord>(
-        w.txn,
-        "databases",
-        q_eq(Some("by_owner_name"), vec![json!(user_id)]),
-        &mut remaining,
-    )
-    .await?
+    for d in
+        take_rows::<DbRecord>(w.txn, "databases", q_eq(Some("by_owner_name"), vec![json!(user_id)]), &mut remaining)
+            .await?
     {
         deleted_db_ids.push(d.id.clone());
         delete_db(w, d).await?;

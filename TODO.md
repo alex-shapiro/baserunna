@@ -653,8 +653,8 @@ only.
       probe test, creating and deleting 80,000 API keys increased batch key
       deletion time from 0.02 ms to 7.4 ms. That slowdown remained after 30
       minutes of idle time. `Txn::cost` counts only live entries. The metadata
-      cost test misses tombstone scans. Expired-session reaper scans also slow
-      down across all tenants.
+      cost test misses tombstone scans. Tombstones also slow expired-session
+      reaper scans across all tenants.
 - [ ] [untriaged · Tenant isolation] **Limit API keys and sessions per user.**
       A tenant can create unlimited API keys and sessions in the shared system
       database. This breaks the SPEC §1 goal "Each tenant has a limit for each
@@ -663,4 +663,5 @@ only.
       limit. Account deletion removes at most `PAGE_MAX` rows per batch. All
       batches share a single 10 s request deadline. Deleting an account with
       many keys or sessions can time out with `outcome_unknown: true`. The user
-      must then retry deletion. Not measured.
+      must then retry deletion. We have not measured this timeout with a probe
+      test.

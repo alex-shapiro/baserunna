@@ -20,18 +20,20 @@ queue then fails to isolate tenants.
 
 The request to add a test is right, but the plan text is partly wrong. It says
 that multi-row deletes already run in batches of `PAGE_MAX` rows. This applies
-to sessions and API keys. However, two deletes run in a single transaction:
+to sessions and API keys. Two delete commands still run in a single
+transaction:
 
-- `delete_user` deletes up to `max_dbs_per_owner` personal databases, 1,000 by
-  default, and up to `max_orgs_per_user` memberships, 100 by default.
-- `delete_org` deletes up to `max_members_per_org` memberships, 1,000 by
-  default.
+- `delete_user` deletes up to `max_dbs_per_owner` personal databases. The
+  default limit is 1,000. It also deletes up to `max_orgs_per_user`
+  memberships. The default limit is 100.
+- `delete_org` deletes up to `max_members_per_org` memberships. The default
+  limit is 1,000.
 
-Per-owner limits set the maximum cost of these commands. SPEC §1 lets an
-administrator change per-tenant limits. Changing those limits also changes that
-maximum. A tenant reaches the maximum only after running a command for each
-row. We chose to delete these rows in batches of `PAGE_MAX`. Every command then
-has a fixed maximum cost.
+We chose to delete these rows in batches of `PAGE_MAX`. Every command then has
+a fixed maximum cost. Before this change, per-tenant limits set the maximum
+cost of these commands. SPEC §1 lets an administrator change per-tenant limits.
+Changing those limits also changes that maximum. A tenant reaches the maximum
+only after running a command for each row.
 
 ## Precedent
 
@@ -72,7 +74,7 @@ Other approaches:
   limit fail for users. A test finds the problem before release without a new
   failure mode. We can add a run-time limit later.
 - Keep `delete_user` and `delete_org` in a single transaction. Deletion stays
-  atomic. However, per-tenant limits set the maximum cost. Very high limits can
+  atomic. Per-tenant limits then set the maximum cost. Very high limits can
   make account deletion fail.
 
 ## Review decisions
@@ -84,7 +86,7 @@ Round 1:
   missed.
 - Batch database and membership deletes in `delete_user` and `delete_org`:
   accepted after the user chose batching. The largest batch reads 7,009 entries
-  instead of 16,605. Removed `DeleteApiKeys` and
+  instead of 16,605. We removed `DeleteApiKeys` and
   `UserDeletion::TooManyCredentials`.
 - Remove test constants from SPEC: accepted. SPEC now states the rule.
 - Charge measured cost in the fair queue instead of command count: reported to
@@ -101,13 +103,14 @@ Round 2:
   membership and at least one owner. The test checks integrity after each
   batch. It also deletes `org-big` as a non-member site administrator.
 - Exhaustive match to force measuring new commands: rejected. Rust cannot list
-  enum variants. A match therefore cannot fail for an unmeasured command.
+  enum variants. A match does not catch an unmeasured command.
 - Assert a maximum entry count per command: accepted. Each command reads and
   writes at most `16 * PAGE_MAX` entries.
 - Interrupted account deletion removes the caller's session first: accepted.
   The node now deletes sessions last.
-- Cleanups: moved the `delete_org` loop into `Node`, updated this brief, and
-  rewrapped SPEC. Kept byte counters for the test report.
+- Code and document updates: accepted. We moved the `delete_org` loop into
+  `Node`. We updated this brief and rewrapped `SPEC.md`. We kept the byte
+  counters for the test report.
 - Record `Txn::cost` in production: reported to the user as out of scope.
 - Run multi-batch deletion in the simulator: rejected. Integrity checks after
   each batch cover every stop point between batches.

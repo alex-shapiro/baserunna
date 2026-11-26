@@ -1213,11 +1213,13 @@ recreate a purged database.
   `public_url` is https). The API uses `Authorization: Bearer`. Users list
   their sessions and revoke one, or all but the current one.
 - **Account self-service** requires a signed-in session, not an API key.
+
   Before changing a password, the node checks the current password. Failed
   checks count toward the account's sign-in backoff. The node writes the new
   hash only if the stored hash still matches the checked hash. This check
   prevents two concurrent changes from both succeeding. The node also ends all
   other sessions for the account.
+
   Before deleting an account, the node checks the password. It then removes the
   user's API keys, memberships, databases, and sessions in that order. Each
   system-DB transaction deletes at most `PAGE_MAX` rows. The last transaction
@@ -1226,8 +1228,9 @@ recreate a purged database.
   rejects deletion for the last enabled administrator and for the only owner of
   an organization. Each transaction checks these rules again. The caller's
   session stays valid until the final batch. If a node stops during deletion,
-  the user can retry with that session. Administrators disable and re-enable
-  accounts.
+  the user can retry with that session.
+
+  Administrators disable and re-enable accounts.
 - **Mailed links** (when the node has a mailer, §12): sign-up and
   `POST /v1/me/verify-email` mail a link that verifies the address;
   `POST /v1/auth/password-reset` mails a link that sets a new password,
@@ -1270,7 +1273,7 @@ recreate a purged database.
   - `reader`: reads data.
   - `writer`: reads and writes data and schemas.
   - `admin`: has `writer` access, creates and deletes databases, and manages
-    readers through admins.
+    `reader`, `writer`, and `admin` members.
   - `owner`: has all access, manages all members, and deletes the organization.
 
   An organization always has at least one owner. The node rejects any request

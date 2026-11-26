@@ -30,7 +30,8 @@ scope for v1.
 4. **Tenant resource isolation**
 
 - A tenant is the owner of a database: a user or an organization.
-- Each tenant's use of every resource counts against that tenant's share. Over its share, only that tenant's requests become slower or fail.
+- Each tenant has a guarantee and a limit for each resource. A tenant can always use its guarantee, and it can use idle capacity up to its limit.
+- If a node runs short of a resource, only the requests of tenants above their guarantee become slower or fail.
 
 5. **Testability.**
 

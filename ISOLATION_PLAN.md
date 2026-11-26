@@ -32,10 +32,10 @@ The contest taught these lessons:
 
 1. Each lease holder has its own lease identity. Today the identity belongs to
    the node (`Shared::node_id`).
-2. Each tenant's use of every resource counts against that tenant's share.
-   Resources are memory, CPU, caches, disk, store requests, and the work of
-   the trusted process and the system database. Over a share, only that
-   tenant's work becomes slower or fails.
+2. Each tenant can always use its guarantee of every resource. Resources are
+   memory, CPU, caches, disk, store requests, and the work of the trusted
+   process and the system database. If a node runs short, only the work of
+   tenants above their guarantee becomes slower or fails.
 
 ## Crate layout
 
@@ -189,14 +189,20 @@ At this point the only difference between the designs is the boundary.
 - [ ] Build the chosen mechanism. It must see every allocation and all CPU use,
       including those of dependencies. A counter in our code cannot. The number
       of PRs depends on the mechanism.
-- [ ] Add the soft memory limit: a gauge at the admission point of each
-      boundary. The gauge reads live heap bytes from a counting global
-      allocator. Above a fixed share of the bound, new requests get a retryable 503. Do not use `memory.high`: in `iso3/cgroup` it stalled work for 120 s.
-- [ ] Test the bound with workloads that nobody reviewed.
+- [ ] Give each worker a guarantee and a limit. With cgroups, these are
+      `memory.low` and `memory.max`, and `cpu.weight` and `cpu.max`. A node
+      starts a worker only if the guarantees of its running workers and the new
+      worker fit in the node. Otherwise it returns a retryable 503.
+- [ ] Add the soft memory limit: a gauge at the admission point of each worker.
+      The gauge reads live heap bytes from a counting global allocator. A new
+      request gets a retryable 503 if its tenant is near its limit, or if the
+      node runs short and its tenant is above its guarantee. Do not use
+      `memory.high`: in `iso3/cgroup` it stalled work for 120 s.
+- [ ] Test the guarantees and limits with workloads that nobody reviewed.
 - [ ] Remove the memory counter (`engine/memory.rs`). This also removes the
       fair share of memory among the users of an organization.
 
-### 5. Give each tenant a share of the caches and the store
+### 5. Give each tenant a guarantee and a limit for the caches and the store
 
 The right method depends on the mechanism from milestone 4.
 
@@ -213,10 +219,12 @@ The right method depends on the mechanism from milestone 4.
 
 ## Decisions for the user
 
-- The memory bound for each tenant. The contest used 512 MiB. A higher bound
-  lets larger operations succeed, but it also lets a tenant take more of the
-  node. Also decide whether the bound applies to each tenant on each node, or
-  to each tenant across the cluster. Today a single event query can use 1 GiB.
+- The guarantee and the limit of each tenant. A larger guarantee lets fewer
+  tenants run on a node. A larger limit lets larger operations succeed, but a
+  tenant above its guarantee can then hold more idle capacity. The contest used
+  a limit of 512 MiB. Also decide whether the numbers apply to each tenant on
+  each node, or to each tenant across the cluster. Today a single event query
+  can use 1 GiB.
   In the contest, the worker pool at 512 MiB returned an error for a query in
   19 of 40 runs, and today's code answered all 40.
 - The deployment requirement. The worker pool needs Linux with a delegated
@@ -225,13 +233,16 @@ The right method depends on the mechanism from milestone 4.
 Decided:
 
 - Fairness among the users of an organization is not necessary for now
-  (2026-11-25). All users of an organization share the bound of the
-  organization. One user can fill it, and then the other users get retryable
-  503s.
-- Each owner gets a share (2026-11-25). A user can create up to 100
-  organizations, and each organization is an owner. This is not a problem in
-  practice: each installation has a single organization, or it charges for each
-  organization.
+  (2026-11-25). All users of an organization share the guarantee and the
+  limit of the organization. One user can fill them, and then the other users
+  get retryable 503s.
+- Each owner gets a guarantee and a limit (2026-11-25). A user can create up
+  to 100 organizations, and each organization is an owner. This is not a
+  problem in practice: each installation has a single organization, or it
+  charges for each organization.
+- A tenant's resources follow the industry model of guarantees and limits
+  (2026-11-25), as in the requests and limits of Kubernetes. Guarantees are
+  never overcommitted. Limits can be overcommitted.
 - The goal isolates resources, not data access (2026-11-25). Every worker uses
   the same store credentials. The goal is named "Tenant resource isolation", so
   that it makes no promise about data.

@@ -72,10 +72,8 @@ called the model.
   Fable 3): accepted.
 - The failure contract if a worker stops (Fable 4): accepted.
 - `engine/` also imports `timing` (Fable 5): accepted.
-- What a share is, and who gets one (Opus 1, Fable 1): open tradeoff in
-  `TRADEOFFS.md`.
-- Isolation of data access (Fable, outside the questions): open tradeoff in
-  `TRADEOFFS.md`.
+- What a share is, and who gets one (Opus 1, Fable 1): decided by the user.
+- Isolation of data access (Fable, outside the questions): decided by the user.
 - Frames in their own crate, and the `cargo tree` check misses the simulator
   (Opus 5): rejected. The frames no longer exist, and the check works for each
   crate, so it also covers the simulator.
@@ -86,5 +84,5 @@ called the model.
   for it.
 - Delete the decisions section of this brief (Fable): rejected. This file is
   temporary, and that section informs the reviewers.
-- Push `iso/base` and `iso/floor`, which the plan cites (Fable 5): asked the
-  user.
+- Push `iso/base` and `iso/floor`, which the plan cites (Fable 5): pushed, at
+  the request of the user.

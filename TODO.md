@@ -652,8 +652,8 @@ only.
       across all tenants. The LSM tree keeps deleted rows as tombstones.
       Compaction triggers ignore tombstone density. Range scans must skip those
       tombstones. In a probe test, creating and deleting 80,000 API keys
-      increased batch key deletion time from 0.02 ms to 7.4 ms. After 30
-      minutes of idle time, the scan still took 7.4 ms. `Txn::cost` counts only
+      increased batch key deletion time from 0.02 ms to 7.4 ms. The
+      slowdown remained after 30 minutes of idle time. `Txn::cost` counts only
       live entries. The metadata cost test misses tombstone scans.
 - [ ] [untriaged · Tenant isolation] **Limit API keys and sessions per user.**
       A tenant can create unlimited API keys and sessions in the shared system

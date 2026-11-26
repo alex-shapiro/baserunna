@@ -89,7 +89,7 @@ impl OpenTxns {
         self.open.lock().values().filter(|t| t.db_id == db_id).count()
     }
 
-    /// Enforces the node memory budget for a transaction for `user_id` on `db_id`.
+    /// Enforces the node memory budget for `user_id`'s transaction on `db_id`.
     ///
     /// Unloads idle databases and evicts idle transactions or running queries with
     /// [`memory::fair_admission`] if memory exceeds the budget.
@@ -227,7 +227,7 @@ impl OpenTxns {
         Ok(open)
     }
 
-    /// Removes a started commit record for `txn_id` after a commit fails before applying.
+    /// Removes the started-commit record for `txn_id` after its commit fails without taking effect.
     pub fn forget_started_commit(&self, txn_id: &str) {
         self.started_commits.remove(&txn_id.to_string());
     }
@@ -259,7 +259,9 @@ impl OpenTxns {
         self.abort_locked(open, &mut g, reason)
     }
 
-    /// Aborts `txn` under its lock and records `reason` before unlocking so concurrent waiters see it.
+    /// Aborts `txn` under its lock.
+    ///
+    /// Records `reason` before unlocking so concurrent waiters see the abort reason.
     fn abort_locked(&self, open: &OpenTxn, txn: &mut Option<Txn>, reason: &'static str) -> bool {
         let aborted = txn.take().is_some();
         if aborted {

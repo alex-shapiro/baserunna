@@ -55,7 +55,7 @@ const RULES: &[(&str, &[&str], &str)] = &[
     ("thread_rng", &[], "obtain randomness from Env"),
 ];
 
-/// Workspace library crates included in the source lints.
+/// Workspace library crates that the source lints check.
 ///
 /// `baserunna-client` runs inside simulations, so it follows the same rules.
 const LINTED_CRATES: &[&str] =

@@ -1,7 +1,8 @@
 # Isolation baseline: `main` at `df5196d`
 
 `main` passes 1 of 8 workloads. Exhausted memory causes the kernel to stop the
-node in 5 attacks. Victim p99 latency is 14x to 51x higher in 2 attacks.
+node in 4 attacks, and in some runs of a fifth. Victim p99 latency is 14x to 51x
+higher in 2 attacks.
 
 ## Setup
 
@@ -20,7 +21,7 @@ node in 5 attacks. Victim p99 latency is 14x to 51x higher in 2 attacks.
 | `blob_checks`         | pass; node used 1,050 MiB extra memory | pass                     |
 | `blob_downloads`      | out of memory; kernel stopped node     | 1 run failed criterion 3 |
 | `bulk_inserts`        | out of memory; kernel stopped node     | pass                     |
-| `long_strings`        | out of memory; kernel stopped node     | pass                     |
+| `long_strings`        | out of memory in some runs (see below) | pass                     |
 | `merges`              | out of memory; kernel stopped node     | pass                     |
 | `stream_filter_scans` | victim p99: 56 ms to 2,629–2,846 ms    | pass                     |
 | `table_filter_scans`  | victim p99: 52 ms to 716–818 ms        | pass                     |
@@ -28,6 +29,13 @@ node in 5 attacks. Victim p99 latency is 14x to 51x higher in 2 attacks.
 
 - `blob_checks` passes only because the pass criteria do not limit tenant memory
   yet. A single tenant used 1,050 MiB of the node's 1,536 MiB limit.
+- `long_strings` is at the node memory limit, so the kernel stops the node in
+  only some runs. A later check with a 3 GiB limit measured phase C peaks of
+  1,397 to 1,576 MiB across 6 runs. Only 1 run exceeded 1,536 MiB. The failure
+  that occurs in every run is different: node memory grows by 750 to 900 MiB
+  during the attack query, but the query's budget is 256 MiB. The node then
+  rejects the query with HTTP 413. The pass criteria do not detect this. The
+  simulator memory model in milestone 0 will detect it.
 - The failed small run of `blob_downloads` exceeded its 106 ms p99 limit by
   3 ms. During this run, the victim sent about 470 requests. Because the sample
   is small, the p99 is the fifth-slowest request. A single slow request can

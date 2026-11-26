@@ -29,16 +29,16 @@ scope for v1.
 
 4. **Tenant resource isolation**
 
-- A tenant is the owner of a database: a user or an organization.
-- Each tenant has a limit for each resource. A tenant cannot use more than its limit, and it cannot crash a node.
-- Each limit has a default. An administrator can change the limits of each tenant.
-- If a node runs short of memory, the work of the tenant that uses the most memory stops first.
-- Linux enforces the limits. Other systems, such as macOS for development, run without enforcement.
+- A tenant is a database owner: a user or an organization.
+- Each tenant has a limit for each resource. The node keeps each tenant within its limits. A tenant cannot crash a node.
+- Each limit has a default value. An administrator can change the limits for each tenant.
+- If a node does not have enough memory, it stops the work of the tenant that uses the most memory first.
+- Linux enforces these limits. Other operating systems do not enforce them.
 
 5. **Testability.**
 
 - The service runs and is tested inside a deterministic simulator with fault injection.
-- The simulator tests tenant resource isolation with faults that stop the work of a tenant at any time, as a resource limit does. A test harness outside the simulator tests the limits of the kernel or the runtime.
+- The simulator tests isolation recovery by stopping tenant work at any time. A separate test harness tests real resource limits outside the simulator.
 
 6. **Perf, within reason.**
 

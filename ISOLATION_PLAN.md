@@ -1,261 +1,269 @@
 # Tenant Resource Isolation Plan
 
-This plan builds the tenant resource isolation goal in SPEC §1. The work is a series of
-small PRs to `main`. Each PR is useful by itself, passes the simulator, and leaves
-`main` in a working state.
+This plan isolates each tenant in a separate worker process with Linux cgroup
+limits to meet the tenant resource isolation goal in SPEC §1. Each tenant is a
+database owner: the user or organization in the `owner_id` column of the
+`databases` table in SPEC §8.
 
-A tenant is the owner of a database: the user or organization in the
-`owner_id` column of the `databases` table (SPEC §8).
-
-`TODO.md` tracks bugs. This file tracks the epic. If a PR in this plan fixes a
-`TODO.md` item, the PR also removes that item.
+We will ship this work as small PRs to `main`. Each PR is useful on its own,
+passes the simulator, and leaves `main` working. `TODO.md` lists bugs, and this
+file lists the isolation milestones. When a PR fixes a bug in `TODO.md`, remove
+that item in the same PR.
 
 ## Background
 
-A design contest tried to build isolation in a few fixed-length rounds.
-No design qualified. The report is `reports/tenant-isolation.md` on branch
+We ran a design contest to build isolation in fixed-length rounds. None of the
+designs qualified. The report is in `reports/tenant-isolation.md` on branch
 `iso/base`.
 
-The contest taught these lessons:
+We learned three lessons from the contest:
 
-- The storage engine needs few changes. In the best build, `iso3/cgroup`,
-  most of the engine stayed the same. Each worker ran the same `Engine` code.
-- The node shell needs large changes. Startup, routing, metadata commands,
-  and the system database all change where they run.
-- Correctness is the largest risk. In commit 90fd667, two processes used the
-  same lease identity. The node then served stale reads after concurrent
-  database creates.
+- The storage engine needs few changes. In `iso3/cgroup`, each worker ran the
+  existing `Engine` code with minimal edits.
+- The node shell needs large changes. We must split startup, routing, metadata
+  commands, and the system database across the server and workers.
+- Correctness is the largest risk. In commit `90fd667`, two processes shared
+  the same lease identity. The node then served stale reads after concurrent
+  database creation.
 
 ## Invariants
 
-`main` does not enforce these invariants today.
+The finished system enforces two invariants. `main` does not enforce them yet.
 
-1. Each lease holder has its own lease identity. Today the identity belongs to
-   the node (`Shared::node_id`).
-2. No tenant uses more than its limit of any resource. Resources are memory,
-   CPU, caches, disk, store requests, and the work of the trusted process and
-   the system database. If a node runs short of memory, the work of the tenant
-   that uses the most memory stops first.
+1. Each lease holder has a unique lease identity. Today, all work on a node
+   shares `Shared::node_id`.
+2. The node keeps each tenant within its limit for every resource:
+   - Memory and CPU
+   - Block and disk caches
+   - Object store requests
+   - Shared server and system database work
+
+   If a node does not have enough memory, the kernel stops the work of the
+   tenant that uses the most memory first.
 
 ## Crate layout
 
-Split the `baserunna` crate into four crates:
+We will split the `baserunna` crate into four crates so the server binary
+cannot link the storage engine or open a tenant database:
 
-1. `baserunna-util`: the modules that the other crates share: `error`, `log`,
-   `env`, `util`, `metrics`, `probe`, `timing`, `buggify`, and the `Transport`
-   trait.
-2. `baserunna-storage`: the storage engine and the database features. It
-   depends on `baserunna-util`.
-3. `baserunna-worker`: the request handlers and the background jobs of each
-   tenant. All tenant work runs in this crate. It depends on
-   `baserunna-storage` and `baserunna-util`.
-4. `baserunna-server`: connections, authentication, and the routing of each
-   request to a worker. It depends on `baserunna-util`. It does not depend on
-   `baserunna-storage`.
+1. `baserunna-util`: shared support modules and the `Transport` trait.
+2. `baserunna-storage`: the storage engine and database features. It depends on
+   `baserunna-util`.
+3. `baserunna-worker`: tenant request handlers and background jobs. All tenant
+   work runs in this crate. It depends on `baserunna-storage` and
+   `baserunna-util`.
+4. `baserunna-server`: network connections, authentication, and request
+   routing. It depends only on `baserunna-util`.
 
-`baserunna-server` and `baserunna-worker` each build their own binary. The
-server process cannot open a database, because its binary does not link
-`baserunna-storage`. A CI check on `cargo tree` keeps that dependency out. This
-check replaces the store guard from milestone 3.
+Cargo builds separate binaries for `baserunna-server` and `baserunna-worker`.
+Because `baserunna-server` links only `baserunna-util`, the server process
+cannot open a database. A `cargo tree` check in CI enforces this dependency
+rule. That check replaces the store guard from milestone 3.
 
-The split of the storage engine is easy. Today `engine/` imports only `store`,
-`util`, `probe`, `error`, `buggify`, `env`, `metrics`, `log`, and `timing`.
+Extracting the storage engine is straightforward. Today `engine/` depends only on
+`store` and the shared support modules moving into `baserunna-util`.
 
 ## Milestones
 
-A milestone is a group of PRs. The PR counts are estimates. Each milestone ends
-with a run of the harness from milestone 0. Record the results in this file.
+Each milestone is a group of PRs. After each milestone, run the isolation
+harness from milestone 0. Record the results in this file.
 
-Milestone 0 comes first. Milestones 1 to 3 do not depend on each other. Start
-them in any order. Milestone 4 needs milestone 3. Milestone 5 comes last.
+Milestone 0 comes first. Milestones 1 to 3 are independent, so you can start
+them in any order. Milestone 4 depends on milestone 3. Milestone 5 comes last.
 
 ### 0. Measure isolation on `main`
 
-The isolation harness from the contest measures whether a victim tenant keeps
-working while an attacker tenant runs a workload. It is on branch `iso/base`
-(`crates/baserunna/examples/isolation/`, `scripts/isolation/run.sh`). A
-workload passes if these conditions hold:
+The isolation harness from the contest checks whether a victim tenant keeps
+serving requests while an attacker tenant runs a heavy workload. The harness is
+on branch `iso/base` at `crates/baserunna/examples/isolation/` and
+`scripts/isolation/run.sh`.
 
-- The node continues to run.
-- The victim has no failed requests.
-- The p99 latency of the victim stays within the larger of two limits: 2 times
-  its p99 alone, or its p99 alone plus 50 ms.
-- Requests over a limit get HTTP errors.
+A workload passes if it meets all five criteria:
+
+- The node stays up.
+- All victim requests succeed.
+- The victim p99 latency stays within the larger of twice its baseline p99 or
+  its baseline p99 plus 50 ms.
+- The server returns an HTTP error for requests that exceed a limit.
 - A small variant of the workload succeeds.
 
-- [ ] Move the harness and its pass conditions to `main`. Record the result for
-      each workload on `main` today.
+Tasks:
 
-### 1. Make each operation fit in a fixed amount of memory
+- [ ] Move the isolation harness and its pass criteria to `main`. Record the
+      baseline result for each workload on `main`.
 
-Isolation does not need this milestone. Under a boundary, an operation without
-a bound gets an error at the owner's limit, and the node continues to run. This
-milestone makes those operations succeed. It also helps users today.
+### 1. Bound memory use for each operation
 
-Each PR adds a test of the form "a request of size N uses at most k × N + C
-bytes".
+This milestone bounds per-operation memory so large requests succeed within a
+tenant limit. These changes also protect users on `main` today. Process
+isolation does not require this milestone. Under cgroup limits, an unbounded
+operation fails at the tenant limit while the node stays up.
 
-- [ ] Move the counting allocator into `tests/support/`. Today
-      `memory_bound.rs`, `event_ingest_limits.rs`, and `event_query_limits.rs`
-      each have a copy.
-- [ ] Parse JSON request bodies as a stream: KV and transaction ops. TODO:
-      "Stream JSON request bodies and charge bulk insert memory".
-- [ ] Parse JSON request bodies as a stream: event rows. Same TODO item.
-- [ ] Bound the rows that a bulk insert holds before a flush. Same TODO item.
-- [ ] Limit the partitions of a bulk insert. TODO: "Limit partitions per bulk
-      insert".
-- [ ] Merge parts block by block. This PR is the largest, and it can become two
-      PRs. TODO: "Bound memory usage during part merges".
-- [ ] Limit event maintenance across the node. TODO: "Limit event maintenance
-      concurrency across the node".
-- [ ] Estimate string column memory from the real lengths. TODO: "Estimate
-      granule run memory from actual string lengths".
-- [ ] Compare blob values chunk by chunk in `check` ops (`ops.rs`).
-- [ ] Bound the total bytes of results that a transaction keeps (`ops.rs`).
-- [ ] Limit the blob chunks that downloads hold at the same time
-      (`api/body.rs`).
-- [ ] Stream bodies through the node. Bound `BUFFER_FORWARD_MAX` and the
-      responses in `ForwardDedup`.
-- [ ] Add connection limits. Set the header and buffer limits of hyper in the
-      code (`main.rs`).
-- [ ] Time out stalled request bodies. TODO: "Time out stalled request bodies".
+Each PR adds a test verifying that a request of size `N` uses at most
+`k * N + C` bytes.
 
-### 2. Give each metadata command a fixed maximum cost
+- [ ] Share one counting allocator in `tests/support/` instead of keeping
+      copies in `memory_bound.rs`, `event_ingest_limits.rs`, and
+      `event_query_limits.rs`.
+- [ ] Stream-parse JSON request bodies for KV and transaction operations. Part
+      of `TODO.md`: "Stream JSON request bodies and charge bulk insert memory".
+- [ ] Stream-parse JSON request bodies for event rows. Part of the same
+      `TODO.md` item.
+- [ ] Bound the buffered rows that a bulk insert holds before flushing. Part of
+      the same `TODO.md` item.
+- [ ] Limit partitions per bulk insert. Matches `TODO.md`: "Limit partitions
+      per bulk insert".
+- [ ] Merge parts block by block. Split this work into two PRs if needed.
+      Matches `TODO.md`: "Bound memory usage during part merges".
+- [ ] Limit event maintenance concurrency across the node. Matches `TODO.md`:
+      "Limit event maintenance concurrency across the node".
+- [ ] Estimate string column memory from actual string lengths. Matches
+      `TODO.md`: "Estimate granule run memory from actual string lengths".
+- [ ] Compare blob values chunk by chunk in `check` operations in `ops.rs`.
+- [ ] Bound total result bytes retained by a transaction in `ops.rs`.
+- [ ] Limit concurrent buffered blob chunks during downloads in `api/body.rs`.
+- [ ] Stream forwarded request and response bodies through the node. Bound
+      `BUFFER_FORWARD_MAX` and cached responses in `ForwardDedup`.
+- [ ] Add connection limits and configure Hyper header and buffer limits in
+      `main.rs`.
+- [ ] Time out stalled request bodies. Matches `TODO.md`: "Time out stalled
+      request bodies".
 
-A per-tenant boundary does not fit metadata commands. All of them go through
-the single lease holder of the system database. Many of them also read the data
-of more than one owner. For example, `create_db` for an organization reads the
-role of the user in that organization. So the lease holder admits each command
-at a fixed maximum cost, and it serves tenants fairly.
+### 2. Bound metadata command cost
 
-A limit remains: the total rate of metadata writes in the cluster has a
-ceiling. This is a limit on scale, not on isolation.
+The system database lease holder runs all metadata commands. It caps the cost
+of each command and schedules tenants fairly. Per-tenant workers cannot isolate
+metadata commands because one lease holder runs all of them and many commands
+read across owners. For example, `create_db` for an organization reads the
+caller's role in that organization.
 
-- [ ] Add a length limit to each field of each metadata command. Most fields
-      have a limit today. The Google `sub` value does not.
-- [ ] Add a test that each command reads and writes at most a fixed number of
-      rows and bytes. Commands that delete many rows already work in batches of
-      `PAGE_MAX` rows.
-- [ ] Add a fair queue at the lease holder of the system database, before it
-      runs a command. Use a queue for each account, and a queue for each client
-      address before sign-in.
+The cluster still has a ceiling on total metadata write throughput. That
+ceiling limits scale rather than isolation.
+
+- [ ] Enforce a length limit on every metadata command field, including the
+      Google `sub` field.
+- [ ] Test that every metadata command reads and writes at most a fixed number
+      of rows and bytes. Multi-row deletes already run in batches of `PAGE_MAX`
+      rows.
+- [ ] Add a fair queue at the system database lease holder before command
+      execution. Queue authenticated requests by account and unauthenticated
+      requests by client IP address.
 
 ### 3. Run tenant work in workers
 
-A worker belongs to a node. It runs the databases of a single owner on that
-node. The server of the node sends each database request to the worker of its
-owner through the `Transport` trait (`cluster.rs`), which nodes already use to
-forward requests to each other. So the boundary protocol is HTTP. Peers see
-only nodes. The worker routes requests to peers and holds leases, as a node
-does today.
+Each node manages a pool of workers. A worker serves the databases of a single
+owner on that node. The node server forwards each database request to the
+owner's worker over HTTP through the `Transport` trait in `cluster.rs`. Nodes
+already use `Transport` to forward requests to peers. Peers see only nodes.
+Each worker forwards requests to peers and holds leases just like a node does
+today.
 
-The lease identity of a worker is the node ID plus a suffix that is new each
-time the worker starts. This keeps invariant 1, and a peer still finds the node
-from the identity. In this milestone, the workers run in the process of the
-server. Milestone 4 moves each worker into its own process.
+Each worker creates a lease identity by appending a fresh suffix to the node ID
+on startup. That suffix satisfies invariant 1. Peers still derive the owning
+node from the prefix. In this milestone, workers run inside the server process.
+Milestone 4 moves each worker into its own OS process.
 
-If a worker stops, all requests in flight for that owner on that node fail.
-The writes of its databases pause until their leases expire, for at most one
-lease period. SPEC §1 allows the same pause after a node stops.
+If a worker stops, all in-flight requests for that owner on that node fail.
+Databases owned by that worker cannot accept writes until their leases expire,
+which takes at most one lease period. SPEC §1 allows the same write pause after
+a node stops.
 
-- [ ] Move the shared modules into `baserunna-util`, and the storage engine and
-      the database features into `baserunna-storage`.
-- [ ] Send each database request to an in-process worker for its owner. Each
-      worker has its own `Engine` and lease identity. The background jobs of
-      each database run in its worker. The server sends the authenticated
-      principal with the request, and it streams each body. The simulator runs
-      the workers inside each simulated node.
-- [ ] Stop a worker after it is idle for a fixed time. It releases its leases
-      before it stops.
-- [ ] Add a store guard on the server side. It fails each read of a tenant
-      object, in tests and in the simulator.
-- [ ] Run the system database in its own worker. Metadata commands and the
-      account and organization routes run there. Authentication and routing get
-      metadata records from it.
+- [ ] Move shared modules into `baserunna-util`. Move the storage engine and
+      database features into `baserunna-storage`.
+- [ ] Route each database request to an in-process worker for its owner. Give
+      each worker its own `Engine`, lease identity, and background jobs. Pass
+      the authenticated principal with each request and stream request and
+      response bodies. Run workers inside each simulated node.
+- [ ] Stop idle workers after a fixed timeout. Release all held leases before
+      stopping.
+- [ ] Add a server-side store guard that rejects reads of tenant objects in
+      tests and in the simulator.
+- [ ] Run the system database in its own worker. Handle metadata commands,
+      account routes, and organization routes in that worker. Fetch metadata
+      records from it for authentication and routing.
 - [ ] Move connections, authentication, and routing into `baserunna-server`.
-      Add the `cargo tree` check. Rename the rest of the `baserunna` crate to
+      Add the `cargo tree` CI check. Rename the remaining `baserunna` crate to
       `baserunna-worker`.
 
 ### 4. Run each worker in its own process
 
-Each worker runs in its own process, in a cgroup for its owner. The kernel
-enforces the limits of the cgroup, so the limits cover every allocation and all
-CPU use, including those of dependencies. A counter in our code cannot.
+Each worker runs in its own OS process inside a per-owner Linux cgroup. The
+kernel enforces cgroup limits across all memory allocations and CPU time,
+including third-party dependencies. In-process counters miss allocations
+outside our tracking code.
 
-- [ ] Before any measurement, record the results that the worker pool must
-      reach. Use absolute numbers, not percentages. Include these measurements:
-  - CPU time for each request
-  - the latency of a hot read
-  - memory and CPU with 1,000 active owners on a node
-  - the time of each event query in the harness
-  - the results of the harness from milestone 0
+- [ ] Record absolute target numbers for the worker pool before running
+      benchmarks. Include these metrics:
+  - CPU time per request
+  - Hot read latency
+  - Memory and CPU usage with 1,000 active owners on a node
+  - Duration of each event query in the harness
+  - Milestone 0 isolation harness results
 
-  Known number: an empty round trip over a Unix socket adds 25.6 µs of CPU for
-  each request (`BENCH_BOUNDARY` on branch `iso/floor`).
+  Baseline reference: an empty Unix socket round trip adds 25.6 µs of CPU time
+  per request, measured by `BENCH_BOUNDARY` on branch `iso/floor`.
 - [ ] Find the cause of the 81% loss of KV throughput in `iso3/cgroup`.
-- [ ] Run each worker from milestone 3 in its own process, and measure it. If
-      it misses a recorded result, stop and review the plan.
-- [ ] Give each worker a limit. With cgroups, these are `memory.max` and
-      `cpu.max`, and each worker has the same `cpu.weight`. On a host without
-      cgroup v2, such as macOS, workers run without limits, and the server logs
-      a warning at start.
-- [ ] Give each limit a default, and let an administrator override the limits
-      of each owner. The system database stores each override. If an
-      administrator changes a limit, the server writes the new value to the
-      cgroup of the running worker at once. Choose the defaults from the
-      harness results. Today a single event query can use 1 GiB. In the
-      contest, the worker pool at 512 MiB returned an error for a query in 19
-      of 40 runs, and today's code answered all 40.
-- [ ] Add the soft memory limit: a gauge at the admission point of each worker.
-      The gauge reads live heap bytes from a counting global allocator. A new
-      request gets a retryable 503 if its tenant is near its limit. Do not use
-      `memory.high`: in `iso3/cgroup` it stalled work for 120 s.
-- [ ] Put the cgroup of each owner inside a single `tenants` cgroup. Its
-      `memory.max` is the memory of the node minus a reserve for the server and
-      the system worker. Set `memory.oom.group` on the cgroup of each owner. If
-      the tenants together run short of memory, the kernel stops the worker
-      that uses the most memory. It cannot stop the server or the system
-      worker, because they are outside the `tenants` cgroup.
-- [ ] Test the limits with workloads that nobody reviewed.
-- [ ] Remove the memory counter (`engine/memory.rs`). This also removes the
-      fair share of memory among the users of an organization.
+- [ ] Move each worker from milestone 3 into its own process and benchmark it.
+      If any metric misses its target, stop and revise the plan.
+- [ ] Enforce `memory.max` and `cpu.max` on each owner cgroup, and assign an
+      equal `cpu.weight` to each worker. On hosts without cgroup v2, run
+      workers without limits and log a startup warning.
+- [ ] Define default limits from the harness results and let administrators
+      store per-owner overrides in the system database. Apply limit updates
+      immediately to the running worker's cgroup. Note that a single event
+      query can use 1 GiB today. In the contest, a 512 MiB worker limit failed
+      19 of 40 event query runs that succeeded on `main`.
+- [ ] Add a soft memory limit at worker request admission. Read live heap bytes
+      from a counting global allocator and return HTTP 503 if the worker is
+      near its memory limit. Avoid cgroup `memory.high`, which stalled workers
+      for 120 s in `iso3/cgroup`.
+- [ ] Place every owner cgroup inside a parent `tenants` cgroup. Set
+      `memory.max` on `tenants` to total node memory minus a reserve for the
+      server and the system worker. Enable `memory.oom.group` on each owner
+      cgroup. If total tenant memory exceeds this limit, the kernel kills the
+      worker using the most memory while leaving the server and system worker
+      running.
+- [ ] Test the limits with unseen adversarial workloads.
+- [ ] Remove the in-process memory counter in `engine/memory.rs`. Removing it
+      also removes per-user memory fairness within an organization.
 
-### 5. Give each tenant a limit for the caches and the store
+### 5. Limit per-tenant cache and object store usage
 
-- [ ] Block cache
-- [ ] Disk cache
-- [ ] Store requests
+- [ ] Limit per-tenant block cache usage.
+- [ ] Limit per-tenant disk cache usage.
+- [ ] Limit per-tenant object store request rates.
 
 ## Rules for each PR
 
-- Each PR merges to `main` by itself and passes the simulator.
-- Each PR does not change the algorithm of an operation unless the PR is about
-  that algorithm.
-- The plan has no fixed time limit.
+- Make each PR self-contained so we can merge it to `main` independently.
+- Ensure every PR passes the simulator.
+- Keep operation algorithms unchanged unless the PR targets that algorithm.
+- Run this plan without a fixed deadline.
 
 ## Decisions
 
-- Each limit has a default, and an administrator can override the limits of
-  each owner (2026-11-25). For example, a paying customer can get larger limits
-  than a free customer.
-- The worker pool is the only mechanism (2026-11-25). The workers from
-  milestone 3 cannot compile to WebAssembly, and in the contest the WebAssembly
-  sandbox ran event queries 1.4 to 9.0 times slower.
-- Only Linux enforces the limits (2026-11-25). Enforcement needs a delegated
-  cgroup v2 subtree. macOS stays supported for development, without
-  enforcement.
-- Fairness among the users of an organization is not necessary for now
-  (2026-11-25). All users of an organization share the limit of the
-  organization. One user can fill it, and then the other users get retryable
-  503s.
-- Each owner gets a limit (2026-11-25). A user can create up to 100
-  organizations, and each organization is an owner. This is not a problem in
-  practice: each installation has a single organization, or it charges for each
-  organization.
-- Workers belong to nodes (2026-11-25). Peers see only nodes, and membership,
-  routing, and placement do not change.
-- Each tenant has limits, not guarantees (2026-11-25). A guarantee needs a
-  scheduler that places work by capacity, and the nodes do not have one.
-- The goal isolates resources, not data access (2026-11-25). Every worker uses
-  the same store credentials. The goal is named "Tenant resource isolation", so
-  that it makes no promise about data.
+### 2026-11-25
+
+- **Default limits with per-owner overrides.** Administrators can assign higher
+  limits to paying customers than to free customers.
+- **Process worker pools only.** Milestone 3 workers cannot compile to
+  WebAssembly. In the contest, the WebAssembly sandbox ran event queries 1.4 to
+  9.0 times slower.
+- **Linux-only enforcement.** Enforcement requires a delegated cgroup v2
+  subtree. Development on macOS remains supported without enforcement.
+- **Shared organization limits.** Users within an organization share the
+  organization's limits. We do not enforce fairness across users inside an
+  organization yet. If a user fills the limit, other users in that organization
+  receive retryable HTTP 503 errors.
+- **Per-owner limits.** A user can create up to 100 organizations, and each
+  organization is a separate owner. In practice, deployments either run a
+  single organization or bill per organization.
+- **Node-local workers.** Each node owns its workers locally. Peers see only
+  nodes. Cluster membership, routing, and placement stay unchanged.
+- **Limits without guarantees.** Tenants receive resource limits rather than
+  resource guarantees. Guarantees require a capacity-aware placement scheduler,
+  which Baserunna does not have.
+- **Resource isolation only.** This goal isolates compute and storage
+  resources, not data access. All workers share the same object store
+  credentials. The goal title states "Tenant resource isolation" to reflect
+  this scope.

@@ -1212,13 +1212,13 @@ recreate a purged database.
   their sessions and revoke one, or all but the current one.
 - **Account self-service** requires a signed-in session, not an API key.
 
-  To change a password, the node first checks the current password. The node
+  To change a password, the node checks the current password. The node
   counts failed checks toward the account's sign-in backoff. The node writes
   the new hash only if the stored hash still matches the checked hash. This
   check prevents two concurrent changes from succeeding. The node also ends all
   other sessions for the account.
 
-  To delete an account, the node first checks the password. It then removes the
+  To delete an account, the node checks the password. It then removes the
   user's API keys, memberships, databases, and sessions in that order. Each
   system-DB transaction deletes at most `PAGE_MAX` rows. The last transaction
   deletes the user row. The node marks each removed database manifest as

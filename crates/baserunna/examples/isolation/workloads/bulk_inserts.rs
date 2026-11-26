@@ -6,9 +6,8 @@
 //! sizes are the sizes that this rule gave on today's node in the VM: 142 node bytes per body byte
 //! for `{}` rows (7,560,000 bytes) and 20 for user event rows (30 MiB).
 //!
-//! The small variant sends one smaller body of each shape. Today's node completes it with growth
-//! under the 512 MiB tenant bound, so a node that refuses it refuses a legitimate insert. A 256 KiB
-//! probe insert reports the node bytes per body byte, as a measurement only.
+//! The small variant sends one smaller body of each shape. Today's node completes it, so a node
+//! that refuses it refuses a legitimate insert. A 256 KiB probe insert reports the node bytes per body byte, as a measurement only.
 
 use super::{AttackContext, AttackOutcome, Round, Variant, Workload, concurrent_posts};
 use crate::cgroup::MemorySampler;

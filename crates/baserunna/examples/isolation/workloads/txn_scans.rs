@@ -19,7 +19,7 @@ const KEYS: usize = 1000;
 const VALUE_BYTES: usize = 32 << 10;
 /// Puts per setup transaction: 8 MiB of writes, half of the 16 MiB transaction write limit.
 const PUTS_PER_TXN: usize = 256;
-/// Scan ops in one attack transaction: their values sum to 512 MiB, the tenant memory bound.
+/// Scan ops in one attack transaction: their values sum to 512 MiB, a third of the node cgroup.
 const ATTACK_SCANS: usize = 16;
 /// Concurrent attack transactions, as in the other workloads that send concurrent requests.
 const ATTACK_REQUESTS: usize = 4;

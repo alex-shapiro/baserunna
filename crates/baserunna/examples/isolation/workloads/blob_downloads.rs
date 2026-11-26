@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 /// Bytes of the blob: 3 chunks of the 8 MiB `blob_chunk_size`, so that each download sends more
 /// than one chunk, and below the 32 MiB `json_body_max` so that one `PUT` stores it.
 const BLOB_BYTES: usize = 24 << 20;
-/// Concurrent download clients in the attack. With one 8 MiB chunk each, they hold 1 GiB, twice
-/// the 512 MiB tenant memory bound.
+/// Concurrent download clients in the attack. With one 8 MiB chunk each, they hold 1 GiB, two
+/// thirds of the node cgroup.
 const ATTACK_CLIENTS: usize = 128;
 /// Duration of the attack in each round: long enough for many victim requests to meet it.
 const ATTACK_DURATION: Duration = Duration::from_secs(10);

@@ -104,6 +104,15 @@ impl WriteSet {
     }
 }
 
+/// Entries and bytes that a transaction read from its snapshot and staged for writing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TxnCost {
+    pub entries_read: usize,
+    pub bytes_read: usize,
+    pub entries_written: usize,
+    pub bytes_written: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct CommitRequest {
     pub commit_id: u64,
@@ -160,6 +169,8 @@ pub struct Txn {
     max_write_bytes: usize,
     read_bytes: usize,
     max_read_bytes: usize,
+    entries_read: usize,
+    entry_bytes_read: usize,
     charge: Charge,
     /// Admission gate for memory growth and the charged byte threshold for the next check.
     gate: Option<(Arc<dyn MemoryGate>, usize)>,
@@ -193,6 +204,8 @@ impl Txn {
             max_write_bytes,
             read_bytes: 0,
             max_read_bytes: max_write_bytes,
+            entries_read: 0,
+            entry_bytes_read: 0,
             charge,
             gate: None,
             appended: 0,
@@ -266,6 +279,21 @@ impl Txn {
         self.writes.is_empty()
     }
 
+    /// Returns the entries and bytes that this transaction has read from its snapshot and staged for writing.
+    pub fn cost(&self) -> TxnCost {
+        TxnCost {
+            entries_read: self.entries_read,
+            bytes_read: self.entry_bytes_read,
+            entries_written: self.writes.puts.len() + self.writes.range_deletes.len(),
+            bytes_written: self.write_bytes,
+        }
+    }
+
+    fn count_read(&mut self, e: &super::types::Entry) {
+        self.entries_read += 1;
+        self.entry_bytes_read += e.size();
+    }
+
     fn masked(&self, k: &[u8]) -> bool {
         self.writes.range_deletes.iter().any(|r| r.contains(k))
     }
@@ -289,6 +317,7 @@ impl Txn {
         }
         let found = self.snapshot.get(key, self.read_time).await?;
         if let Some(e) = &found {
+            self.count_read(e);
             self.read_expiry = earliest(self.read_expiry, e.expires);
         }
         Ok(found.map(Txn::stored))
@@ -341,6 +370,7 @@ impl Txn {
             };
             let mut merged: BTreeMap<Bytes, ReadValue> = BTreeMap::new();
             for e in snap {
+                self.count_read(&e);
                 if self.writes.puts.contains_key(&e.key) || self.masked(&e.key) {
                     continue;
                 }

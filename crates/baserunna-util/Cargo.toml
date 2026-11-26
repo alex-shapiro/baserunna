@@ -7,8 +7,8 @@ license.workspace = true
 
 [dependencies]
 baserunna-api.workspace = true
-aws-lc-rs = "1.18"
-axum-core = "0.5"
+aws-lc-rs.workspace = true
+axum-core.workspace = true
 http.workspace = true
 parking_lot.workspace = true
 serde.workspace = true

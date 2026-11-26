@@ -191,6 +191,17 @@ pub fn is_org_id(owner_id: &str) -> bool {
     owner_id.starts_with(ORG_ID_PREFIX)
 }
 
+/// Maximum length in bytes of a user, session, API key, or database ID in a request.
+pub const ID_MAX: usize = 64;
+
+/// Rejects an ID from a request that is longer than [`ID_MAX`] bytes.
+pub fn check_id(id: &str) -> Result<()> {
+    match id.len() <= ID_MAX {
+        true => Ok(()),
+        false => Err(Error::invalid(format!("IDs are at most {ID_MAX} bytes"))),
+    }
+}
+
 pub fn valid_db_name(s: &str) -> bool {
     valid_slug(s, 63)
 }
@@ -214,7 +225,7 @@ pub enum DbRef {
 impl DbRef {
     pub fn parse(s: &str) -> Option<DbRef> {
         if let Some(id) = s.strip_prefix("id:") {
-            return (!id.is_empty() && id.len() <= 64).then(|| DbRef::Id(id.to_string()));
+            return (!id.is_empty() && id.len() <= ID_MAX).then(|| DbRef::Id(id.to_string()));
         }
         match s.split_once('.') {
             Some((org, name)) => (org::valid_org_name(org) && valid_db_name(name))
@@ -465,20 +476,7 @@ pub enum MetaCmd {
     },
 }
 
-/// Maximum byte length of each text field in a [`MetaCmd`].
-pub const META_FIELD_MAX_BYTES: usize = 1024;
-
 impl MetaCmd {
-    /// Returns an error if any text field in the command is longer than [`META_FIELD_MAX_BYTES`] bytes.
-    fn check_field_lengths(&self) -> Result<()> {
-        let encoded =
-            serde_json::to_value(self).map_err(|e| Error::internal(format!("encode metadata command: {e}")))?;
-        match find_field_over_limit(&encoded, "") {
-            Some(field) => Err(Error::invalid(format!("field {field:?} is longer than {META_FIELD_MAX_BYTES} bytes"))),
-            None => Ok(()),
-        }
-    }
-
     pub fn name(&self) -> &'static str {
         match self {
             MetaCmd::Migrate => "migrate",
@@ -508,16 +506,6 @@ impl MetaCmd {
             MetaCmd::SetRole { .. } => "set_role",
             MetaCmd::RemoveMember { .. } => "remove_member",
         }
-    }
-}
-
-/// Returns the field name of the first string in `value` longer than [`META_FIELD_MAX_BYTES`] bytes.
-fn find_field_over_limit<'a>(value: &'a Json, field_name: &'a str) -> Option<&'a str> {
-    match value {
-        Json::String(text) => (text.len() > META_FIELD_MAX_BYTES).then_some(field_name),
-        Json::Object(fields) => fields.iter().find_map(|(name, field_value)| find_field_over_limit(field_value, name)),
-        Json::Array(items) => items.iter().find_map(|item| find_field_over_limit(item, field_name)),
-        Json::Null | Json::Bool(_) | Json::Number(_) => None,
     }
 }
 
@@ -1118,7 +1106,6 @@ fn answer<T: Serialize>(v: T) -> Result<Json> {
 
 /// Executes `cmd` within `txn` and returns its serialized result.
 pub async fn apply(txn: &mut Txn, blobs: &BlobResolver<'_>, cmd: &MetaCmd, now_ms: i64) -> Result<Json> {
-    cmd.check_field_lengths()?;
     let w = &mut Write { txn, blobs, now_ms };
     match cmd {
         MetaCmd::Migrate => answer(migrate(w).await?),

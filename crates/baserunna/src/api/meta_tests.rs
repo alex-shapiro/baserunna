@@ -1,20 +1,21 @@
 //! Tests for metadata commands through the HTTP API.
 
-use crate::meta::META_FIELD_MAX_BYTES;
+use super::META_BODY_MAX;
+use crate::meta::ID_MAX;
 use crate::sim::cost::World;
 use baserunna_util::run_paused;
 use bytes::Bytes;
 use serde_json::json;
 
 #[test]
-fn metadata_api_rejects_ids_longer_than_field_limit() {
+fn metadata_api_rejects_ids_longer_than_id_limit() {
     run_paused(async {
         let world = World::new(1, 1).await;
         let admin_token = world.signup(0, "admin@x.io").await;
         let org = world.json(0, "POST", "/v1/orgs", &admin_token, json!({"name": "acme"})).await;
         assert_eq!(org["name"], "acme", "{org}");
         for (id_len, expected_status, expected_code) in
-            [(META_FIELD_MAX_BYTES, 404, "not_found"), (META_FIELD_MAX_BYTES + 1, 400, "invalid_argument")]
+            [(ID_MAX, 404, "not_found"), (ID_MAX + 1, 400, "invalid_argument")]
         {
             let id = "a".repeat(id_len);
             for (method, path, body) in [
@@ -34,6 +35,22 @@ fn metadata_api_rejects_ids_longer_than_field_limit() {
                     response.json()
                 );
             }
+        }
+    });
+}
+
+#[test]
+fn metadata_api_rejects_bodies_over_body_limit() {
+    run_paused(async {
+        let world = World::new(1, 1).await;
+        let token = world.signup(0, "admin@x.io").await;
+        for path in ["/v1/api-keys", "/v1/orgs", "/v1/dbs"] {
+            let fits = json!({"name": "a".repeat(META_BODY_MAX - 100)}).to_string();
+            let response = world.call(0, "POST", path, &token, Bytes::from(fits)).await;
+            assert_eq!(response.status, 400, "POST {path} with a body under the limit: {:?}", response.json());
+            let too_large = json!({"name": "a".repeat(META_BODY_MAX)}).to_string();
+            let response = world.call(0, "POST", path, &token, Bytes::from(too_large)).await;
+            assert_eq!(response.status, 413, "POST {path} with a body over the limit: {:?}", response.json());
         }
     });
 }

@@ -1121,10 +1121,17 @@ keys) check that user's rights inside their own transaction: whether
 the user still exists and is enabled, and their role. Authorization of
 metadata changes is therefore serializable with the changes themselves.
 
-Each text field in a metadata command has a maximum length of 1024 bytes. The
-lease holder checks every text field before it reads rows. It checks fields
-from clients and external sources. If a field is longer than 1024 bytes, the
-lease holder rejects the command with `400 invalid_argument`.
+Routes that run metadata commands accept a request body of at most 64 KiB
+(`META_BODY_MAX`). The node stops reading a longer body and returns
+`413 too_large`. After the node parses the request, it rejects a text field
+that is over its length limit with `400 invalid_argument`:
+
+- Emails: 254 bytes
+- Passwords: 256 bytes
+- API key names: 100 bytes
+- Database names: 63 bytes
+- Organization names: 39 bytes
+- IDs in a URL path: 64 bytes (`ID_MAX`)
 
 Listings of users, sessions, API keys, organizations, members and
 databases are paginated (`limit`, default 100 and at most 1000, and

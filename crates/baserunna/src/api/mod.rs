@@ -47,6 +47,9 @@ pub fn error_json(e: &Error) -> Json {
 /// Maximum body size for `/internal/v1/events/bind`.
 const BIND_BODY_MAX: usize = 1 << 30;
 
+/// Maximum request body size in bytes for routes that run metadata commands.
+pub(crate) const META_BODY_MAX: usize = 64 * 1024;
+
 /// Reconstructs an [`Error`] from a JSON error response, falling back to `status`
 /// if the `error` object is missing.
 pub fn error_from_json(status: u16, j: &Json) -> Error {
@@ -1111,17 +1114,19 @@ pub fn router(node: Arc<Node>) -> Router {
         .merge(events::routes())
         .route_layer(middleware::from_fn_with_state(node.clone(), db_routing));
     let internal = Router::new()
-        .route("/internal/v1/meta", post(account::internal_meta))
+        .route("/internal/v1/meta", post(account::internal_meta).layer(DefaultBodyLimit::max(META_BODY_MAX)))
         .route("/internal/v1/notice", post(commit_notice))
         .route("/internal/v1/events/bind", post(events::internal_bind).layer(DefaultBodyLimit::max(BIND_BODY_MAX)))
         .route_layer(middleware::from_fn_with_state(node.clone(), internal_auth));
+    let meta_routes = account::routes()
+        .merge(orgs::routes())
+        .route(api::ListDbs::ROUTE, get(data::list_dbs).post(data::create_db))
+        .layer(DefaultBodyLimit::max(META_BODY_MAX));
     let r = Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/openapi.json", get(openapi))
         .endpoint::<api::GetLimits, _>(limits)
-        .merge(account::routes())
-        .merge(orgs::routes())
-        .route(api::ListDbs::ROUTE, get(data::list_dbs).post(data::create_db))
+        .merge(meta_routes)
         .merge(db_routes)
         .merge(internal)
         .merge(crate::console::routes())

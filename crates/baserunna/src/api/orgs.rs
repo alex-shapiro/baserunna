@@ -124,6 +124,7 @@ async fn set_role(
     JsonBody(b): JsonBody<SetRole>,
 ) -> Result<J> {
     p.require_session()?;
+    meta::check_id(&user)?;
     let (o, _) = node.resolve_org(&p, &name).await?;
     let cmd = MetaCmd::SetRole { org_id: o.id.clone(), actor: p.user.id.clone(), user_id: user.clone(), role: b.role };
     let m: MemberInfo = node.run_meta_as(cmd).await?;
@@ -138,6 +139,7 @@ async fn remove_member(
     _: Req<api::RemoveMember>,
 ) -> Result<Reply<api::RemoveMember>> {
     p.require_session()?;
+    meta::check_id(&user)?;
     let (o, _) = node.resolve_org(&p, &name).await?;
     node.run_meta(MetaCmd::RemoveMember { org_id: o.id.clone(), actor: p.user.id.clone(), user_id: user.clone() })
         .await?;

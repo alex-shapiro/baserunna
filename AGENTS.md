@@ -15,11 +15,11 @@ Design details are in [`SPEC.md`](SPEC.md).
 
 ## Requirements
 
-The only requirements are the goals and non-goals in section 1 of `SPEC.md`. Everything else describes the system as it is today. This includes the rest of `SPEC.md`, the tests, the code, the interfaces, and `TODO.md`. These documents can be wrong, and you can change them.
+Only the goals and non-goals in section 1 of `SPEC.md` are requirements. All other code, docs, and tests describe the current system. Any of them can be wrong. You can change them.
 
-- A test that asserts current behavior does not prove that the behavior is correct.
-- A design in `SPEC.md` is not a reason to keep that design. If a better design conflicts with `SPEC.md`, change `SPEC.md`.
-- If the code and `SPEC.md` disagree, do not assume that either one is correct. Decide which behavior serves users better.
+- A test that checks current behavior does not prove that the behavior is correct.
+- Do not keep a design only because `SPEC.md` describes it. Change `SPEC.md` if a better design conflicts with it.
+- If the code does not match `SPEC.md`, do not assume that either is correct. Choose the behavior that serves users better.
 
 ## Playbooks
 

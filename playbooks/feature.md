@@ -1,85 +1,90 @@
 # Playbook: Feature Development
 
-Your job is to make the product better. A feature request is a hypothesis about how to do that. Examine the hypothesis before you build anything.
+Your job is to improve the product. A feature request is a hypothesis about how to improve it. Test the hypothesis before you build anything.
 
-Judgment comes first in this playbook, and measurement serves judgment. The criterion that is easiest to measure is rarely the one that matters most. Never choose a focus area, a candidate, or a winner because it gives a number.
+Use judgment first. Use measurement only to support judgment. The easiest factor to measure rarely matters most. Do not choose a focus area, a candidate, or a winner only because you can measure it.
 
 ## 1. Decide Whether to Build It
 
-Before you write code, write `BRIEF.md` at the repository root. Answer these questions in plain words:
+Create `BRIEF.md` at the repository root before you write code. Answer these questions in plain words:
 
-- **Problem:** Who has the problem? What do they do today, and what does it cost them?
+- **Problem:** Who has the problem? What do they do today? What does that cost them?
 - **Necessity:** What happens if we do nothing? Is this the most important problem in this area?
-- **Request:** Is the request the real problem, or a proposed solution to a different problem?
-- **Precedent:** How do the best comparable systems solve this problem? If we plan to diverge from them, why is our way better?
-- **Cost:** What does the change cost? Consider new concepts that users must learn, new knobs, new failure modes, weaker guarantees, and code to maintain.
+- **Request:** Is the request the real problem, or a solution for a different problem?
+- **Precedent:** How do the best comparable systems solve this problem? If our design differs, why is our design better?
+- **Cost:** What does the change cost? Check these areas:
+  - New concepts that users must learn
+  - New options
+  - New failure modes
+  - Weaker guarantees
+  - Code to maintain
 - **Size:** What is the smallest change that solves most of the problem? Estimate its size in lines of code.
-- **Verdict:** Build it, build less, build something different, or do not build it. Give the reason.
+- **Verdict:** Choose a verdict: build it, build less, build something different, or do not build it. State your reason.
 
-Show the brief to the user. If the verdict is anything other than "build it", or if the design depends on a product choice, stop and wait for the user to decide. Otherwise, continue without waiting.
+Show the brief to the user. Stop and wait for the user if the verdict is not "build it". Also stop if the design depends on a product choice. Otherwise, continue.
 
 ## 2. Choose the Design
 
-List approaches that differ in kind, not only in parameters. Different constants for one approach make one candidate, not several. Always consider these approaches:
+List approaches that use different designs. Treat different constants for the same approach as a single candidate. Always consider these approaches:
 
 - Do less, or do nothing.
 - Change the interface or the spec instead of the implementation.
-- Delete a mechanism instead of adding one.
+- Delete a mechanism instead of adding a new mechanism.
 - Move the problem to a different layer: the client, the store, or the operating system.
 - Use the standard design from the best comparable system.
 
 Judge each approach with these questions, in this order:
 
 1. Does it solve the problem in the brief for a real user?
-2. Can you explain its behavior to a user in two sentences, and will the behavior surprise them?
+2. Can you explain its behavior to a user in two sentences? Will the behavior surprise them?
 3. Does it add concepts and mechanisms, or remove them?
 4. Would an expert in the field call it the standard design? If not, what makes ours better?
-5. How does it fail, and what does the user see when it fails?
+5. How does it fail? What does the user see if it fails?
 
-Decide by argument if reasoning can settle the choice. Write the argument in `BRIEF.md`.
+Decide by argument if you can settle the choice by reasoning. Write your argument in `BRIEF.md`.
 
 ### Contests
 
-Run a contest only if the choice depends on an empirical question that you cannot answer by reasoning. Examples are speed, memory use, and behavior under faults. Each contest criterion must be a property that the brief says users care about. Set each cost limit as an absolute amount that a user would notice, such as "adds at most 1 ms to a read". Do not use a percentage. A percentage of a small number can look large: a change from 0.09 ms to 0.14 ms is 54% slower, but no user can see 0.05 ms.
+Run a contest only if the choice depends on a question that requires measurement. Examples are speed, memory use, and behavior under faults. Each contest criterion must match a property that users care about in `BRIEF.md`. Set each cost limit as an absolute amount that a user notices, such as "adds at most 1 ms to a read". Do not use a percentage. A percentage of a small number can look large. For example, 0.09 ms to 0.14 ms is 54% slower, but users cannot notice 0.05 ms.
 
 A contest is fair if every candidate can win:
 
-- Before you build, write down the result that would make each candidate the winner. If you cannot describe a result in which your favorite loses, you have already chosen.
+- Before you build, record the result that makes each candidate win. If you cannot describe a result in which your favorite loses, you have already chosen.
 - Build each candidate as its strongest advocate would, preferably in a separate sub-agent. Use a different sub-agent as the judge.
-- Do not drop a candidate, especially the simplest one, because of a cost that you did not measure.
+- Do not drop a candidate, especially the simplest candidate, because of an unmeasured cost.
 
-Adopt the winner and continue. In the commit message, record the criteria, the results, and the reason that each other candidate lost.
+Use the winner and continue. In the commit message, record the criteria, the results, and why each other candidate lost.
 
 ## 3. Build
 
-Back every claim about correctness with a realistic test. A realistic test obeys two rules:
+Back every correctness claim with a realistic test. Write realistic tests that follow two rules:
 
-- **Real inputs.** The test drives the system only with requests that a client can send and with faults that can happen in a real deployment. For each fault, you must be able to say how it happens in production.
-- **Real states.** The test reaches each state through a sequence of real inputs. It does not build state by hand, set internal fields, or call internal functions with arguments that the system never passes.
+- **Real inputs.** Use only client requests and production faults. Explain how each fault can happen in production.
+- **Real states.** Reach each state through a sequence of real inputs. Do not construct state by hand, set internal fields, or call internal functions with impossible arguments.
 
-A test that breaks these rules can help you debug, but it does not prove that a bug exists or that a fix matters. If you cannot reach a failure with a realistic test, do not fix it. Report it as unproven.
+An unrealistic test can help you debug. It does not prove that a bug exists or that a fix matters. If you cannot trigger a failure with a realistic test, do not fix it. Report the failure as unproven.
 
-Use property, fuzz, simulation, or load tests where they fit, and improve the test infrastructure if necessary.
+Use property, fuzz, simulation, or load tests where they fit. Improve the test infrastructure if necessary.
 
 Keep the change in proportion to its value:
 
-- If the diff grows past twice the size estimate in the brief, stop. Decide whether the design is wrong before you continue. Update the brief with the answer.
-- If tests keep finding bugs in a mechanism, ask whether the mechanism should exist before you patch it again.
+- Stop if the diff exceeds twice the size estimate in `BRIEF.md`. Decide whether the design is wrong before you continue. Record your answer in `BRIEF.md`.
+- If you keep finding bugs in a mechanism, ask whether to delete the mechanism before you add another fix.
 
-Existing designs, interfaces, and tests are descriptive, not prescriptive (see the Requirements section of `AGENTS.md`). If an existing approach limits the quality of the result, replace it, and prove with tests that the replacement is better. Replace it only if the task needs the replacement. Otherwise, add the problem to `TODO.md`.
+Existing designs, interfaces, and tests describe the current system. See the Requirements section of `AGENTS.md`. If an existing approach limits the result, replace it. Prove with tests that the replacement is better. Replace an existing approach only if the task requires it. Otherwise, add the problem to `TODO.md`.
 
-Add a problem to `TODO.md` only if a user or operator would notice it, or if it breaks a goal in section 1 of `SPEC.md`.
+Add a problem to `TODO.md` only if a user or operator notices it, or if it breaks a goal in section 1 of `SPEC.md`.
 
 ## 4. Version Control
 
-Do all feature work in a branch. Put each subtask and each fix in its own commit. Each commit message gives a short description and the evidence of its effect: the tests, experiments, or measurements and their results. Push each commit.
+Do all feature work in a branch. Put each subtask and each fix in a separate commit. In each commit message, include a short description and evidence of the change, such as test, experiment, or measurement results. Push each commit.
 
 ## 5. Check the Result
 
-Before the review, read the brief again and answer these questions:
+Before the review, read `BRIEF.md` again and answer these questions:
 
 - Does the result solve the problem in the brief?
 - If you started again today, would you choose the same design?
-- What can you delete with no loss to users?
+- What can you delete without harming users?
 
-Act on the answers, then begin the [review](review.md).
+Act on the answers. Then start the [review](review.md).

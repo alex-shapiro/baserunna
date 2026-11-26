@@ -13,6 +13,14 @@ Baserunna is a web service that hosts small databases on object storage.
 
 Design details are in [`SPEC.md`](SPEC.md).
 
+## Requirements
+
+Only the goals and non-goals in section 1 of `SPEC.md` are requirements. All other code, documents, and tests describe the current system. Any of them can be wrong. You can change them.
+
+- A test that checks current behavior does not prove that the behavior is correct.
+- Do not keep a design only because `SPEC.md` describes it. Change `SPEC.md` if a better design conflicts with it.
+- If the code does not match `SPEC.md`, do not assume that either is correct. Choose the behavior that serves users better.
+
 ## Playbooks
 
 - Follow playbooks/feature.md for a feature request.

@@ -1,5 +1,5 @@
-//! Organizations: databases shared by several users, each a member with a
-//! role. See SPEC §9 and [`baserunna_util::access`] for role permissions.
+//! Organizations let multiple users share databases with role-based permissions.
+//! See SPEC §9 and [`baserunna_util::access`] for role permissions.
 //!
 //! Every organization keeps at least one owner. Enabled site administrators
 //! act as owners of every organization.
@@ -216,7 +216,7 @@ pub(super) async fn add_member(
 ) -> Result<MemberInfo> {
     let me = active_user(w.txn, actor).await?;
     let mine = require_role(w.txn, org_id, &me, Role::Admin).await?;
-    if !mine.may_change(None, Some(role)) {
+    if !mine.can_change_role(None, Some(role)) {
         return Err(Error::PermissionDenied("only owners can add owners".into()));
     }
     let user =
@@ -243,7 +243,7 @@ pub(super) async fn set_role(
     let me = active_user(w.txn, actor).await?;
     let mine = require_role(w.txn, org_id, &me, Role::Admin).await?;
     let m = get_member(w.txn, org_id, user_id).await?.ok_or_else(|| Error::not_found("not a member"))?;
-    if !mine.may_change(Some(m.role), Some(role)) {
+    if !mine.can_change_role(Some(m.role), Some(role)) {
         return Err(Error::PermissionDenied("only owners can change owners".into()));
     }
     keep_an_owner(w.txn, org_id, m.role, Some(role)).await?;
@@ -255,7 +255,7 @@ pub(super) async fn remove_member(w: &mut Write<'_, '_>, org_id: &str, actor: &s
     let me = active_user(w.txn, actor).await?;
     let mine = require_role(w.txn, org_id, &me, Role::Reader).await?;
     let m = get_member(w.txn, org_id, user_id).await?.ok_or_else(|| Error::not_found("not a member"))?;
-    if actor != user_id && !mine.may_change(Some(m.role), None) {
+    if actor != user_id && !mine.can_change_role(Some(m.role), None) {
         return Err(Error::PermissionDenied(
             match mine.can_administer() {
                 true => "only owners can remove owners",

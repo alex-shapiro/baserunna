@@ -713,13 +713,13 @@ async fn trigger_maintenance(
     token: &str,
     db_id: &str,
     row: usize,
-) -> baserunna_storage::store::metered::Counts {
+) -> baserunna_storage::store::metered::StoreCounts {
     let before = w.store.scope(db_id);
     let other_day = format!(r#"[{{"t":{},"u":"x","e":"x"}}]"#, MERGE_DAY_MS - 30 * DAY_MS + row as i64);
     bulk_insert(w, token, "d", "ev", other_day).await;
     tokio::time::sleep(Duration::from_secs(60)).await;
     let after = w.store.scope(db_id);
-    baserunna_storage::store::metered::Counts {
+    baserunna_storage::store::metered::StoreCounts {
         gets: after.gets - before.gets,
         puts: after.puts - before.puts,
         lists: after.lists - before.lists,

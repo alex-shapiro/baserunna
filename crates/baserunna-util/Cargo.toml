@@ -1,6 +1,6 @@
 [package]
 name = "baserunna-util"
-description = "Support modules shared by the baserunna server and storage crates"
+description = "Shared support modules for Baserunna crates"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

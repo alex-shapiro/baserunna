@@ -334,7 +334,7 @@ pub struct OpCtx<'a> {
     pub json_value_max: u64,
     /// Resource limits for `query_events` operations.
     pub query_limits: crate::events::exec::Limits,
-    /// Open transactions that admit `query_events` operations, or `None` to skip admission.
+    /// Transaction registry that admits `query_events` operations. Set to `None` to skip admission.
     pub txns: Option<&'a Arc<crate::txns::OpenTxns>>,
     /// User ID of the caller.
     pub user_id: &'a str,

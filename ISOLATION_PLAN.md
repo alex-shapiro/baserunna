@@ -60,10 +60,10 @@ Because `baserunna-server` does not link `baserunna-storage`, the server
 process cannot open a database. A `cargo tree` check in CI enforces this rule.
 That check replaces the store guard from milestone 3.
 
-`baserunna-util` and `baserunna-storage` exist now. The object store client is
-in `baserunna-storage`, so the server will not link it. `Role` and `Access` are
-in `baserunna-util`, because the server will send the caller's access to the
-worker with each request.
+`baserunna-util` and `baserunna-storage` are now separate crates.
+`baserunna-storage` contains the object store client. `baserunna-util` contains
+`Role` and `Access`. The server will send an `Access` value to the worker with
+each request.
 
 ## Milestones
 

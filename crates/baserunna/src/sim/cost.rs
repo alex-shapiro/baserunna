@@ -7,7 +7,7 @@ use crate::node::{Node, NodeConfig};
 use axum::body::Body;
 use baserunna_storage::engine::local::{LocalTier, MemLocal};
 use baserunna_storage::engine::{Consistency, EngineConfig};
-use baserunna_storage::store::metered::{Counts, MeteredStore};
+use baserunna_storage::store::metered::{MeteredStore, StoreCounts};
 use baserunna_storage::store::{DynStore, MemStore};
 use baserunna_util::env::Env;
 use baserunna_util::{BoxFut, run_paused};
@@ -30,9 +30,12 @@ pub mod prices {
     pub const STORAGE_GB_MONTH: f64 = 0.023;
 }
 
-/// Returns the S3 list price of `c` in USD.
-pub fn dollars(c: &Counts) -> f64 {
-    c.gets * prices::GET + c.puts * prices::PUT + c.lists * prices::LIST + c.deletes * prices::DELETE
+/// Returns the S3 request cost for `counts` in USD.
+pub fn request_cost_usd(counts: &StoreCounts) -> f64 {
+    counts.gets * prices::GET
+        + counts.puts * prices::PUT
+        + counts.lists * prices::LIST
+        + counts.deletes * prices::DELETE
 }
 
 #[derive(Default)]
@@ -254,7 +257,7 @@ pub const LATENCY_MS: u64 = 20;
 pub struct Measurement {
     pub name: &'static str,
     pub unit: &'static str,
-    pub per_unit: Counts,
+    pub per_unit: StoreCounts,
     pub latency_ms: Option<f64>,
 }
 
@@ -286,7 +289,7 @@ impl Report {
                 c.puts,
                 c.lists,
                 c.deletes,
-                dollars(&c) * 1e6,
+                request_cost_usd(c) * 1e6,
                 m.latency_ms.map(|l| format!("{l:.0} ms")).unwrap_or_default(),
             ));
         }
@@ -301,7 +304,7 @@ impl Report {
 struct Recorder<'a> {
     store: &'a MeteredStore,
     scope: String,
-    before: Counts,
+    before: StoreCounts,
     started: Instant,
 }
 
@@ -777,7 +780,7 @@ pub const HOT_READS_PER_HOUR: u64 = 36_000;
 pub fn monthly_cost(r: &Report, p: &Profile) -> Bill {
     let cfg = EngineConfig::default();
     let days = 30.0;
-    let writes = p.writes_per_day * dollars(&r.get("steady_write").per_unit) * days;
+    let writes = p.writes_per_day * request_cost_usd(&r.get("steady_write").per_unit) * days;
     let reads = if p.reads_per_day == 0.0 || p.active_hours == 0.0 {
         0.0
     } else {
@@ -786,17 +789,17 @@ pub fn monthly_cost(r: &Report, p: &Profile) -> Bill {
         let per_period = p.reads_per_day / periods;
         let period_cost = if per_period >= cfg.lease_read_threshold as f64 {
             let hot = r.get("hot_reads_10_per_s").per_unit;
-            let per_hour = dollars(&Counts { gets: 0.0, ..hot });
+            let per_hour = request_cost_usd(&StoreCounts { gets: 0.0, ..hot });
             let per_read = hot.gets / HOT_READS_PER_HOUR as f64 * prices::GET;
             per_hour * lease_s / 3600.0 + per_period * per_read
         } else {
-            per_period * dollars(&r.get("strong_read_unleased").per_unit)
+            per_period * request_cost_usd(&r.get("strong_read_unleased").per_unit)
         };
         periods * period_cost * days
     };
     let mib = (1u64 << 20) as f64;
-    let blobs = (p.blob_upload_bytes_per_day / mib * dollars(&r.get("blob_upload").per_unit)
-        + p.blob_download_bytes_per_day / mib * dollars(&r.get("blob_download").per_unit))
+    let blobs = (p.blob_upload_bytes_per_day / mib * request_cost_usd(&r.get("blob_upload").per_unit)
+        + p.blob_download_bytes_per_day / mib * request_cost_usd(&r.get("blob_download").per_unit))
         * days;
     let storage = (p.data_bytes * r.space_amplification + p.blob_bytes) / GB * prices::STORAGE_GB_MONTH;
     Bill { writes, reads, blobs, storage }
@@ -824,7 +827,7 @@ pub fn cost_table(r: &Report) -> String {
     }
     for name in ["node_overhead_1_node", "node_overhead_3_nodes"] {
         let m = r.get(name);
-        s.push_str(&format!("{name}: ${:.2} per node-month\n", dollars(&m.per_unit) * 24.0 * 30.0));
+        s.push_str(&format!("{name}: ${:.2} per node-month\n", request_cost_usd(&m.per_unit) * 24.0 * 30.0));
     }
     s
 }

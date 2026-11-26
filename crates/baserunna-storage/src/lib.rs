@@ -1,5 +1,7 @@
-//! Storage engine and database features of baserunna: key-value transactions,
-//! tables, streams, and event tables on object storage. See `SPEC.md`.
+//! Storage engine and database operations for Baserunna.
+//!
+//! This crate implements key-value transactions, tables, streams, and event tables on object
+//! storage. See `SPEC.md`.
 
 #![forbid(unsafe_code)]
 #![recursion_limit = "512"]

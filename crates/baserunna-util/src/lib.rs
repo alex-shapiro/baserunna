@@ -1,4 +1,4 @@
-//! Support modules shared by the baserunna crates.
+//! Shared support modules for Baserunna crates.
 
 #![forbid(unsafe_code)]
 
@@ -22,7 +22,7 @@ use std::future::Future;
 use std::hash::{BuildHasherDefault, DefaultHasher};
 use std::pin::Pin;
 
-/// Boxed `Send` future, for async methods of object-safe traits.
+/// A boxed `Send` future for async methods on object-safe traits.
 pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// `HashMap` with a deterministic hasher.
@@ -45,7 +45,9 @@ pub async fn race<A: Future + Unpin, B: Future + Unpin>(a: &mut A, b: &mut B) ->
     .await
 }
 
-/// Runs `f` on a current-thread runtime with paused time and logs only errors.
+/// Runs `f` on a single-threaded Tokio runtime with paused virtual time.
+///
+/// Sets the log level to [`log::Level::Error`] while `f` runs and restores it afterward.
 pub fn run_paused<F: Future>(f: F) -> F::Output {
     let lvl = crate::log::level();
     crate::log::set_level(Some(crate::log::Level::Error));

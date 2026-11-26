@@ -129,7 +129,7 @@ async fn commit(w: &World, token: &str, db: &str, id: &str) -> Resp {
 }
 
 #[test]
-fn cancelled_ops_request_aborts_transaction() {
+fn canceled_ops_request_aborts_transaction() {
     run_paused(async {
         let w = World::new(1, 1).await;
         let token = w.signup(0, "a@x.io").await;
@@ -143,12 +143,12 @@ fn cancelled_ops_request_aborts_transaction() {
         w.store.set_latency_ms(1_000);
         let request =
             ops(&w, &token, "a", &id, json!([{"op": "put", "key": "x", "value": "1"}, {"op": "get", "key": "blob"}]));
-        let cancelled = tokio::time::timeout(Duration::from_millis(100), request).await;
-        assert!(cancelled.is_err(), "the request finished before it was cancelled: {cancelled:?}");
+        let canceled = tokio::time::timeout(Duration::from_millis(100), request).await;
+        assert!(canceled.is_err(), "the request finished before it was canceled: {canceled:?}");
         w.store.set_latency_ms(1);
         let r = ops(&w, &token, "a", &id, json!([{"op": "get", "key": "x"}])).await;
         assert_eq!(r["error"]["code"], "txn_not_found", "a partly applied request left its transaction open: {r}");
-        assert!(r["error"]["message"].as_str().unwrap().contains("cancelled"), "{r}");
+        assert!(r["error"]["message"].as_str().unwrap().contains("canceled"), "{r}");
     });
 }
 

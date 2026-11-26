@@ -1,11 +1,11 @@
-//! Roles and effective permissions of a principal on a database. See SPEC §9.
+//! Organization roles and database permissions. See SPEC §9.
 //!
-//! | role     | data (read) | data (write, schema) | create/delete databases | manage members        | delete org |
-//! | -------- | ----------- | -------------------- | ----------------------- | --------------------- | ---------- |
-//! | `reader` | yes         |                      |                         |                       |            |
-//! | `writer` | yes         | yes                  |                         |                       |            |
-//! | `admin`  | yes         | yes                  | yes                     | readers to admins     |            |
-//! | `owner`  | yes         | yes                  | yes                     | everyone              | yes        |
+//! Each higher role includes all permissions of the roles below it:
+//!
+//! - `reader`: read data
+//! - `writer`: write data and change schemas
+//! - `admin`: create or delete databases and manage `reader`, `writer`, and `admin` members
+//! - `owner`: manage all members and delete the organization
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -61,15 +61,16 @@ impl Role {
         self >= Role::Admin
     }
 
-    /// Returns whether a member with role `self` may change a user's membership
-    /// from `from` to `to`. Only owners may add, modify, or remove owners.
-    pub fn may_change(self, from: Option<Role>, to: Option<Role>) -> bool {
+    /// Returns `true` if a member with role `self` can change a membership from `from` to `to`.
+    ///
+    /// Only owners can add, change, or remove owners.
+    pub fn can_change_role(self, from: Option<Role>, to: Option<Role>) -> bool {
         let owners_involved = from == Some(Role::Owner) || to == Some(Role::Owner);
         self.can_administer() && (!owners_involved || self == Role::Owner)
     }
 }
 
-/// Effective permissions of a principal on a database.
+/// Effective database permissions for a caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Access {
     pub role: Role,

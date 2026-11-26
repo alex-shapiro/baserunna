@@ -10,7 +10,7 @@ use std::time::Duration;
 
 /// Object-store request and byte counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct Counts {
+pub struct StoreCounts {
     pub gets: f64,
     pub puts: f64,
     pub lists: f64,
@@ -18,52 +18,52 @@ pub struct Counts {
     pub put_bytes: f64,
 }
 
-impl Counts {
+impl StoreCounts {
     pub fn total(&self) -> f64 {
         self.gets + self.puts + self.lists + self.deletes
     }
 
-    pub fn per(&self, n: f64) -> Counts {
-        Counts {
-            gets: self.gets / n,
-            puts: self.puts / n,
-            lists: self.lists / n,
-            deletes: self.deletes / n,
-            put_bytes: self.put_bytes / n,
+    pub fn per(&self, divisor: f64) -> StoreCounts {
+        StoreCounts {
+            gets: self.gets / divisor,
+            puts: self.puts / divisor,
+            lists: self.lists / divisor,
+            deletes: self.deletes / divisor,
+            put_bytes: self.put_bytes / divisor,
         }
     }
 
-    pub fn minus(&self, o: &Counts) -> Counts {
-        Counts {
-            gets: self.gets - o.gets,
-            puts: self.puts - o.puts,
-            lists: self.lists - o.lists,
-            deletes: self.deletes - o.deletes,
-            put_bytes: self.put_bytes - o.put_bytes,
+    pub fn minus(&self, other: &StoreCounts) -> StoreCounts {
+        StoreCounts {
+            gets: self.gets - other.gets,
+            puts: self.puts - other.puts,
+            lists: self.lists - other.lists,
+            deletes: self.deletes - other.deletes,
+            put_bytes: self.put_bytes - other.put_bytes,
         }
     }
 
-    pub fn plus(&self, o: &Counts) -> Counts {
-        Counts {
-            gets: self.gets + o.gets,
-            puts: self.puts + o.puts,
-            lists: self.lists + o.lists,
-            deletes: self.deletes + o.deletes,
-            put_bytes: self.put_bytes + o.put_bytes,
+    pub fn plus(&self, other: &StoreCounts) -> StoreCounts {
+        StoreCounts {
+            gets: self.gets + other.gets,
+            puts: self.puts + other.puts,
+            lists: self.lists + other.lists,
+            deletes: self.deletes + other.deletes,
+            put_bytes: self.put_bytes + other.put_bytes,
         }
     }
 }
 
-/// Returns the database ID for a store key, `"sys"`, or `""` for keys outside `dbs/`.
-pub fn scope_of(key: &str) -> &str {
+/// Returns the database ID or `"sys"` from a key under `dbs/`. Returns `""` for other keys.
+pub fn key_scope(key: &str) -> &str {
     key.strip_prefix("dbs/").and_then(|r| r.split('/').next()).unwrap_or("")
 }
 
-/// Object store wrapper that counts requests per database and injects fixed latency.
+/// Object store wrapper that counts requests per database and adds fixed latency.
 pub struct MeteredStore {
     inner: DynStore,
     latency_ms: AtomicU64,
-    counts: Mutex<BTreeMap<String, Counts>>,
+    counts: Mutex<BTreeMap<String, StoreCounts>>,
 }
 
 impl MeteredStore {
@@ -75,9 +75,9 @@ impl MeteredStore {
         self.latency_ms.store(ms, Ordering::Relaxed);
     }
 
-    fn count(&self, key: &str, f: impl FnOnce(&mut Counts)) {
+    fn count(&self, key: &str, f: impl FnOnce(&mut StoreCounts)) {
         let mut g = self.counts.lock();
-        f(g.entry(scope_of(key).to_string()).or_default());
+        f(g.entry(key_scope(key).to_string()).or_default());
     }
 
     async fn delay(&self) {
@@ -87,12 +87,12 @@ impl MeteredStore {
         }
     }
 
-    pub fn scope(&self, scope: &str) -> Counts {
+    pub fn scope(&self, scope: &str) -> StoreCounts {
         self.counts.lock().get(scope).copied().unwrap_or_default()
     }
 
-    pub fn total(&self) -> Counts {
-        self.counts.lock().values().fold(Counts::default(), |a, c| a.plus(c))
+    pub fn total(&self) -> StoreCounts {
+        self.counts.lock().values().fold(StoreCounts::default(), |a, c| a.plus(c))
     }
 }
 

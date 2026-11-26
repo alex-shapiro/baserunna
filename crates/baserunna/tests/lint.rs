@@ -55,15 +55,17 @@ const RULES: &[(&str, &[&str], &str)] = &[
     ("thread_rng", &[], "obtain randomness from Env"),
 ];
 
-/// Library crates whose source the lints check. The client runs inside
-/// simulations, so it follows the same rules.
-const CRATES: &[&str] = &["baserunna", "baserunna-api", "baserunna-client", "baserunna-storage", "baserunna-util"];
+/// Workspace library crates included in the source lints.
+///
+/// `baserunna-client` runs inside simulations, so it follows the same rules.
+const LINTED_CRATES: &[&str] =
+    &["baserunna", "baserunna-api", "baserunna-client", "baserunna-storage", "baserunna-util"];
 
 #[test]
 fn determinism_and_safety_lints() {
     let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
-    for name in CRATES {
+    for name in LINTED_CRATES {
         rust_files(&crates_dir.join(name).join("src"), &mut files);
     }
     let mut violations = Vec::new();
@@ -85,7 +87,7 @@ fn determinism_and_safety_lints() {
 #[test]
 fn forbid_unsafe_is_declared() {
     let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    for name in CRATES {
+    for name in LINTED_CRATES {
         let text = std::fs::read_to_string(crates_dir.join(name).join("src/lib.rs")).unwrap();
         assert!(text.contains("#![forbid(unsafe_code)]"), "{name} does not forbid unsafe code");
     }

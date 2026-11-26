@@ -269,7 +269,7 @@ fn gen_step(r: &mut Rng) -> Step {
     }
 }
 
-/// Reference implementation of role transition permissions, independent of [`Role::may_change`].
+/// Reference implementation of role transition permissions, independent of [`Role::can_change_role`].
 fn may(actor: Role, from: Option<Role>, to: Option<Role>) -> bool {
     match actor {
         Role::Owner => true,
@@ -625,16 +625,19 @@ fn role_lattice() {
                 assert!(!a.can_administer() || b.can_administer());
                 for from in [None, Some(Role::Reader), Some(Role::Owner)] {
                     for to in [None, Some(Role::Writer), Some(Role::Owner)] {
-                        assert!(!a.may_change(from, to) || b.may_change(from, to), "{a:?} {b:?} {from:?} {to:?}");
+                        assert!(
+                            !a.can_change_role(from, to) || b.can_change_role(from, to),
+                            "{a:?} {b:?} {from:?} {to:?}"
+                        );
                     }
                 }
             }
         }
         assert_eq!(serde_json::to_value(a).unwrap(), json!(a.name()), "name() is the serialized name");
-        assert!(!Role::Admin.may_change(Some(Role::Owner), Some(Role::Reader)), "admins cannot demote owners");
-        assert!(!Role::Admin.may_change(None, Some(Role::Owner)), "nor make owners");
-        assert!(Role::Admin.may_change(Some(Role::Writer), Some(Role::Admin)));
-        assert!(!Role::Writer.may_change(Some(Role::Reader), None));
+        assert!(!Role::Admin.can_change_role(Some(Role::Owner), Some(Role::Reader)), "admins cannot demote owners");
+        assert!(!Role::Admin.can_change_role(None, Some(Role::Owner)), "nor make owners");
+        assert!(Role::Admin.can_change_role(Some(Role::Writer), Some(Role::Admin)));
+        assert!(!Role::Writer.can_change_role(Some(Role::Reader), None));
     }
 }
 

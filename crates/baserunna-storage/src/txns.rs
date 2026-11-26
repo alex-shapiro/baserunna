@@ -1,6 +1,7 @@
-//! Per-node registry of open interactive transactions, enforcing per-user concurrency limits,
-//! idle and lifetime expiration, and max-min fair memory admission of transactions and event
-//! queries (SPEC §5.12, §6.2).
+//! Per-node registry for open interactive transactions (SPEC §5.12, §6.2).
+//!
+//! Enforces per-user transaction limits, idle and lifetime timeouts, and fair memory admission
+//! across transactions and event queries.
 
 use crate::engine::memory::{self, Held, MemoryGate};
 use crate::engine::{Engine, Txn, Version};
@@ -29,10 +30,11 @@ pub struct OpenTxn {
     created: Instant,
     last_used: Mutex<Instant>,
     memory: Arc<AtomicUsize>,
-    /// Weak reference to the transaction's snapshot version, used to attribute pinned version
-    /// memory without locking `txn`.
+    /// Weak reference to the snapshot version.
+    ///
+    /// Attributes pinned version memory without locking `txn`.
     snapshot: Weak<Version>,
-    /// Set to `None` on commit or abort.
+    /// Holds the open transaction until commit or abort sets it to `None`.
     txn: Arc<tokio::sync::Mutex<Option<Txn>>>,
 }
 
@@ -52,7 +54,7 @@ pub struct OpenTxns {
     queries: Arc<Queries>,
     open: Mutex<DetHashMap<String, Arc<OpenTxn>>>,
     aborted: TtlCache<String, &'static str>,
-    /// Maps transaction IDs whose commit has started to their commit IDs.
+    /// Maps each committing transaction ID to its commit ID.
     started_commits: TtlCache<String, u64>,
 }
 
@@ -68,7 +70,9 @@ impl OpenTxns {
         })
     }
 
-    /// Admits an event query of `user_id`, waiting up to 5 s for a query slot.
+    /// Admits an event query for `user_id`.
+    ///
+    /// Waits up to 5 s for a query slot.
     pub async fn start_query(self: &Arc<Self>, user_id: &str) -> Result<crate::queries::QueryGrant> {
         self.queries.start(user_id, self).await
     }
@@ -85,9 +89,10 @@ impl OpenTxns {
         self.open.lock().values().filter(|t| t.db_id == db_id).count()
     }
 
-    /// Enforces the node memory budget for a transaction of `user_id` on `db_id`. Unloads idle
-    /// databases and evicts idle transactions and running queries via [`memory::fair_admission`]
-    /// if needed.
+    /// Enforces the node memory budget for a transaction for `user_id` on `db_id`.
+    ///
+    /// Unloads idle databases and evicts idle transactions or running queries with
+    /// [`memory::fair_admission`] if memory exceeds the budget.
     pub fn admit(&self, user_id: &str, db_id: &str) -> Result<()> {
         if self.engine.shared.is_system(db_id) {
             return Ok(());
@@ -103,9 +108,10 @@ impl OpenTxns {
         })
     }
 
-    /// Enforces the node memory budget for growth of query `q`. Aborts `q` if its user holds at
-    /// least its fair share. Always admits the oldest running query so at least 1 query finishes
-    /// even if databases fill the budget.
+    /// Enforces the node memory budget for query `q`.
+    ///
+    /// Aborts `q` if its user already holds at least a fair share of memory. Always admits the
+    /// oldest running query so at least 1 query finishes even if databases fill the budget.
     pub(crate) fn admit_query(&self, q: &QueryMemory) -> Result<()> {
         if self.fair_admission(&q.user_id) || self.queries.active_queries().last().is_some_and(|o| o.seq == q.seq) {
             return Ok(());
@@ -118,9 +124,11 @@ impl OpenTxns {
         }))
     }
 
-    /// Returns false if node memory exceeds the budget and `user_id` holds at least its fair
-    /// share. Otherwise, evicts the idle transactions and running queries selected by
-    /// [`memory::fair_admission`] and returns true.
+    /// Reclaims memory so `user_id` can fit within the node memory budget.
+    ///
+    /// Returns `false` if memory stays over budget and `user_id` already holds at least its fair
+    /// share. Otherwise evicts the holders that [`memory::fair_admission`] selects and returns
+    /// `true`.
     fn fair_admission(&self, user_id: &str) -> bool {
         let shared = &self.engine.shared;
         if shared.reclaim_to_budget() {
@@ -162,8 +170,9 @@ impl OpenTxns {
         })
     }
 
-    /// Registers `txn` as open transaction `id` for `user_id` on `db_id` and returns a locked
-    /// [`TxnGuard`] for the initial request.
+    /// Registers `txn` as open transaction `id` for `user_id` on `db_id`.
+    ///
+    /// Returns a locked [`TxnGuard`] for the initial request.
     pub fn open(
         self: &Arc<Self>,
         id: String,
@@ -218,8 +227,7 @@ impl OpenTxns {
         Ok(open)
     }
 
-    /// Removes a transaction ID recorded by [`TxnGuard::take_for_commit`] after its commit fails
-    /// without being applied.
+    /// Removes a started commit record for `txn_id` after a commit fails before applying.
     pub fn forget_started_commit(&self, txn_id: &str) {
         self.started_commits.remove(&txn_id.to_string());
     }
@@ -251,8 +259,7 @@ impl OpenTxns {
         self.abort_locked(open, &mut g, reason)
     }
 
-    /// Records `reason` before `txn` is unlocked so that concurrent waiters observe the abort
-    /// reason.
+    /// Aborts `txn` under its lock and records `reason` before unlocking so concurrent waiters see it.
     fn abort_locked(&self, open: &OpenTxn, txn: &mut Option<Txn>, reason: &'static str) -> bool {
         let aborted = txn.take().is_some();
         if aborted {
@@ -286,8 +293,10 @@ impl OpenTxns {
         }
     }
 
-    /// Returns open transactions from least to most recently used, then running queries from
-    /// newest to oldest, paired with their memory usage.
+    /// Lists all memory holders with their current memory usage.
+    ///
+    /// Orders open transactions from least to most recently used, followed by running queries from
+    /// newest to oldest.
     fn held_memory(&self) -> Vec<(MemoryHolder, Held<String>)> {
         let idle_since = |t: &OpenTxn| t.txn.try_lock().ok().filter(|g| g.is_some()).map(|_| t.last_used());
         let mut open: Vec<(Option<Instant>, Arc<OpenTxn>)> =
@@ -329,8 +338,10 @@ enum MemoryHolder {
     Query(Arc<QueryMemory>),
 }
 
-/// Exclusive guard for an open transaction during a single request. If dropped before
-/// [`TxnGuard::finish`] succeeds or [`TxnGuard::take`] is called, the transaction is aborted.
+/// Exclusive guard for an open transaction during a single request.
+///
+/// Dropping the guard before calling [`TxnGuard::finish`] or [`TxnGuard::take`] aborts the
+/// transaction.
 pub struct TxnGuard<'a> {
     txns: &'a OpenTxns,
     open: Arc<OpenTxn>,
@@ -352,7 +363,7 @@ impl TxnGuard<'_> {
         result
     }
 
-    /// Takes the transaction for committing and records its commit ID in [`OpenTxns`].
+    /// Takes the transaction for commit and records its commit ID in [`OpenTxns`].
     pub fn take_for_commit(self) -> Txn {
         let commit_id = self.guard.as_ref().expect("open transaction must be present while guard is active").commit_id;
         self.txns.started_commits.store(self.open.id.clone(), Some(commit_id), Instant::now());
@@ -371,7 +382,7 @@ impl TxnGuard<'_> {
 impl Drop for TxnGuard<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.txns.abort_locked(&self.open, &mut self.guard, "a request on it failed or was cancelled");
+            self.txns.abort_locked(&self.open, &mut self.guard, "a request on it failed or was canceled");
         }
     }
 }

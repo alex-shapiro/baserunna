@@ -1,4 +1,4 @@
-//! Error type for all baserunna crates, with HTTP status mapping.
+//! Shared error type and HTTP response mapping for Baserunna crates.
 
 use axum_core::response::{IntoResponse, Response};
 use baserunna_api::{self as api, ErrorCode};
@@ -75,7 +75,7 @@ impl Error {
         Error::Unavailable { message: m.into(), retry_after_ms: None, outcome_unknown: false }
     }
 
-    /// Converts the error to the `error` object of an HTTP error response.
+    /// Builds the [`api::ApiError`] payload for an HTTP error response.
     pub fn to_api_error(&self) -> api::ApiError {
         let details = |d: api::ErrorDetails| Some(d);
         let details = match self {

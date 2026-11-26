@@ -4,3 +4,4 @@
 /mutants.out*
 *.orig
 *.rej
+__pycache__/

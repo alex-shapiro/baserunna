@@ -59,7 +59,8 @@ impl Workload for Merges {
                             let rows_per_part = ROWS_PER_TABLE.div_ceil(PARTS_BEFORE_TRIGGER);
                             for part_index in 0..PARTS_BEFORE_TRIGGER {
                                 let row_start = table_index * ROWS_PER_TABLE + part_index * rows_per_part;
-                                let row_end = (table_index * ROWS_PER_TABLE + ROWS_PER_TABLE).min(row_start + rows_per_part);
+                                let row_end =
+                                    (table_index * ROWS_PER_TABLE + ROWS_PER_TABLE).min(row_start + rows_per_part);
                                 let body = format!(
                                     "[{}]",
                                     (row_start..row_end).map(format_event_row).collect::<Vec<_>>().join(",")

@@ -168,7 +168,10 @@ impl NodeApi {
                 Ok(None) => break,
                 Err(err) => {
                     return (
-                        build_record(Some(status), Some(format!("response body error after {total_bytes} bytes: {err:?}"))),
+                        build_record(
+                            Some(status),
+                            Some(format!("response body error after {total_bytes} bytes: {err:?}")),
+                        ),
                         total_bytes,
                     );
                 }
@@ -201,9 +204,7 @@ impl NodeApi {
     }
 
     pub async fn create_db(&self, token: &str, db: &str) -> Result<(), String> {
-        self.send_expect(Method::POST, "/v1/dbs", token, json!({"name": db}).to_string(), &[200, 201])
-            .await
-            .map(|_| ())
+        self.send_expect(Method::POST, "/v1/dbs", token, json!({"name": db}).to_string(), &[200, 201]).await.map(|_| ())
     }
 
     pub async fn create_event_table(&self, token: &str, db: &str, table: Json) -> Result<(), String> {

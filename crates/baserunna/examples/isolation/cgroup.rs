@@ -98,12 +98,8 @@ impl MemorySampler {
         let thread = std::thread::spawn(move || {
             let started_at = Instant::now();
             let start_bytes = cgroup.memory_current_bytes().unwrap_or(0);
-            let mut summary = MemorySummary {
-                start_bytes,
-                peak_bytes: start_bytes,
-                end_bytes: start_bytes,
-                ..Default::default()
-            };
+            let mut summary =
+                MemorySummary { start_bytes, peak_bytes: start_bytes, end_bytes: start_bytes, ..Default::default() };
             while !thread_stop_flag.load(Relaxed) {
                 if let Some(current_bytes) = cgroup.memory_current_bytes() {
                     summary.sample_count += 1;

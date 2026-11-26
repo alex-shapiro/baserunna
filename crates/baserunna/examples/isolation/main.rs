@@ -86,7 +86,9 @@ fn parse_args() -> CliArgs {
             "--out" => cli.output_path = value,
             "--node-pid" => cli.node_pid = value.parse().ok(),
             "--deadline-ms" => cli.request_deadline = Duration::from_millis(value.parse().unwrap_or_else(|_| usage())),
-            "--victim-secs" => cli.victim_alone_duration = Duration::from_secs(value.parse().unwrap_or_else(|_| usage())),
+            "--victim-secs" => {
+                cli.victim_alone_duration = Duration::from_secs(value.parse().unwrap_or_else(|_| usage()))
+            }
             "--victim-rps" => cli.victim_rps = value.parse().unwrap_or_else(|_| usage()),
             "--rounds" => cli.event_scan_rounds = value.parse().unwrap_or_else(|_| usage()),
             "--clients" => cli.kv_clients = value.parse().unwrap_or_else(|_| usage()),
@@ -138,11 +140,8 @@ fn attack_summary(outcome: &AttackOutcome, deadline: Duration) -> Json {
         .iter()
         .filter(|record| record.status.is_some_and(|code| code >= 400) && !record.expected)
         .collect();
-    let late: Vec<&RequestRecord> = rejected
-        .iter()
-        .copied()
-        .filter(|record| record.elapsed_ms > 2.0 * deadline.as_secs_f64() * 1000.0)
-        .collect();
+    let late: Vec<&RequestRecord> =
+        rejected.iter().copied().filter(|record| record.elapsed_ms > 2.0 * deadline.as_secs_f64() * 1000.0).collect();
     json!({
         "requests": outcome.requests,
         "completed": outcome.completed,
@@ -163,11 +162,8 @@ async fn main() {
         "workload": cli.workload, "variant": cli.variant, "node": cli.node_url, "cgroup": cli.cgroup.0,
         "request_deadline_ms": cli.request_deadline.as_millis() as u64,
     });
-    let monitor = NodeMonitor {
-        pid: cli.node_pid,
-        cgroup: cli.cgroup.clone(),
-        oom_kills_before: cli.cgroup.node_oom_kills(),
-    };
+    let monitor =
+        NodeMonitor { pid: cli.node_pid, cgroup: cli.cgroup.clone(), oom_kills_before: cli.cgroup.node_oom_kills() };
     if let Err(err) = run(&cli, &monitor, &mut report).await {
         eprintln!("isolation: {err}");
         report["error"] = json!(err);
@@ -175,7 +171,8 @@ async fn main() {
     report["node_after"] = monitor.report();
     report["total_s"] = json!(started.elapsed().as_secs_f64());
     let text = serde_json::to_string_pretty(&report).expect("json");
-    std::fs::write(&cli.output_path, text + "\n").unwrap_or_else(|err| panic!("cannot write {}: {err}", cli.output_path));
+    std::fs::write(&cli.output_path, text + "\n")
+        .unwrap_or_else(|err| panic!("cannot write {}: {err}", cli.output_path));
     eprintln!("isolation: wrote {}", cli.output_path);
 }
 

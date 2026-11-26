@@ -151,7 +151,13 @@ async fn measure(
         Arc::new((0..64).map(|i| Bytes::from(Rng::new(1_000 + i).text(VALUE_BYTES))).collect());
     let tasks: Vec<_> = (0..client_count)
         .map(|client_index| {
-            tokio::spawn(client_loop(http.clone(), keys.clone(), values.clone(), phase.clone(), client_index as u64 + 1))
+            tokio::spawn(client_loop(
+                http.clone(),
+                keys.clone(),
+                values.clone(),
+                phase.clone(),
+                client_index as u64 + 1,
+            ))
         })
         .collect();
     tokio::time::sleep(warmup).await;

@@ -52,11 +52,11 @@ server binary from linking the storage engine:
    work runs in this crate. It depends on `baserunna-storage` and
    `baserunna-util`.
 4. `baserunna-server`: network connections, authentication, and request
-   routing. It depends only on `baserunna-util`.
+   routing. It does not depend on `baserunna-storage`.
 
 Cargo builds separate binaries for `baserunna-server` and `baserunna-worker`.
-Because `baserunna-server` links only `baserunna-util`, the server process
-cannot open a database. A `cargo tree` check in CI enforces this dependency
+Because `baserunna-server` does not link `baserunna-storage`, the server
+process cannot open a database. A `cargo tree` check in CI enforces this dependency
 rule. That check replaces the store guard from milestone 3.
 
 Extracting the storage engine is simple. Today `engine/` depends only on

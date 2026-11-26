@@ -183,7 +183,9 @@ tracking code.
   Under per-owner cgroups, the harness tests isolation. It checks if the kernel
   stops only the attacker. It also checks if victim requests stay fast. On
   `main`, the harness shows only node-wide effects. Milestone 1 and `TODO.md`
-  already list the per-operation problems that cause those effects.
+  already list the per-operation memory problems that cause most of those
+  effects. The CPU effects of filter scans need the `cpu.max` limits from this
+  milestone.
 - [ ] Record absolute target numbers for the worker pool before you run
       benchmarks. Include these metrics:
   - CPU time per request

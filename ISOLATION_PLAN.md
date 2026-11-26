@@ -66,7 +66,8 @@ on `store` and the shared modules we will put in `baserunna-util`.
 ## Milestones
 
 Each milestone is a group of PRs. After each milestone, run the isolation
-harness from milestone 0. Record the results in this file.
+harness and the isolation simulator scenarios from milestone 0. Record the
+results in this file.
 
 Start with milestone 0. Milestones 1 to 3 are independent. Start them in any
 order. Milestone 4 depends on milestone 3. Finish with milestone 5.
@@ -74,9 +75,9 @@ order. Milestone 4 depends on milestone 3. Finish with milestone 5.
 ### 0. Measure isolation on `main`
 
 The isolation harness checks whether the node continues to serve a victim
-tenant while an attacker tenant runs a heavy workload. The harness is on branch
-`iso/base` at `crates/baserunna/examples/isolation/` and
-`scripts/isolation/run.sh`.
+tenant while an attacker tenant runs a heavy workload. The harness is in
+`crates/baserunna/examples/isolation/`. The scripts in `scripts/isolation/`
+build it and run it in a Linux VM.
 
 A workload passes if it meets all five criteria:
 
@@ -87,8 +88,64 @@ A workload passes if it meets all five criteria:
 - The server returns an HTTP error for requests that exceed a limit.
 - A small version of the workload succeeds.
 
-- [ ] Move the isolation harness and its pass criteria to `main`. Record the
+- [x] Move the isolation harness and its pass criteria to `main`. Record the
       baseline result for each workload on `main`.
+- [ ] Model tenant memory limits in the simulator. Add a counting allocator to
+      simulation builds that charges each allocation to the tenant whose task
+      makes it. Give each tenant a memory limit. If a tenant exceeds its limit,
+      stop all work of that tenant, as the kernel stops a worker. This PR
+      removes the `TODO.md` item "Check memory estimates against the real heap
+      in simulation".
+- [ ] Port the isolation workloads to simulator scenarios. Each scenario checks
+      criteria 1, 2, 4, and 5 with faults. Record the baseline result for each
+      scenario on `main`.
+
+The simulator cannot measure real CPU time, so the VM harness still checks
+criterion 3. The VM harness also checks that the real kernel stops a tenant at
+the same limit as the simulator model.
+
+To run the harness, start the Linux VM and run these commands in it. The
+results go to the directory that you give `measure.sh`. Keep the Mac awake for
+the whole run, for example with `caffeinate -i -s`.
+
+```text
+scripts/isolation/build.sh
+scripts/isolation/measure.sh target/isolation-results/<name>
+python3 -I scripts/isolation/summarize.py target/isolation-results/<name>
+```
+
+#### Baseline on `main`
+
+`main` passes 1 of the 8 workloads. The VM ran each variant of each workload
+twice, at commit `df5196d` on 2026-11-26. The node ran in a cgroup with a
+1,536 MiB memory limit, and the fake object store added 20 ms to each request.
+With no attacker, the median victim p99 latency was 55 ms.
+
+| Workload              | Attack variant                                  | Small variant            |
+| --------------------- | ----------------------------------------------- | ------------------------ |
+| `blob_checks`         | pass, but node memory grew 1,050 MiB            | pass                     |
+| `blob_downloads`      | the node ran out of memory and stopped          | 1 run failed criterion 3 |
+| `bulk_inserts`        | the node ran out of memory and stopped          | pass                     |
+| `long_strings`        | the node ran out of memory and stopped          | pass                     |
+| `merges`              | the node ran out of memory and stopped          | pass                     |
+| `stream_filter_scans` | victim p99 rose from 56 ms to 2,629–2,846 ms    | pass                     |
+| `table_filter_scans`  | victim p99 rose from 52 ms to 716–818 ms        | pass                     |
+| `txn_scans`           | the node ran out of memory and stopped          | pass                     |
+
+Notes on the baseline:
+
+- `blob_checks` passes only because no criterion limits tenant memory. One
+  tenant used 1,050 MiB of the node's 1,536 MiB.
+- The failed small run of `blob_downloads` exceeded its 106 ms p99 limit by
+  3 ms. The victim sends only about 470 requests while an attack runs, so the
+  p99 is the fifth-slowest request. A single slow request can change the result.
+- The cost measurements gave these results:
+  - `kv_throughput`: 72,300 operations per second with 256 clients, and 35 µs
+    of node CPU time per operation.
+  - `idle_cost`: 48 to 51 MiB of node memory with 1,000 idle owners.
+  - `event_scan`: the node refused the "top users" query with HTTP 413 in all
+    40 rounds. Earlier runs of the same code completed it in 0 to 20 of 20
+    rounds. The cause of this difference is unknown.
 
 ### 1. Limit memory use for each operation
 
@@ -212,7 +269,8 @@ tracking code.
       per-owner overrides in the system database. Apply limit updates
       immediately to the running worker's cgroup. A single event query can use
       1 GiB today. In the contest, a 512 MiB worker limit caused 19 of 40 event
-      query runs to fail. Today `main` completes all 40.
+      query runs to fail. On `main`, the result of the same query changes from
+      run to run. See the milestone 0 baseline.
 - [ ] Check a soft memory limit before a worker admits a request. Read live
       heap bytes from a counting global allocator. Return HTTP 503 if the
       worker is near its memory limit. Do not use cgroup `memory.high`. In

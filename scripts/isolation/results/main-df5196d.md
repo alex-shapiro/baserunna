@@ -10,7 +10,7 @@ to 51.
 - VM: 4 vCPUs, 8 GiB of memory, Linux 6.8.0-149-generic.
 - The node ran in a cgroup with a 1,536 MiB memory limit and no swap.
 - The fake object store added 20 ms to each request.
-- `measure.sh` ran each variant of each workload twice. The Mac stayed awake
+- The harness ran each variant of each workload twice. The Mac stayed awake
   for the whole run.
 - With no attacker, the median victim p99 latency was 55 ms.
 

@@ -36,12 +36,13 @@ would in production.
 
 ## Size
 
-- Copy the harness, the fake S3 server, and `run.sh` from `iso/base`.
+- Copy the harness, the fake S3 server, and `run.sh` from `iso/base`. Port
+  `run.sh` to Python, so that all harness scripts use one language.
 - Change the pass criteria to the five in the plan. The contest had a sixth
   criterion: a fixed 576 MiB limit on node memory growth. The plan removes it,
   because milestone 4 sets the limits from the harness results. The harness
   still records the growth.
-- Add `build.sh`, `measure.sh`, and `summarize.py` to build, run every
+- Add `build.py`, `measure.py`, and `summarize.py` to build, run every
   workload, and print a results table.
 - Estimate: 200 changed lines over the copy.
 
@@ -81,3 +82,22 @@ necessary. No contest is necessary.
 - What can we delete? No script uses the `--find-saturation` mode of
   `kv_throughput`. Milestone 4 needs it to set its throughput targets.
 - Size: about 350 lines changed over the copy, under twice the estimate.
+
+## Review decisions, round 1
+
+- Baseline lost at the squash merge: accepted. Results now go in
+  `scripts/isolation/results/`, because squash merges drop branch commit
+  messages.
+- Criterion 3 is noisy: accepted as a milestone 0 plan item. A fixed attack
+  time changes the design of each workload, so it needs its own PR.
+- `blob_checks` passes while one tenant uses 1,050 MiB: accepted as a note in
+  the results file. No code change, because no tenant limit exists yet.
+- The required VM is not stated: accepted. `run.py` states the requirements
+  and records the VM's vCPUs, memory, and kernel in each result.
+- Delete `--find-saturation`: accepted. No script uses it.
+- The "top users" query result changes from run to run: not added to
+  `TODO.md`. A 413 at the memory budget is the designed response, and the
+  cause of the variation is unknown, so it is not a proven bug. The results
+  file records it.
+- No second round: no accepted finding changes the system design or fixes a
+  significant bug.

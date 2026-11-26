@@ -229,8 +229,8 @@ tracking code.
       per-owner overrides in the system database. Apply limit updates
       immediately to the running worker's cgroup. A single event query can use
       1 GiB today. In the contest, a 512 MiB worker limit caused 19 of 40 event
-      query runs to fail. On `main`, the node returns different results for the
-      same query across runs.
+      query runs to fail. On `main`, the same query succeeds in some runs and
+      fails with HTTP 413 in other runs.
 - [ ] Check a soft memory limit before a worker admits a request. Read live
       heap bytes from a counting global allocator. Return HTTP 503 if the
       worker is near its memory limit. Do not use cgroup `memory.high`. In

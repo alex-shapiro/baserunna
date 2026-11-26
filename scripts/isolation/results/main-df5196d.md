@@ -1,8 +1,7 @@
 # Isolation baseline: `main` at `df5196d`
 
 `main` passes 1 of 8 workloads. Exhausted memory causes the kernel to stop the
-node in 5 attacks. High CPU load increases victim p99 latency by 14x to 51x in
-2 attacks.
+node in 5 attacks. Victim p99 latency increases by 14x to 51x in 2 attacks.
 
 ## Setup
 
@@ -40,6 +39,6 @@ node in 5 attacks. High CPU load increases victim p99 latency by 14x to 51x in
   operation used 35 µs of node CPU time.
 - `idle_cost`: 48 to 51 MiB of node memory with 1,000 idle owners.
 - `event_scan`: the node rejected the "top users" query with HTTP 413 in all 40
-  rounds. In 7 earlier runs of the same binary, the node completed 20 rounds in
-  5 runs, 3 rounds in 1 run, and 0 rounds in 1 run. We do not know the cause
-  yet.
+  rounds. In 7 earlier runs of the same node code, the node completed 20
+  rounds in 5 runs, 3 rounds in 1 run, and 0 rounds in 1 run. We do not know
+  the cause yet.

@@ -122,6 +122,7 @@ dependencies = [
  "axum",
  "baserunna-api",
  "baserunna-client",
+ "baserunna-fake-s3",
  "bytes",
  "crc32c",
  "futures-util",
@@ -164,6 +165,32 @@ dependencies = [
  "bytes",
  "http",
  "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "baserunna-fake-s3"
+version = "0.1.0"
+dependencies = [
+ "aws-lc-rs",
+ "axum",
+ "parking_lot",
+ "tokio",
+]
+
+[[package]]
+name = "baserunna-isolation"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

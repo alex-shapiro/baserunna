@@ -1,7 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/baserunna", "crates/baserunna-api", "crates/baserunna-client"]
-default-members = ["crates/baserunna", "crates/baserunna-api", "crates/baserunna-client"]
+members = [
+    "crates/baserunna",
+    "crates/baserunna-api",
+    "crates/baserunna-client",
+    "crates/baserunna-fake-s3",
+    "crates/baserunna-isolation",
+]
+default-members = ["crates/baserunna", "crates/baserunna-api", "crates/baserunna-client", "crates/baserunna-fake-s3"]
 
 [workspace.package]
 edition = "2024"
@@ -11,6 +17,7 @@ license = "AGPLv3"
 [workspace.dependencies]
 baserunna-api = { path = "crates/baserunna-api" }
 baserunna-client = { path = "crates/baserunna-client", default-features = false }
+baserunna-fake-s3 = { path = "crates/baserunna-fake-s3" }
 bytes = "1"
 http = "1"
 parking_lot = "0.12"

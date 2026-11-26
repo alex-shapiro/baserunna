@@ -18,8 +18,9 @@ def main():
     target_dir = os.environ.get(
         "ISOLATION_TARGET_DIR", str(Path.home() / "target-isolation")
     )
-    command = ["cargo", "build", "-q", "--release", "--bin", "baserunna"]
-    command += ["--example", "isolation", "--example", "fake_s3_server"]
+    command = ["cargo", "build", "-q", "--release"]
+    command += ["-p", "baserunna", "-p", "baserunna-isolation", "-p", "baserunna-fake-s3"]
+    command += ["--bin", "baserunna", "--bin", "isolation", "--bin", "fake_s3_server"]
     subprocess.run(
         command,
         cwd=REPO_ROOT,

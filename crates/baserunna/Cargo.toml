@@ -33,6 +33,7 @@ object_store = { version = "0.14", default-features = false, features = ["aws"],
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"], optional = true }
 
 [dev-dependencies]
+baserunna-fake-s3.workspace = true
 baserunna-client = { workspace = true, features = ["reqwest"] }
 libc = "0.2"
 
@@ -42,12 +43,4 @@ harness = false
 
 [[example]]
 name = "loadgen"
-required-features = ["cloud"]
-
-[[example]]
-name = "fake_s3_server"
-required-features = ["cloud"]
-
-[[example]]
-name = "isolation"
 required-features = ["cloud"]

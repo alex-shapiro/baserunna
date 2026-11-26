@@ -1,0 +1,17 @@
+[package]
+name = "baserunna-fake-s3"
+version.workspace = true
+edition.workspace = true
+description = "in-memory fake S3 server for baserunna tests"
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "fake_s3_server"
+path = "src/main.rs"
+
+[dependencies]
+aws-lc-rs = "1.18"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+parking_lot.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }

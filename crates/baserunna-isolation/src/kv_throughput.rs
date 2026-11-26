@@ -4,7 +4,6 @@
 
 use crate::cgroup::NodeCgroup;
 use crate::http::NodeApi;
-use baserunna::util::rng::Rng;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
 use http_body_util::{BodyExt, Full};
@@ -28,6 +27,35 @@ const WARMUP_DURATION: Duration = Duration::from_secs(3);
 const MEASURE_DURATION: Duration = Duration::from_secs(15);
 
 type LoadClient = Client<HttpConnector, Full<Bytes>>;
+
+/// Returns the KV value of `VALUE_BYTES` bytes for `index`.
+fn kv_value(index: usize) -> String {
+    format!("{index:0width$}", width = VALUE_BYTES)
+}
+
+/// SplitMix64 generator that picks keys and operations for one load client.
+struct LoadRng {
+    state: u64,
+}
+
+impl LoadRng {
+    fn new(seed: u64) -> LoadRng {
+        LoadRng { state: seed }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Returns a number in `[0, n)`.
+    fn below(&mut self, n: u64) -> u64 {
+        ((self.next_u64() as u128 * n as u128) >> 64) as u64
+    }
+}
 
 /// Target key URI and authorization header for a database.
 struct DbKey {
@@ -99,7 +127,7 @@ async fn setup(api: &NodeApi, node_url: &str) -> Result<Vec<DbKey>, String> {
             if db_index % DBS_PER_OWNER != 0 {
                 create_db_with_retries(api, token, &format!("d{db_index}")).await?;
             }
-            let value = Rng::new(db_index as u64).text(VALUE_BYTES);
+            let value = kv_value(db_index);
             api.send_expect(Method::PUT, &format!("/v1/dbs/d{db_index}/kv/k0"), token, value, &[200]).await.map(|_| ())
         })
         .buffer_unordered(SETUP_CONCURRENCY)
@@ -147,8 +175,7 @@ async fn measure(
     measure_window: Duration,
 ) -> LoadWindow {
     let phase = Arc::new(AtomicU8::new(PHASE_WARMING));
-    let values: Arc<Vec<Bytes>> =
-        Arc::new((0..64).map(|i| Bytes::from(Rng::new(1_000 + i).text(VALUE_BYTES))).collect());
+    let values: Arc<Vec<Bytes>> = Arc::new((0..64).map(|i| Bytes::from(kv_value(1_000 + i))).collect());
     let tasks: Vec<_> = (0..client_count)
         .map(|client_index| {
             tokio::spawn(client_loop(
@@ -215,7 +242,7 @@ async fn client_loop(
     phase: Arc<AtomicU8>,
     seed: u64,
 ) -> (Vec<u32>, u64, Vec<String>) {
-    let mut rng = Rng::new(seed);
+    let mut rng = LoadRng::new(seed);
     let mut latencies_us = Vec::with_capacity(1 << 14);
     let (mut errors, mut error_samples) = (0u64, Vec::new());
     loop {
@@ -223,9 +250,9 @@ async fn client_loop(
         if phase_before == PHASE_STOPPED {
             break;
         }
-        let key = &keys[rng.usize(keys.len())];
+        let key = &keys[rng.below(keys.len() as u64) as usize];
         let is_write = rng.below(100) < WRITE_PERCENT;
-        let body = if is_write { values[rng.usize(values.len())].clone() } else { Bytes::new() };
+        let body = if is_write { values[rng.below(values.len() as u64) as usize].clone() } else { Bytes::new() };
         let mut request = Request::new(Full::new(body));
         *request.method_mut() = if is_write { Method::PUT } else { Method::GET };
         *request.uri_mut() = key.uri.clone();

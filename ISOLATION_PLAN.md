@@ -76,7 +76,7 @@ order. Milestone 4 depends on milestone 3. Finish with milestone 5.
 
 The isolation harness checks whether the node continues to serve a victim
 tenant while an attacker tenant runs a heavy workload. The harness is in
-`crates/baserunna/examples/isolation/`. The scripts in `scripts/isolation/`
+`crates/baserunna-isolation/`. The scripts in `scripts/isolation/`
 build and run the harness in a Linux VM.
 
 A workload passes if it meets all five criteria:

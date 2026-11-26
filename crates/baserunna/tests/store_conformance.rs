@@ -4,14 +4,11 @@
 //! in-process S3 server, and a live S3 store if `BASERUNNA_TEST_STORE` is set. Also verifies that
 //! each conformance check detects its corresponding contract violation.
 
-#[path = "support/fake_s3.rs"]
-mod fake_s3;
-
 use axum::http::Method;
 use baserunna::store::conformance::{self, Config};
 use baserunna::store::*;
+use baserunna_fake_s3::{BUCKET, FakeS3, Fault};
 use bytes::Bytes;
-use fake_s3::{FakeS3, Fault};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
@@ -71,7 +68,7 @@ fn model_sequences_agree_on_mem_and_fs_stores() {
 fn fake_store(s3: &FakeS3, prefix: &str, extra: &[(&str, &str)]) -> DynStore {
     let mut cfg = s3.config();
     cfg.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
-    Arc::new(CloudStore::from_url_with(&format!("s3://{}/{prefix}", fake_s3::BUCKET), cfg).unwrap())
+    Arc::new(CloudStore::from_url_with(&format!("s3://{}/{prefix}", BUCKET), cfg).unwrap())
 }
 
 #[test]

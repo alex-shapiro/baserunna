@@ -41,8 +41,8 @@ def copy_binaries(target_dir, bin_dir):
     bin_dir.mkdir(parents=True, exist_ok=True)
     sources = [
         target_dir / "release/baserunna",
-        target_dir / "release/examples/isolation",
-        target_dir / "release/examples/fake_s3_server",
+        target_dir / "release/isolation",
+        target_dir / "release/fake_s3_server",
     ]
     for source in sources:
         (bin_dir / source.name).unlink(missing_ok=True)
@@ -64,7 +64,7 @@ def run_workload(results_dir, bin_dir, workload, variant, iteration, client_flag
         str(result_path),
         str(bin_dir / "baserunna"),
     ]
-    env = dict(os.environ, EXAMPLES_DIR=str(bin_dir))
+    env = dict(os.environ, HARNESS_BIN_DIR=str(bin_dir))
     with open(result_path.with_suffix(".stdout"), "w") as log:
         subprocess.run(
             command + client_flags, env=env, stdout=log, stderr=subprocess.STDOUT

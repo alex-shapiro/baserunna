@@ -10,7 +10,8 @@ The script writes the VM vCPU count, memory, and kernel version to each output f
 Environment variables:
 - ISOLATION_TARGET_DIR: Cargo build directory. Default: $HOME/target-isolation.
 - NODE_BIN: Node binary path. Default: $ISOLATION_TARGET_DIR/release/baserunna.
-- EXAMPLES_DIR: Harness binary directory. Default: $ISOLATION_TARGET_DIR/release/examples.
+- HARNESS_BIN_DIR: Directory of the `isolation` and `fake_s3_server` binaries.
+  Default: $ISOLATION_TARGET_DIR/release.
 - S3_PORT and NODE_PORT: Fixed ports for the fake S3 server and node. Default: free ports.
 - ISO_CGROUP: Parent cgroup path. Default: /sys/fs/cgroup/iso.
 
@@ -227,7 +228,7 @@ def main():
     node_bin = Path(
         node_arg or os.environ.get("NODE_BIN") or target_dir / "release/baserunna"
     ).resolve()
-    examples_dir = Path(os.environ.get("EXAMPLES_DIR", target_dir / "release/examples"))
+    harness_bin_dir = Path(os.environ.get("HARNESS_BIN_DIR", target_dir / "release"))
     s3_port = os.environ.get("S3_PORT") or free_port()
     node_port = os.environ.get("NODE_PORT") or free_port()
     cgroup_root = Path(os.environ.get("ISO_CGROUP", "/sys/fs/cgroup/iso"))
@@ -257,7 +258,7 @@ def main():
         s3_env_path = work_dir / "s3.env"
         with open(s3_env_path, "w") as s3_env_file:
             s3_server = subprocess.Popen(
-                [str(examples_dir / "fake_s3_server"), f"127.0.0.1:{s3_port}"],
+                [str(harness_bin_dir / "fake_s3_server"), f"127.0.0.1:{s3_port}"],
                 env=dict(os.environ, FAKE_S3_LATENCY_MS=store_latency_ms),
                 stdout=s3_env_file,
             )
@@ -279,7 +280,7 @@ def main():
             )
 
         client_args = [
-            str(examples_dir / "isolation"),
+            str(harness_bin_dir / "isolation"),
             "--node", f"http://127.0.0.1:{node_port}",
             "--cgroup", str(node_cgroup),
             "--workload", workload,

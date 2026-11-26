@@ -61,8 +61,27 @@ The split of the storage engine is easy. Today `engine/` imports only `store`,
 
 A milestone is a group of PRs. The PR counts are estimates.
 
-Milestones 1 to 3 do not depend on each other. Start them in any order.
-Milestone 4 needs milestone 3. Milestone 5 comes last.
+Milestone 0 comes first. Milestones 1 to 3 do not depend on each other. Start
+them in any order. Milestone 4 needs milestone 3. Milestone 5 comes last.
+
+### 0. Measure isolation on `main`
+
+The isolation harness from the contest measures whether a victim tenant keeps
+working while an attacker tenant runs a workload. It is on branch `iso/base`
+(`crates/baserunna/examples/isolation/`, `scripts/isolation/run.sh`). A
+workload passes if these conditions hold:
+
+- The node continues to run.
+- The victim has no failed requests.
+- The p99 latency of the victim stays within the larger of two limits: 2 times
+  its p99 alone, or its p99 alone plus 50 ms.
+- Requests over a limit get HTTP errors.
+- A small variant of the workload succeeds.
+
+- [ ] Move the harness and its pass conditions to `main`. Record the result for
+      each workload on `main` today.
+- [ ] Run the harness at the end of each milestone, and record the results in
+      this file.
 
 ### 1. Make each operation fit in a fixed amount of memory
 

@@ -648,19 +648,19 @@ only.
 - [ ] [untriaged · Tenant isolation] **Compact tombstones that slow scans of
       the system database.** Compaction triggers do not check tombstone
       density. Deleted rows remain in the LSM tree as tombstones. Later range
-      scans must step over those tombstones. A tenant can repeat create and
-      delete calls to slow its metadata scans on the system-DB lease holder.
-      In a probe test, creating and deleting 80,000 API keys raised batch key
-      deletion time from 0.02 ms to 7.4 ms. That slowdown remained after 30 idle
-      minutes. `Txn::cost` counts only live entries, so the metadata cost test
-      does not detect tombstone scans. Expired-session reaper scans hit the
-      same slowdown across all tenants.
+      scans must skip those tombstones. A tenant can repeat create and delete
+      calls to slow its metadata scans on the system-DB lease holder. In a
+      probe test, creating and deleting 80,000 API keys increased batch key
+      deletion time from 0.02 ms to 7.4 ms. That slowdown remained after 30
+      minutes of idle time. `Txn::cost` counts only live entries. The metadata
+      cost test misses tombstone scans. Expired-session reaper scans also slow
+      down across all tenants.
 - [ ] [untriaged · Tenant isolation] **Limit API keys and sessions per user.**
       A tenant can create unlimited API keys and sessions in the shared system
       database. This breaks the SPEC §1 goal "Each tenant has a limit for each
       resource". `MetaCmd::CreateApiKey` and `create_key` in `api/account.rs`
-      do not cap key counts. Each sign-in also adds a session without a cap.
-      Account deletion deletes at most `PAGE_MAX` rows per batch under a single
-      10 s request deadline. An account with many keys or sessions can time out
-      with `outcome_unknown: true`. The user must then retry deletion. Not
-      measured.
+      do not limit key counts. Each sign-in also adds a session without a
+      limit. Account deletion removes at most `PAGE_MAX` rows per batch. All
+      batches share a single 10 s request deadline. Deleting an account with
+      many keys or sessions can time out with `outcome_unknown: true`. The user
+      must then retry deletion. Not measured.

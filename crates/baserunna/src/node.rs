@@ -1243,7 +1243,7 @@ impl Node {
         Ok(hash == current)
     }
 
-    /// Deletes organization `org_id` and all of its memberships.
+    /// Deletes organization `org_id` and all its memberships.
     pub async fn delete_org(&self, principal: &Principal, org_id: &str) -> Result<()> {
         loop {
             let cmd = MetaCmd::DeleteOrg { org_id: org_id.to_string(), actor: principal.user.id.clone() };

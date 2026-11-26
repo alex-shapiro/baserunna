@@ -419,7 +419,7 @@ pub enum MetaCmd {
     /// Deletes up to `PAGE_MAX` rows owned by `user_id` and returns [`UserDeletion`].
     ///
     /// Deletes API keys, memberships, personal databases, and sessions in that
-    /// order, then deletes the user row in the final batch. Rejects deletion
+    /// order. Deletes the user row in the final batch. Rejects deletion
     /// of the last enabled administrator or the only owner of an organization.
     DeleteUser {
         user_id: String,
@@ -568,7 +568,7 @@ pub struct Batch {
 pub struct UserDeletion {
     /// IDs of personal databases deleted in this batch. The caller must mark their storage deleted.
     pub deleted_db_ids: Vec<String>,
-    /// True if more rows remain and the caller must run [`MetaCmd::DeleteUser`] again.
+    /// True if more rows remain. The caller must run [`MetaCmd::DeleteUser`] again.
     pub more: bool,
 }
 

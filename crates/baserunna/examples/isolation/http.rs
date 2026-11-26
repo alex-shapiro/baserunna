@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::{Value as Json, json};
 use std::time::{Duration, Instant};
 
-/// Maximum duration that [`NodeApi::send_expect`] retries HTTP 503 responses.
+/// Maximum duration that [`NodeApi::send_expect`] retries retryable responses.
 pub const SETUP_RETRY_LIMIT: Duration = Duration::from_secs(60);
 
 /// HTTP client bound to a single node URL.
@@ -70,8 +70,8 @@ impl NodeApi {
 
     /// Sends a request and requires the response status to match `expected_statuses`.
     ///
-    /// Retries HTTP 503 responses marked retryable with exponential backoff up to
-    /// [`SETUP_RETRY_LIMIT`].
+    /// Retries each error response that the node marks retryable, such as a 503 at a limit or a
+    /// 409 on a commit conflict, with exponential backoff up to [`SETUP_RETRY_LIMIT`].
     pub async fn send_expect(
         &self,
         method: Method,
@@ -91,7 +91,7 @@ impl NodeApi {
             if expected_statuses.contains(&reply.status) {
                 return Ok(reply);
             }
-            let retryable = reply.status == 503 && reply.json()["error"]["retryable"] == json!(true);
+            let retryable = reply.json()["error"]["retryable"] == json!(true);
             if !retryable || started.elapsed() + backoff > SETUP_RETRY_LIMIT {
                 return Err(format!("{method} {path}: status {}: {}", reply.status, reply.excerpt()));
             }

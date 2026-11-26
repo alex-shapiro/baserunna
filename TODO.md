@@ -579,7 +579,7 @@ only.
       with `outcome: "not_applied"` even though the commit is visible to other
       nodes. Tests: `commit_applied_with_a_412_is_not_replayed` and
       `commit_applied_with_a_412_on_the_last_attempt_is_not_reported_as_not_applied`
-      in `src/engine/tests.rs`. This fault occurs only if a store client retries
+      in `crates/baserunna-storage/src/engine/tests.rs`. This fault occurs only if a store client retries
       a conditional `PUT` after the first attempt is applied.
 - [ ] [untriaged · Wrong commit result] **Report `replayed: true` if another node
       applied the commit ID.** Include a unique write ID in each manifest `PUT`
@@ -591,7 +591,7 @@ only.
       the results of its uncommitted execution instead of `replayed: true` with
       `results: null` (SPEC §6.2). Test:
       `commit_applied_by_another_node_after_an_unknown_put_is_replayed` in
-      `src/engine/tests.rs`.
+      `crates/baserunna-storage/src/engine/tests.rs`.
 - [ ] [untriaged · Events] **Fix transactional `delete_events` ops that
       exceed the request deadline.** Extend or resume a `/txn` `delete_events`
       op on a cold cache so a slow object store does not fail it repeatedly at

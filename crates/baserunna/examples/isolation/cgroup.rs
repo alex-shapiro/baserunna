@@ -26,10 +26,9 @@ impl NodeCgroup {
             .find_map(|line| line.strip_prefix(key)?.strip_prefix(' ')?.trim().parse().ok())
     }
 
-    /// Counts OOM kills of processes inside the node's `main` leaf cgroup.
+    /// Counts OOM kills inside the node's `main` leaf cgroup.
     ///
-    /// Counts only kills in `main`. The kernel can stop workers in child cgroups to enforce
-    /// tenant limits.
+    /// Worker processes run in child cgroups where the kernel can stop them to enforce tenant limits.
     pub fn node_oom_kills(&self) -> Option<u64> {
         let leaf = NodeCgroup(self.0.join("main"));
         leaf.read_keyed_u64("memory.events.local", "oom_kill")

@@ -1,6 +1,7 @@
 //! Idle resource cost benchmark for 1,000 inactive owners.
 //!
-//! Creates 1,000 owners, each with a database, and runs a read and write on each database.
+//! Creates 1,000 owners with a database each.
+//! Runs a read and a write on each database.
 //! Then measures cgroup memory, CPU, and process counts over a 30-second idle window.
 
 use crate::cgroup::{MemorySampler, NodeCgroup};

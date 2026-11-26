@@ -14,7 +14,7 @@ use bytes::Bytes;
 use futures_util::future::BoxFuture;
 use serde_json::{Value as Json, json};
 
-/// Schema and body sizes for a bulk insert row shape.
+/// Row formatter and body sizes for a bulk insert row shape.
 struct RowShape {
     name: &'static str,
     format_row: fn(usize) -> String,

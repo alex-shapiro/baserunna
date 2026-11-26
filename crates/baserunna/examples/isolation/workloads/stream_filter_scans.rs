@@ -4,8 +4,8 @@
 //! or scans `scan_limit` records.
 //! A client can set `scan_limit` up to `SCAN_LIMIT_MAX`, so an unmatched filter forces maximum CPU
 //! work per request.
-//! The per-user rate limit counts requests, not scanned records. Concurrent queries therefore
-//! drive high node CPU use.
+//! The per-user rate limit counts requests instead of scanned records.
+//! Concurrent queries drive high node CPU use.
 
 use super::{AttackContext, AttackOutcome, Round, Variant, Workload};
 use bytes::Bytes;

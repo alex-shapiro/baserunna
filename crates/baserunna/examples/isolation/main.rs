@@ -202,7 +202,7 @@ async fn run(cli: &CliArgs, monitor: &NodeMonitor, report: &mut Json) -> Result<
     let workload = workloads::by_name(&cli.workload).ok_or_else(|| format!("unknown workload {:?}", cli.workload))?;
     let idle_node_bytes = cli.cgroup.memory_current_bytes().ok_or("cannot read the node's memory.current")?;
     report["idle_node_bytes"] = json!(idle_node_bytes);
-    let variant = cli.variant.ok_or("--variant is required for this workload")?;
+    let variant = cli.variant.ok_or("this workload requires --variant")?;
     let victim_owner = api.create_owner("victim@iso.test", "victim").await?;
     victim::prepare(&api, &victim_owner).await?;
     let ctx = AttackContext { api: api.clone(), attacker, variant, cgroup: cli.cgroup.clone() };

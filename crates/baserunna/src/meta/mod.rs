@@ -465,15 +465,18 @@ pub enum MetaCmd {
     },
 }
 
-/// Maximum length in bytes of each text field in a [`MetaCmd`].
-pub const META_FIELD_MAX: usize = 1024;
+/// Maximum byte length of each text field in a [`MetaCmd`].
+pub const META_FIELD_MAX_BYTES: usize = 1024;
 
 impl MetaCmd {
-    /// Rejects the command if a text field is longer than [`META_FIELD_MAX`] bytes.
+    /// Returns an error if any text field in the command is longer than [`META_FIELD_MAX_BYTES`] bytes.
     fn check_field_lengths(&self) -> Result<()> {
-        let encoded = serde_json::to_value(self).map_err(|e| Error::internal(format!("encoding a command: {e}")))?;
-        match long_field(&encoded, "") {
-            Some(field) => Err(Error::invalid(format!("the field {field:?} is longer than {META_FIELD_MAX} bytes"))),
+        let encoded =
+            serde_json::to_value(self).map_err(|e| Error::internal(format!("encode metadata command: {e}")))?;
+        match find_field_over_limit(&encoded, "") {
+            Some(field) => {
+                Err(Error::invalid(format!("field {field:?} is longer than {META_FIELD_MAX_BYTES} bytes")))
+            }
             None => Ok(()),
         }
     }
@@ -510,12 +513,12 @@ impl MetaCmd {
     }
 }
 
-/// Returns the name of the first string in `v` longer than [`META_FIELD_MAX`] bytes.
-fn long_field<'a>(v: &'a Json, field: &'a str) -> Option<&'a str> {
-    match v {
-        Json::String(s) => (s.len() > META_FIELD_MAX).then_some(field),
-        Json::Object(fields) => fields.iter().find_map(|(name, v)| long_field(v, name)),
-        Json::Array(items) => items.iter().find_map(|v| long_field(v, field)),
+/// Returns the field name of the first string in `value` longer than [`META_FIELD_MAX_BYTES`] bytes.
+fn find_field_over_limit<'a>(value: &'a Json, field_name: &'a str) -> Option<&'a str> {
+    match value {
+        Json::String(text) => (text.len() > META_FIELD_MAX_BYTES).then_some(field_name),
+        Json::Object(fields) => fields.iter().find_map(|(name, field_value)| find_field_over_limit(field_value, name)),
+        Json::Array(items) => items.iter().find_map(|item| find_field_over_limit(item, field_name)),
         Json::Null | Json::Bool(_) | Json::Number(_) => None,
     }
 }

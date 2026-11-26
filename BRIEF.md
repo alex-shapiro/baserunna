@@ -31,9 +31,8 @@ The per-owner limits set the maximum cost of these commands. SPEC §1 lets an
 administrator change the limits for each tenant, so an administrator also
 changes this maximum. A tenant can reach the maximum only after it runs one
 command for each row. Thus the cost of the large command is paid in advance by
-many small commands from the same account. This branch keeps these deletes in
-one transaction and corrects the plan text. `TRADEOFFS.md` asks whether to
-delete them in batches.
+many small commands from the same account. The user chose to delete these rows
+in batches of `PAGE_MAX`, so that every command has a fixed maximum cost.
 
 ## Precedent
 
@@ -69,15 +68,16 @@ Other approaches:
 - Enforce a row limit at run time in each system transaction. A command that
   exceeds the limit fails for the user. A test finds the problem before
   release, without a new failure mode. We can add the run-time limit later.
-- Batch `delete_user` and `delete_org`. This makes partial deletes visible to
-  users and adds code. The per-owner limits already give a fixed maximum.
+- Keep `delete_user` and `delete_org` in one transaction. Deletion stays
+  atomic, but an administrator's per-tenant limit sets the maximum cost, and
+  very high limits make account deletion fail.
 
 ## Review decisions
 
 Round 1:
 
 - Design 1, compare costs at two data sizes instead of a fitted per-row bound: accepted. The new test catches a full scan of `deleted_databases`, which the old test missed.
-- Design 2, delete databases and memberships of `delete_user` and `delete_org` in batches: deferred to the user in `TRADEOFFS.md`. It needs a product tradeoff.
+- Design 2, delete databases and memberships of `delete_user` and `delete_org` in batches: accepted after the user chose batches. The largest batch reads 7,009 entries instead of 16,605. `DeleteApiKeys` and `UserDeletion::TooManyCredentials` are deleted.
 - Design 3, SPEC text records test constants as design: accepted. SPEC now states the rule.
 - Design, outside question, the fair queue should charge measured cost instead of command count: reported to the user. It belongs to the next plan item.
 - Correctness 1, tombstones make scans slower and `Txn::cost` does not count them: real but rejected for this branch. The fix belongs to the storage engine. Added to `TODO.md`.

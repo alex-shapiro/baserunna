@@ -403,11 +403,6 @@ pub enum MetaCmd {
         id: String,
         user_id: String,
     },
-    /// Deletes up to `limit` API keys for `user_id`. Returns [`Batch`].
-    DeleteApiKeys {
-        user_id: String,
-        limit: usize,
-    },
     /// Creates database `name` under `owner_id` and returns its [`DbRecord`].
     CreateDb {
         id: String,
@@ -421,9 +416,10 @@ pub enum MetaCmd {
     DeleteDb {
         id: String,
     },
-    /// Deletes a user account along with its sessions, API keys, memberships,
-    /// and personal databases. Rejects deletion of the last enabled
-    /// administrator or the sole owner of an organization. Returns [`UserDeletion`].
+    /// Deletes up to `PAGE_MAX` of a user's sessions, API keys, memberships,
+    /// and personal databases, then the user if none remain. Rejects deletion of
+    /// the last enabled administrator or the sole owner of an organization.
+    /// Returns [`UserDeletion`].
     DeleteUser {
         user_id: String,
     },
@@ -451,7 +447,8 @@ pub enum MetaCmd {
         actor: String,
         max_orgs: usize,
     },
-    /// Deletes an organization that has no remaining databases.
+    /// Deletes up to `PAGE_MAX` members of an organization that has no
+    /// databases, then the organization if no other members remain. Returns [`Batch`].
     DeleteOrg {
         org_id: String,
         actor: String,
@@ -494,7 +491,6 @@ impl MetaCmd {
             MetaCmd::RevokeSessions { .. } => "revoke_sessions",
             MetaCmd::CreateApiKey { .. } => "create_api_key",
             MetaCmd::DeleteApiKey { .. } => "delete_api_key",
-            MetaCmd::DeleteApiKeys { .. } => "delete_api_keys",
             MetaCmd::CreateDb { .. } => "create_db",
             MetaCmd::DeleteDb { .. } => "delete_db",
             MetaCmd::DeleteUser { .. } => "delete_user",
@@ -554,14 +550,11 @@ pub struct Batch {
 
 /// Result of [`MetaCmd::DeleteUser`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum UserDeletion {
-    /// The user was deleted; `dbs` lists personal databases whose storage must
-    /// be marked deleted.
-    Deleted { dbs: Vec<String> },
-    /// The user has too many sessions or API keys to delete in a single
-    /// transaction; the caller must delete them in batches first.
-    TooManyCredentials,
+pub struct UserDeletion {
+    /// Personal databases whose metadata this batch deleted and whose storage the caller must mark deleted.
+    pub dbs: Vec<String>,
+    /// Whether rows remain, so that the caller must run the command again.
+    pub more: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -652,10 +645,6 @@ pub async fn get_db(txn: &mut Txn, id: &str) -> Result<Option<DbRecord>> {
 
 pub async fn resolve_db(txn: &mut Txn, owner_id: &str, name: &str) -> Result<Option<DbRecord>> {
     first(txn, "databases", "by_owner_name", vec![json!(owner_id), json!(name)]).await
-}
-
-async fn list_dbs(txn: &mut Txn, owner_id: &str) -> Result<Vec<DbRecord>> {
-    query_all(txn, "databases", q_eq(Some("by_owner_name"), vec![json!(owner_id)])).await
 }
 
 pub async fn dbs_page(txn: &mut Txn, owner_id: &str, limit: usize, cursor: Option<String>) -> Result<Page<DbRecord>> {
@@ -988,14 +977,6 @@ async fn revoke_sessions(txn: &mut Txn, user_id: &str, except: &Option<String>, 
     Ok(Batch { deleted: doomed.len().min(limit), more: more || doomed.len() > limit })
 }
 
-async fn delete_api_keys(txn: &mut Txn, user_id: &str, limit: usize) -> Result<Batch> {
-    let (keys, more) = first_rows::<ApiKey>(txn, "api_keys", by_user(user_id), limit).await?;
-    for k in &keys {
-        table::delete(txn, "api_keys", &json!(k.id)).await?;
-    }
-    Ok(Batch { deleted: keys.len(), more })
-}
-
 async fn create_db(
     w: &mut Write<'_, '_>,
     id: &str,
@@ -1038,28 +1019,38 @@ async fn delete_user(w: &mut Write<'_, '_>, user_id: &str) -> Result<UserDeletio
             )));
         }
     }
-    let (sessions, more_sessions) =
-        first_rows::<Session>(w.txn, "sessions", by_user(user_id), baserunna_api::PAGE_MAX).await?;
-    let (keys, more_keys) = first_rows::<ApiKey>(w.txn, "api_keys", by_user(user_id), baserunna_api::PAGE_MAX).await?;
-    if more_sessions || more_keys {
-        return Ok(UserDeletion::TooManyCredentials);
-    }
-    for s in sessions {
+    let mut left = baserunna_api::PAGE_MAX;
+    for s in take_rows::<Session>(w.txn, "sessions", by_user(user_id), &mut left).await? {
         table::delete(w.txn, "sessions", &json!(s.token_hash)).await?;
     }
-    for k in keys {
+    for k in take_rows::<ApiKey>(w.txn, "api_keys", by_user(user_id), &mut left).await? {
         table::delete(w.txn, "api_keys", &json!(k.id)).await?;
     }
-    for m in memberships {
+    for m in take_rows::<org::Member>(w.txn, "org_members", by_user(user_id), &mut left).await? {
         org::change_membership(w, &m.org_id, user_id, Some(m.role), None).await?;
     }
     let mut dbs = Vec::new();
-    for d in list_dbs(w.txn, user_id).await? {
+    for d in
+        take_rows::<DbRecord>(w.txn, "databases", q_eq(Some("by_owner_name"), vec![json!(user_id)]), &mut left).await?
+    {
         dbs.push(d.id.clone());
         delete_db(w, d).await?;
     }
+    if left == 0 {
+        return Ok(UserDeletion { dbs, more: true });
+    }
     table::delete(w.txn, "users", &json!(user_id)).await?;
-    Ok(UserDeletion::Deleted { dbs })
+    Ok(UserDeletion { dbs, more: false })
+}
+
+/// Reads up to `left` rows of `q` and subtracts the number of rows read from `left`.
+async fn take_rows<T: DeserializeOwned>(txn: &mut Txn, t: &str, q: Query, left: &mut usize) -> Result<Vec<T>> {
+    if *left == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = page(txn, t, q, *left, None).await?.items;
+    *left -= rows.len();
+    Ok(rows)
 }
 
 async fn purge_pass(w: &mut Write<'_, '_>, id: &str, passes: i64) -> Result<()> {
@@ -1150,7 +1141,6 @@ pub async fn apply(txn: &mut Txn, blobs: &BlobResolver<'_>, cmd: &MetaCmd, now_m
             Some(k) if k.user_id == *user_id => answer(table::delete(w.txn, "api_keys", &json!(id)).await?),
             _ => Err(Error::not_found("API key not found")),
         },
-        MetaCmd::DeleteApiKeys { user_id, limit } => answer(delete_api_keys(w.txn, user_id, *limit).await?),
         MetaCmd::CreateDb { id, owner_id, actor, name, max_dbs } => {
             answer(create_db(w, id, owner_id, actor, name, *max_dbs).await?)
         }

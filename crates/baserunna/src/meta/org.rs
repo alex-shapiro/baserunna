@@ -5,8 +5,10 @@
 //! act as owners of every organization.
 
 use super::{
-    Count, Page, User, Write, active_user, add_count, count, first, from_row, get_user, page, q_eq, query_all, to_row,
+    Batch, Count, Page, User, Write, active_user, add_count, count, first, from_row, get_user, page, q_eq, query_all,
+    to_row,
 };
+use baserunna_api::PAGE_MAX;
 use baserunna_storage::engine::Txn;
 use baserunna_storage::table::{self, InsertMode};
 use baserunna_util::access::Role;
@@ -186,18 +188,24 @@ pub(super) async fn create_org(
     Ok(o)
 }
 
-pub(super) async fn delete_org(w: &mut Write<'_, '_>, org_id: &str, actor: &str) -> Result<()> {
+pub(super) async fn delete_org(w: &mut Write<'_, '_>, org_id: &str, actor: &str) -> Result<Batch> {
     let me = active_user(w.txn, actor).await?;
     require_role(w.txn, org_id, &me, Role::Owner).await?;
     if count(w.txn, Count::Dbs, org_id).await? > 0 {
         return Err(Error::PermissionDenied("delete the organization's databases first".into()));
     }
-    let members: Vec<Member> = query_all(w.txn, "org_members", q_eq(None, vec![json!(org_id)])).await?;
-    for m in members {
+    let p: Page<Member> = page(w.txn, "org_members", q_eq(None, vec![json!(org_id)]), PAGE_MAX, None).await?;
+    let more = p.next_cursor.is_some();
+    // The actor's membership goes last, so the actor keeps its role for the next batch.
+    let doomed: Vec<Member> = p.items.into_iter().filter(|m| !more || m.user_id != actor).collect();
+    let deleted = doomed.len();
+    for m in doomed {
         change_membership(w, org_id, &m.user_id, Some(m.role), None).await?;
     }
-    table::delete(w.txn, "orgs", &json!(org_id)).await?;
-    Ok(())
+    if !more {
+        table::delete(w.txn, "orgs", &json!(org_id)).await?;
+    }
+    Ok(Batch { deleted, more })
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

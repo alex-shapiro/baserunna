@@ -1137,13 +1137,16 @@ The client address in a session must parse as an IP address. If a trusted
 proxy sends an entry in `X-Forwarded-For` that is not an IP address, the node
 uses the peer address.
 
-No metadata command scans rows that a tenant can add without a limit.
-Commands that delete sessions or API keys delete at most `PAGE_MAX` rows each.
-The node runs them in a loop until no rows remain. `delete_user` and
-`delete_org` delete all databases and memberships of the owner in one
-transaction, so the per-owner limits set their maximum cost. A tenant reaches
-that maximum only after it runs one command for each row. `heartbeat` reads all
-node rows, and only operators change the number of nodes.
+No metadata command scans rows that a tenant can add without a limit. A
+command that deletes many rows deletes at most `PAGE_MAX` rows each time, and
+the node runs it in a loop until no rows remain. This rule applies to session
+revocation, account deletion, and organization deletion. Two reads have other
+limits:
+
+- `delete_user` reads all memberships of the user to find organizations where
+  the user is the only owner. The limit on organizations per user sets this
+  cost.
+- `heartbeat` reads all node rows. Only operators change the number of nodes.
 
 Listings of users, sessions, API keys, organizations, members and
 databases are paginated (`limit`, default 100 and at most 1000, and
@@ -1213,11 +1216,14 @@ recreate a purged database.
   the account's sign-in backoff) and ends every other session; the new
   hash is written only if the stored one is still the one checked, so two
   concurrent changes cannot both succeed. Deleting an account confirms the
-  password and removes, in one system-DB transaction, the user, their
-  sessions, API keys and memberships, and their databases (whose manifests
-  are then flagged deleted and later purged, as for `DELETE /v1/dbs/{db}`).
-  It is refused for the last enabled administrator and for the only owner
-  of an organization. Administrators disable and re-enable accounts.
+  password. Then the node removes the user's sessions, API keys,
+  memberships, and databases in system-DB transactions of at most
+  `PAGE_MAX` rows each, and removes the user in the last transaction. The
+  node flags the manifest of each deleted database and purges it later, as
+  for `DELETE /v1/dbs/{db}`. The node refuses the deletion for the last
+  enabled administrator and for the only owner of an organization. Each
+  transaction checks these conditions again. If the node stops during the
+  deletion, the account keeps its remaining rows until the user retries. Administrators disable and re-enable accounts.
 - **Mailed links** (when the node has a mailer, §12): sign-up and
   `POST /v1/me/verify-email` mail a link that verifies the address;
   `POST /v1/auth/password-reset` mails a link that sets a new password,
@@ -1267,7 +1273,9 @@ recreate a purged database.
   An organization always keeps an owner: the last one cannot leave or be
   demoted. Members are added by the email of an existing account, and
   leave by removing themselves. An organization is deleted only once it has
-  no databases, so no database outlives its owner. Organization names are
+  no databases, so no database outlives its owner. The node removes its
+  members in transactions of at most `PAGE_MAX` rows each, and removes the
+  caller's membership and the organization in the last transaction. Organization names are
   1-39 characters of `[a-z0-9_-]`, starting with a letter or digit; its
   databases are addressed as
   `org.name`. To anyone outside an organization, it and its databases do

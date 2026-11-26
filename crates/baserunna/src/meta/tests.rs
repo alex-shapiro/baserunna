@@ -107,7 +107,7 @@ fn migrate_signup_and_dbs() {
         let mut t = read(&db).await;
         check_integrity(&mut t).await.unwrap();
         assert_eq!(resolve_db(&mut t, "u2", "one").await.unwrap().unwrap().id, "d3");
-        assert_eq!(list_dbs(&mut t, "u2").await.unwrap().len(), 2);
+        assert_eq!(dbs_page(&mut t, "u2", 10, None).await.unwrap().items.len(), 2);
         assert_eq!(list_deleted_dbs(&mut t).await.unwrap().len(), 3);
         assert_eq!(user_by_email(&mut t, "b@x.io").await.unwrap().unwrap().id, "u2");
         let p = dbs_page(&mut t, "u2", 1, None).await.unwrap();

@@ -18,7 +18,7 @@ fn member_limits(cfg: &NodeConfig) -> MemberLimits {
     MemberLimits { max_members: cfg.max_members_per_org, max_orgs: cfg.max_orgs_per_user }
 }
 
-const COMMAND_NAMES: [&str; 26] = [
+const COMMAND_NAMES: [&str; 25] = [
     "migrate",
     "ensure_config",
     "signup",
@@ -32,7 +32,6 @@ const COMMAND_NAMES: [&str; 26] = [
     "revoke_sessions",
     "create_api_key",
     "delete_api_key",
-    "delete_api_keys",
     "create_db",
     "delete_db",
     "delete_user",
@@ -125,15 +124,16 @@ fn node(id: &str) -> NodeRecord {
 
 /// Fills every per-owner limit and every listing that a command can scan.
 ///
-/// - The user `victim` has the most sessions and API keys that `delete_user` deletes in one transaction.
-///   This user also has the maximum number of personal databases and organization memberships.
+/// - The user `victim` has `PAGE_MAX - 1` sessions and API keys and the maximum number of memberships.
+/// - The user `partner` owns the other organizations of `victim`.
+/// - The user `dbowner` has the maximum number of personal databases.
 /// - The organization `org-big` has the maximum number of members.
 /// - The user `m0` has more than `PAGE_MAX` sessions.
 /// - Other users have more than `PAGE_MAX` expired sessions.
 async fn fill_limits(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeConfig) {
     let member_ids: Vec<String> = (0..cfg.max_members_per_org - 2).map(|i| format!("m{i}")).collect();
     let mut cmds = vec![MetaCmd::Migrate];
-    for id in ["admin", "victim", "partner"].into_iter().chain(member_ids.iter().map(|s| s.as_str())) {
+    for id in ["admin", "victim", "partner", "dbowner"].into_iter().chain(member_ids.iter().map(|s| s.as_str())) {
         cmds.push(signup_cmd(env, id));
     }
     cmds.push(MetaCmd::CreateOrg {
@@ -171,14 +171,14 @@ async fn fill_limits(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeCon
     }
     cmds.extend((0..PAGE_MAX - 1).map(|i| MetaCmd::CreateApiKey { key: api_key("victim", i) }));
     let create_db = |i: usize| MetaCmd::CreateDb {
-        id: format!("db-victim-{i}"),
-        owner_id: "victim".into(),
-        actor: "victim".into(),
+        id: format!("db-dbowner-{i}"),
+        owner_id: "dbowner".into(),
+        actor: "dbowner".into(),
         name: long_name("db", i, 63),
         max_dbs: cfg.max_dbs_per_owner,
     };
     cmds.push(create_db(cfg.max_dbs_per_owner));
-    cmds.push(MetaCmd::DeleteDb { id: format!("db-victim-{}", cfg.max_dbs_per_owner) });
+    cmds.push(MetaCmd::DeleteDb { id: format!("db-dbowner-{}", cfg.max_dbs_per_owner) });
     cmds.extend((0..cfg.max_dbs_per_owner).map(create_db));
     cmds.extend(
         ["node-a", "node-b", "node-c"].map(|id| MetaCmd::Heartbeat { node: node(id), dead_after_ms: 3_600_000 }),
@@ -221,7 +221,6 @@ fn worst_case_commands(
         MetaCmd::RevokeSessions { user_id: "m0".into(), except: Some(token_hash("m0", 0)), limit: META_BATCH },
         MetaCmd::CreateApiKey { key: api_key("victim", PAGE_MAX) },
         MetaCmd::DeleteApiKey { id: api_key("victim", 0).id, user_id: "victim".into() },
-        MetaCmd::DeleteApiKeys { user_id: "victim".into(), limit: META_BATCH },
         MetaCmd::CreateDb {
             id: "db-shared".into(),
             owner_id: "org-p0".into(),
@@ -229,10 +228,12 @@ fn worst_case_commands(
             name: long_name("shared", 0, 63),
             max_dbs: cfg.max_dbs_per_owner,
         },
-        MetaCmd::DeleteDb { id: "db-victim-0".into() },
+        MetaCmd::DeleteDb { id: "db-dbowner-0".into() },
         MetaCmd::DeleteUser { user_id: "victim".into() },
         MetaCmd::DeleteUser { user_id: "m0".into() },
-        MetaCmd::PurgePass { id: format!("db-victim-{}", cfg.max_dbs_per_owner), passes: 0 },
+        MetaCmd::DeleteUser { user_id: "dbowner".into() },
+        MetaCmd::DeleteUser { user_id: "partner".into() },
+        MetaCmd::PurgePass { id: format!("db-dbowner-{}", cfg.max_dbs_per_owner), passes: 0 },
         MetaCmd::ExpireSessions { before_ms: NOW_MS, limit: META_BATCH },
         MetaCmd::Heartbeat { node: node("node-d"), dead_after_ms: 3_600_000 },
         MetaCmd::Leave { id: "node-a".into() },
@@ -312,13 +313,7 @@ async fn measure_all(db: &Arc<Db>, env: &baserunna_util::env::Env, cfg: &NodeCon
     let victim = get_user(&mut begin(db).await, "victim").await.unwrap().unwrap();
     let mut costs = Vec::new();
     for cmd in worst_case_commands(env, cfg, victim.password_hash) {
-        let (answer, cost) = measure(db, &cmd).await;
-        if let MetaCmd::DeleteUser { user_id } = &cmd {
-            let deletion: UserDeletion = serde_json::from_value(answer).unwrap();
-            let full = user_id == "victim";
-            assert_eq!(matches!(deletion, UserDeletion::Deleted { .. }), full, "{user_id}: {deletion:?}");
-        }
-        costs.push((cmd.name(), cost));
+        costs.push((cmd.name(), measure(db, &cmd).await.1));
     }
     costs
 }
@@ -351,5 +346,48 @@ fn metadata_command_cost_does_not_grow_with_stored_data() {
         }
         eprintln!("{report}");
         assert!(grew.is_empty(), "{grew:#?}");
+    });
+}
+
+/// Runs `cmd` until its answer reports that no rows remain, and returns the number of runs.
+async fn run_until_done(db: &Arc<Db>, cmd: &MetaCmd) -> usize {
+    for runs in 1.. {
+        let mut t = begin(db).await;
+        let answer = apply(&mut t, &BlobResolver { db }, cmd, NOW_MS).await.unwrap_or_else(|e| panic!("{cmd:?}: {e}"));
+        db.commit(t.into_request()).await.unwrap();
+        if answer["more"] == json!(false) {
+            return runs;
+        }
+    }
+    unreachable!()
+}
+
+#[test]
+fn batched_deletes_remove_owners_at_their_limits() {
+    rt().block_on(async {
+        let (eng, _store, env) = engine(6, EngineConfig::small_for_tests());
+        let db = eng.db(SYS_DB);
+        db.open(true).await.unwrap();
+        let cfg = NodeConfig::default();
+        fill_limits(&db, &env, &cfg).await;
+        let delete_org = MetaCmd::DeleteOrg { org_id: "org-big".into(), actor: "admin".into() };
+        assert_eq!(run_until_done(&db, &delete_org).await, 2, "1,000 members take two batches");
+        for (user_id, batches) in [("victim", 3), ("dbowner", 2)] {
+            let cmd = MetaCmd::DeleteUser { user_id: user_id.into() };
+            assert_eq!(run_until_done(&db, &cmd).await, batches, "{user_id}");
+        }
+        let mut t = begin(&db).await;
+        let partner = MetaCmd::DeleteUser { user_id: "partner".into() };
+        let refused = apply(&mut t, &BlobResolver { db: &db }, &partner, NOW_MS).await;
+        assert!(matches!(refused, Err(Error::PermissionDenied(_))), "partner is now the only owner: {refused:?}");
+        let mut t = begin(&db).await;
+        check_integrity(&mut t).await.unwrap();
+        for user_id in ["victim", "dbowner"] {
+            assert_eq!(get_user(&mut t, user_id).await.unwrap(), None, "{user_id}");
+        }
+        assert_eq!(org::get_org(&mut t, "org-big").await.unwrap(), None);
+        assert_eq!(dbs_page(&mut t, "dbowner", 10, None).await.unwrap().items, vec![]);
+        let deleted = list_deleted_dbs(&mut t).await.unwrap();
+        assert_eq!(deleted.len(), cfg.max_dbs_per_owner + 1, "every database waits for its storage purge");
     });
 }

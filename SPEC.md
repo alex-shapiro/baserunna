@@ -1137,15 +1137,14 @@ The client address in a session must parse as an IP address. If a trusted
 proxy sends an entry in `X-Forwarded-For` that is not an IP address, the node
 uses the peer address.
 
-Metadata commands do not scan rows that a tenant can add without a limit.
-A multi-row delete command removes at most `PAGE_MAX` rows per call. The node
-repeats the command until it removes all target rows. This rule applies to
-session revocation, account deletion, and organization deletion. Two commands
-use other limits:
+Each metadata command scans a limited set of rows. A multi-row delete command
+removes at most `PAGE_MAX` rows per call. The node repeats the command until
+it removes all target rows. This rule applies to session revocation, account
+deletion, and organization deletion. Two commands use other limits:
 
-- `delete_user` reads every membership of the user to find organizations where
-  the user is the only owner. The per-user organization limit sets this
-  maximum.
+- `delete_user` reads every membership of the user. It checks whether the user
+  is the only owner of an organization. A user can join organizations up to the
+  per-user organization limit.
 - `heartbeat` reads all node rows. Only operators change the node count.
 
 Listings of users, sessions, API keys, organizations, members and
@@ -1213,10 +1212,10 @@ recreate a purged database.
   their sessions and revoke one, or all but the current one.
 - **Account self-service** requires a signed-in session, not an API key.
 
-  Before changing a password, the node checks the current password. Failed
-  checks count toward the account's sign-in backoff. The node writes the new
-  hash only if the stored hash still matches the checked hash. This check
-  prevents two concurrent changes from both succeeding. The node also ends all
+  Before changing a password, the node checks the current password. The node
+  counts failed checks toward the account's sign-in backoff. The node writes
+  the new hash only if the stored hash still matches the checked hash. This
+  check prevents two concurrent changes from succeeding. The node also ends all
   other sessions for the account.
 
   Before deleting an account, the node checks the password. It then removes the
@@ -1225,10 +1224,10 @@ recreate a purged database.
   deletes the user row. The node marks each removed database manifest as
   deleted. It purges that storage later, as in `DELETE /v1/dbs/{db}`. The node
   rejects deletion for the last enabled administrator and for the only owner of
-  an organization. Each transaction checks these rules again. If the user has
-  fewer than `PAGE_MAX` sessions, the caller's session stays valid until the
-  final batch. If a node stops during deletion,
-  the user can retry with that session.
+  an organization. The node checks these rules in each transaction. If the user
+  has fewer than `PAGE_MAX` sessions, the caller's session stays valid until
+  the final batch. If a node stops during deletion, the user can retry with
+  that session.
 
   Administrators disable and re-enable accounts.
 - **Mailed links** (when the node has a mailer, §12): sign-up and
@@ -1277,8 +1276,8 @@ recreate a purged database.
   - `owner`: has all access, manages all members, and deletes the organization.
 
   An organization always has at least one owner. The node rejects any request
-  to remove or demote the last owner. Admins and owners add members by the
-  email address of an existing account. Any member except the last owner can
+  to remove or demote the last owner. An `admin` or `owner` adds an existing
+  account as a member by email address. Any member except the last owner can
   leave.
 
   An owner can delete an organization only after removing all its databases.

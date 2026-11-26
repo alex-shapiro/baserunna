@@ -646,22 +646,21 @@ only.
       commit then fails with `500 internal: corrupt data: key too long`. The
       database stays readable. The server logs a false corruption message.
 - [ ] [untriaged · Tenant isolation] **Compact tombstones that slow scans of
-      the system database.** Compaction triggers do not check tombstone
-      density. Deleted rows remain in the LSM tree as tombstones. Later range
-      scans must skip those tombstones. A tenant can repeat create and delete
-      calls to slow its metadata scans on the system-DB lease holder. In a
-      probe test, creating and deleting 80,000 API keys increased batch key
-      deletion time from 0.02 ms to 7.4 ms. That slowdown remained after 30
-      minutes of idle time. `Txn::cost` counts only live entries. The metadata
-      cost test misses tombstone scans. Tombstones also slow expired-session
-      reaper scans across all tenants.
+      the system database.** A tenant can repeat create and delete calls to
+      leave tombstones in the system database. Those tombstones slow metadata
+      scans on the system-DB lease holder and expired-session reaper scans
+      across all tenants. The LSM tree keeps deleted rows as tombstones.
+      Compaction triggers ignore tombstone density. Range scans must skip those
+      tombstones. In a probe test, creating and deleting 80,000 API keys
+      increased batch key deletion time from 0.02 ms to 7.4 ms. After 30
+      minutes of idle time, the scan still took 7.4 ms. `Txn::cost` counts only
+      live entries. The metadata cost test misses tombstone scans.
 - [ ] [untriaged · Tenant isolation] **Limit API keys and sessions per user.**
       A tenant can create unlimited API keys and sessions in the shared system
-      database. This breaks the SPEC §1 goal "Each tenant has a limit for each
-      resource". `MetaCmd::CreateApiKey` and `create_key` in `api/account.rs`
-      do not limit key counts. Each sign-in also adds a session without a
-      limit. Account deletion removes at most `PAGE_MAX` rows per batch. All
-      batches share a single 10 s request deadline. Deleting an account with
-      many keys or sessions can time out with `outcome_unknown: true`. The user
-      must then retry deletion. We have not measured this timeout with a probe
-      test.
+      database. SPEC §1 requires a limit for each tenant resource.
+      `MetaCmd::CreateApiKey` and `create_key` in `api/account.rs` do not limit
+      key counts. Each sign-in also adds a session without a limit. Account
+      deletion removes at most `PAGE_MAX` rows per batch. All batches share a
+      single 10 s request deadline. Deleting an account with many keys or
+      sessions can time out with `outcome_unknown: true`. The user must then
+      retry deletion. We have not measured this timeout with a probe test.

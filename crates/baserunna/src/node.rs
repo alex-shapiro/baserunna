@@ -1260,7 +1260,7 @@ impl Node {
         self.reauthenticate(&user, password).await?;
         loop {
             let deletion: UserDeletion = self.run_meta_as(MetaCmd::DeleteUser { user_id: user.id.clone() }).await?;
-            // Mark each database manifest deleted so cached handles stop serving it immediately.
+            // Mark each database manifest as deleted so cached handles stop serving it.
             for id in deletion.deleted_db_ids {
                 let db = self.engine.db(&id);
                 if db.open(false).await.is_ok()

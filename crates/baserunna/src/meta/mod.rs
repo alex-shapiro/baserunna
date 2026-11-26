@@ -450,7 +450,7 @@ pub enum MetaCmd {
     },
     /// Deletes up to `PAGE_MAX` members of `org_id` and returns [`Batch`].
     ///
-    /// Rejects organizations that still own databases. Deletes the
+    /// Rejects deletion if the organization owns a database. Deletes the
     /// organization row in the final batch.
     DeleteOrg {
         org_id: String,
@@ -478,7 +478,7 @@ pub enum MetaCmd {
     },
 }
 
-/// Defines [`MetaCmd::name`] and [`MetaCmd::NAMES`] from a single exhaustive variant list.
+/// Defines [`MetaCmd::name`] and [`MetaCmd::NAMES`] from a full list of variants.
 macro_rules! meta_cmd_names {
     ($($variant:ident => $name:literal,)*) => {
         impl MetaCmd {
@@ -1060,7 +1060,7 @@ async fn delete_user(w: &mut Write<'_, '_>, user_id: &str) -> Result<UserDeletio
     Ok(UserDeletion { deleted_db_ids, more: false })
 }
 
-/// Reads up to `remaining` rows from `table` and subtracts the count from `remaining`.
+/// Reads up to `remaining` rows from `table`. Subtracts the row count from `remaining`.
 async fn take_rows<T: DeserializeOwned>(
     txn: &mut Txn,
     table: &str,

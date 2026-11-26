@@ -1,4 +1,4 @@
-//! Tests that each metadata command has a fixed maximum read and write cost.
+//! Tests metadata command read and write costs and batched deletion.
 
 use super::tests::{engine, rt, session};
 use super::*;
@@ -390,7 +390,7 @@ fn batched_deletes_remove_owners_at_their_limits() {
         assert_eq!(
             deleted.len(),
             cfg.max_dbs_per_owner + 1,
-            "metadata tracks every deleted database for storage purge"
+            "every deleted database is recorded for storage purge"
         );
     });
 }

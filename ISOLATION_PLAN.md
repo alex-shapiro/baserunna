@@ -175,7 +175,7 @@ tracking code.
       workload. A workload passes if it meets all five conditions:
   - The node continues to run.
   - All victim requests succeed.
-  - Victim p99 latency is at most the larger of `2 * baseline` or
+  - Victim p99 latency is at most the larger of `2 * baseline` and
     `baseline + 50 ms`.
   - The server returns an HTTP error for requests that exceed a limit.
   - A small version of the workload succeeds.
@@ -184,8 +184,8 @@ tracking code.
   stops only the attacker. It also checks if victim requests stay fast. On
   `main`, the harness shows only node-wide effects. Milestone 1 and `TODO.md`
   already list the per-operation memory problems that cause most of those
-  effects. The CPU effects of filter scans need the `cpu.max` limits from this
-  milestone.
+  effects. Filter scans slow the victim by using CPU. The `cpu.max` limits in
+  this milestone prevent that slowdown.
 - [ ] Record absolute target numbers for the worker pool before you run
       benchmarks. Include these metrics:
   - CPU time per request

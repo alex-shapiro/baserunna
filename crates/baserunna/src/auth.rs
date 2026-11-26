@@ -166,7 +166,7 @@ fn jwt_part(s: &str) -> Result<Json> {
 
 /// Maximum length in ASCII characters of an ID token `sub` claim.
 ///
-/// OpenID Connect Core 1.0 §2 sets this limit.
+/// This limit is defined in OpenID Connect Core 1.0 §2.
 pub const OIDC_SUB_MAX_CHARS: usize = 255;
 
 /// Verifies an RS256 ID token against `jwks`.
@@ -216,7 +216,7 @@ pub fn verify_id_token(token: &str, jwks: &Json, client_id: &str, issuers: &[Str
     }
     let sub = claims["sub"].as_str().ok_or_else(|| unauth("missing sub"))?.to_string();
     if sub.is_empty() || sub.len() > OIDC_SUB_MAX_CHARS || !sub.is_ascii() {
-        return Err(unauth(&format!("sub must be 1 to {OIDC_SUB_MAX_CHARS} ASCII characters")));
+        return Err(unauth(&format!("sub must have 1 to {OIDC_SUB_MAX_CHARS} ASCII characters")));
     }
     let email = claims["email"].as_str().ok_or_else(|| unauth("missing email"))?;
     let email_verified = match &claims["email_verified"] {

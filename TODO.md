@@ -641,9 +641,7 @@ only.
 - [ ] [untriaged · Tables] **Reject table keys longer than the engine key
       limit.** Check the length of each primary key and index key in
       `table::insert` and `table::update`. If a key is longer than the
-      4,096-byte `MAX_USER_KEY` limit, return `400 invalid_argument`. Today,
-      the table layer accepts an indexed value of 5,000 bytes. The commit then
-      fails with `500 internal: corrupt data: key too long` (measured with a
-      probe test on the table layer). The database stays readable.
-      The user receives a 500 error. The server logs a false corruption
-      message.
+      4,096-byte `MAX_USER_KEY` limit, return `400 invalid_argument`. In a
+      probe test, the table layer accepts a 5,000-byte indexed value. The
+      commit then fails with `500 internal: corrupt data: key too long`. The
+      database stays readable. The server logs a false corruption message.

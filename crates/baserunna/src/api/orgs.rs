@@ -78,7 +78,7 @@ async fn get_org(State(node): State<Arc<Node>>, Auth(p): Auth, Path(name): Path<
 async fn delete_org(State(node): State<Arc<Node>>, Auth(p): Auth, Path(name): Path<String>) -> Result<J> {
     p.require_session()?;
     let (o, _) = node.resolve_org(&p, &name).await?;
-    node.run_meta(MetaCmd::DeleteOrg { org_id: o.id, actor: p.user.id.clone() }).await?;
+    node.delete_org(&p, &o.id).await?;
     node.forget_org(&name);
     Ok(axum::Json(json!({})))
 }

@@ -5,8 +5,10 @@
 //! act as owners of every organization.
 
 use super::{
-    Count, Page, User, Write, active_user, add_count, count, first, from_row, get_user, page, q_eq, query_all, to_row,
+    Batch, Count, Page, User, Write, active_user, add_count, count, first, from_row, get_user, page, q_eq, query_all,
+    to_row,
 };
+use baserunna_api::PAGE_MAX;
 use baserunna_storage::engine::Txn;
 use baserunna_storage::table::{self, InsertMode};
 use baserunna_util::access::Role;
@@ -186,18 +188,28 @@ pub(super) async fn create_org(
     Ok(o)
 }
 
-pub(super) async fn delete_org(w: &mut Write<'_, '_>, org_id: &str, actor: &str) -> Result<()> {
+pub(super) async fn delete_org(w: &mut Write<'_, '_>, org_id: &str, actor: &str) -> Result<Batch> {
     let me = active_user(w.txn, actor).await?;
     require_role(w.txn, org_id, &me, Role::Owner).await?;
     if count(w.txn, Count::Dbs, org_id).await? > 0 {
         return Err(Error::PermissionDenied("delete the organization's databases first".into()));
     }
-    let members: Vec<Member> = query_all(w.txn, "org_members", q_eq(None, vec![json!(org_id)])).await?;
-    for m in members {
-        change_membership(w, org_id, &m.user_id, Some(m.role), None).await?;
+    let member_page: Page<Member> = page(w.txn, "org_members", q_eq(None, vec![json!(org_id)]), PAGE_MAX, None).await?;
+    let has_more = member_page.next_cursor.is_some();
+    let mut deleted = 0;
+    for member in member_page.items {
+        // Keep the actor and at least one owner until the last batch.
+        let is_last_owner = member.role == Role::Owner && count(w.txn, Count::Owners, org_id).await? <= 1;
+        if has_more && (member.user_id == actor || is_last_owner) {
+            continue;
+        }
+        change_membership(w, org_id, &member.user_id, Some(member.role), None).await?;
+        deleted += 1;
     }
-    table::delete(w.txn, "orgs", &json!(org_id)).await?;
-    Ok(())
+    if !has_more {
+        table::delete(w.txn, "orgs", &json!(org_id)).await?;
+    }
+    Ok(Batch { deleted, more: has_more })
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

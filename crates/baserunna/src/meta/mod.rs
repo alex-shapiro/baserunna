@@ -5,6 +5,8 @@
 //! (except [`MetaCmd::DeleteDb`], which the caller authorizes before marking
 //! storage deleted). Reads are snapshot reads that any node can serve.
 
+#[cfg(test)]
+mod cost_tests;
 mod org;
 #[cfg(test)]
 mod tests;
@@ -401,11 +403,6 @@ pub enum MetaCmd {
         id: String,
         user_id: String,
     },
-    /// Deletes up to `limit` API keys for `user_id`. Returns [`Batch`].
-    DeleteApiKeys {
-        user_id: String,
-        limit: usize,
-    },
     /// Creates database `name` under `owner_id` and returns its [`DbRecord`].
     CreateDb {
         id: String,
@@ -419,9 +416,11 @@ pub enum MetaCmd {
     DeleteDb {
         id: String,
     },
-    /// Deletes a user account along with its sessions, API keys, memberships,
-    /// and personal databases. Rejects deletion of the last enabled
-    /// administrator or the sole owner of an organization. Returns [`UserDeletion`].
+    /// Deletes up to `PAGE_MAX` rows owned by `user_id` and returns [`UserDeletion`].
+    ///
+    /// Deletes API keys, memberships, personal databases, and sessions in that
+    /// order. Deletes the user row in the last batch. Rejects deletion
+    /// of the last enabled administrator or the only owner of an organization.
     DeleteUser {
         user_id: String,
     },
@@ -449,7 +448,10 @@ pub enum MetaCmd {
         actor: String,
         max_orgs: usize,
     },
-    /// Deletes an organization that has no remaining databases.
+    /// Deletes up to `PAGE_MAX` members of `org_id` and returns [`Batch`].
+    ///
+    /// Rejects deletion if the organization owns a database. Deletes the
+    /// organization row in the last batch.
     DeleteOrg {
         org_id: String,
         actor: String,
@@ -476,37 +478,48 @@ pub enum MetaCmd {
     },
 }
 
-impl MetaCmd {
-    pub fn name(&self) -> &'static str {
-        match self {
-            MetaCmd::Migrate => "migrate",
-            MetaCmd::EnsureConfig { .. } => "ensure_config",
-            MetaCmd::Signup { .. } => "signup",
-            MetaCmd::GoogleLogin { .. } => "google_login",
-            MetaCmd::SetPassword { .. } => "set_password",
-            MetaCmd::VerifyEmail { .. } => "verify_email",
-            MetaCmd::SetDisabled { .. } => "set_disabled",
-            MetaCmd::CreateSession { .. } => "create_session",
-            MetaCmd::DeleteSession { .. } => "delete_session",
-            MetaCmd::RevokeSession { .. } => "revoke_session",
-            MetaCmd::RevokeSessions { .. } => "revoke_sessions",
-            MetaCmd::CreateApiKey { .. } => "create_api_key",
-            MetaCmd::DeleteApiKey { .. } => "delete_api_key",
-            MetaCmd::DeleteApiKeys { .. } => "delete_api_keys",
-            MetaCmd::CreateDb { .. } => "create_db",
-            MetaCmd::DeleteDb { .. } => "delete_db",
-            MetaCmd::DeleteUser { .. } => "delete_user",
-            MetaCmd::PurgePass { .. } => "purge_pass",
-            MetaCmd::ExpireSessions { .. } => "expire_sessions",
-            MetaCmd::Heartbeat { .. } => "heartbeat",
-            MetaCmd::Leave { .. } => "leave",
-            MetaCmd::CreateOrg { .. } => "create_org",
-            MetaCmd::DeleteOrg { .. } => "delete_org",
-            MetaCmd::AddMember { .. } => "add_member",
-            MetaCmd::SetRole { .. } => "set_role",
-            MetaCmd::RemoveMember { .. } => "remove_member",
+/// Defines [`MetaCmd::name`] and [`MetaCmd::NAMES`] from a full list of variants.
+macro_rules! meta_cmd_names {
+    ($($variant:ident => $name:literal,)*) => {
+        impl MetaCmd {
+            /// All metadata command names.
+            pub const NAMES: &[&str] = &[$($name),*];
+
+            pub fn name(&self) -> &'static str {
+                match self {
+                    $(MetaCmd::$variant { .. } => $name,)*
+                }
+            }
         }
-    }
+    };
+}
+
+meta_cmd_names! {
+    Migrate => "migrate",
+    EnsureConfig => "ensure_config",
+    Signup => "signup",
+    GoogleLogin => "google_login",
+    SetPassword => "set_password",
+    VerifyEmail => "verify_email",
+    SetDisabled => "set_disabled",
+    CreateSession => "create_session",
+    DeleteSession => "delete_session",
+    RevokeSession => "revoke_session",
+    RevokeSessions => "revoke_sessions",
+    CreateApiKey => "create_api_key",
+    DeleteApiKey => "delete_api_key",
+    CreateDb => "create_db",
+    DeleteDb => "delete_db",
+    DeleteUser => "delete_user",
+    PurgePass => "purge_pass",
+    ExpireSessions => "expire_sessions",
+    Heartbeat => "heartbeat",
+    Leave => "leave",
+    CreateOrg => "create_org",
+    DeleteOrg => "delete_org",
+    AddMember => "add_member",
+    SetRole => "set_role",
+    RemoveMember => "remove_member",
 }
 
 fn from_row<T: DeserializeOwned>(v: Json) -> Result<T> {
@@ -552,14 +565,11 @@ pub struct Batch {
 
 /// Result of [`MetaCmd::DeleteUser`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-pub enum UserDeletion {
-    /// The user was deleted; `dbs` lists personal databases whose storage must
-    /// be marked deleted.
-    Deleted { dbs: Vec<String> },
-    /// The user has too many sessions or API keys to delete in a single
-    /// transaction; the caller must delete them in batches first.
-    TooManyCredentials,
+pub struct UserDeletion {
+    /// IDs of personal databases deleted in this batch. The caller must mark their storage as deleted.
+    pub deleted_db_ids: Vec<String>,
+    /// True if more rows remain. The caller must run [`MetaCmd::DeleteUser`] again.
+    pub more: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -650,10 +660,6 @@ pub async fn get_db(txn: &mut Txn, id: &str) -> Result<Option<DbRecord>> {
 
 pub async fn resolve_db(txn: &mut Txn, owner_id: &str, name: &str) -> Result<Option<DbRecord>> {
     first(txn, "databases", "by_owner_name", vec![json!(owner_id), json!(name)]).await
-}
-
-async fn list_dbs(txn: &mut Txn, owner_id: &str) -> Result<Vec<DbRecord>> {
-    query_all(txn, "databases", q_eq(Some("by_owner_name"), vec![json!(owner_id)])).await
 }
 
 pub async fn dbs_page(txn: &mut Txn, owner_id: &str, limit: usize, cursor: Option<String>) -> Result<Page<DbRecord>> {
@@ -986,14 +992,6 @@ async fn revoke_sessions(txn: &mut Txn, user_id: &str, except: &Option<String>, 
     Ok(Batch { deleted: doomed.len().min(limit), more: more || doomed.len() > limit })
 }
 
-async fn delete_api_keys(txn: &mut Txn, user_id: &str, limit: usize) -> Result<Batch> {
-    let (keys, more) = first_rows::<ApiKey>(txn, "api_keys", by_user(user_id), limit).await?;
-    for k in &keys {
-        table::delete(txn, "api_keys", &json!(k.id)).await?;
-    }
-    Ok(Batch { deleted: keys.len(), more })
-}
-
 async fn create_db(
     w: &mut Write<'_, '_>,
     id: &str,
@@ -1036,28 +1034,45 @@ async fn delete_user(w: &mut Write<'_, '_>, user_id: &str) -> Result<UserDeletio
             )));
         }
     }
-    let (sessions, more_sessions) =
-        first_rows::<Session>(w.txn, "sessions", by_user(user_id), baserunna_api::PAGE_MAX).await?;
-    let (keys, more_keys) = first_rows::<ApiKey>(w.txn, "api_keys", by_user(user_id), baserunna_api::PAGE_MAX).await?;
-    if more_sessions || more_keys {
-        return Ok(UserDeletion::TooManyCredentials);
-    }
-    for s in sessions {
-        table::delete(w.txn, "sessions", &json!(s.token_hash)).await?;
-    }
-    for k in keys {
+    let mut remaining = baserunna_api::PAGE_MAX;
+    for k in take_rows::<ApiKey>(w.txn, "api_keys", by_user(user_id), &mut remaining).await? {
         table::delete(w.txn, "api_keys", &json!(k.id)).await?;
     }
-    for m in memberships {
+    for m in take_rows::<org::Member>(w.txn, "org_members", by_user(user_id), &mut remaining).await? {
         org::change_membership(w, &m.org_id, user_id, Some(m.role), None).await?;
     }
-    let mut dbs = Vec::new();
-    for d in list_dbs(w.txn, user_id).await? {
-        dbs.push(d.id.clone());
+    let mut deleted_db_ids = Vec::new();
+    for d in
+        take_rows::<DbRecord>(w.txn, "databases", q_eq(Some("by_owner_name"), vec![json!(user_id)]), &mut remaining)
+            .await?
+    {
+        deleted_db_ids.push(d.id.clone());
         delete_db(w, d).await?;
     }
+    // Delete sessions last so the caller can retry a stopped deletion without signing in again.
+    for s in take_rows::<Session>(w.txn, "sessions", by_user(user_id), &mut remaining).await? {
+        table::delete(w.txn, "sessions", &json!(s.token_hash)).await?;
+    }
+    if remaining == 0 {
+        return Ok(UserDeletion { deleted_db_ids, more: true });
+    }
     table::delete(w.txn, "users", &json!(user_id)).await?;
-    Ok(UserDeletion::Deleted { dbs })
+    Ok(UserDeletion { deleted_db_ids, more: false })
+}
+
+/// Reads up to `remaining` rows from `table`. Subtracts the row count from `remaining`.
+async fn take_rows<T: DeserializeOwned>(
+    txn: &mut Txn,
+    table: &str,
+    query: Query,
+    remaining: &mut usize,
+) -> Result<Vec<T>> {
+    if *remaining == 0 {
+        return Ok(Vec::new());
+    }
+    let rows = page(txn, table, query, *remaining, None).await?.items;
+    *remaining -= rows.len();
+    Ok(rows)
 }
 
 async fn purge_pass(w: &mut Write<'_, '_>, id: &str, passes: i64) -> Result<()> {
@@ -1148,7 +1163,6 @@ pub async fn apply(txn: &mut Txn, blobs: &BlobResolver<'_>, cmd: &MetaCmd, now_m
             Some(k) if k.user_id == *user_id => answer(table::delete(w.txn, "api_keys", &json!(id)).await?),
             _ => Err(Error::not_found("API key not found")),
         },
-        MetaCmd::DeleteApiKeys { user_id, limit } => answer(delete_api_keys(w.txn, user_id, *limit).await?),
         MetaCmd::CreateDb { id, owner_id, actor, name, max_dbs } => {
             answer(create_db(w, id, owner_id, actor, name, *max_dbs).await?)
         }

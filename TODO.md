@@ -645,3 +645,23 @@ only.
       probe test, the table layer accepts a 5,000-byte indexed value. The
       commit then fails with `500 internal: corrupt data: key too long`. The
       database stays readable. The server logs a false corruption message.
+- [ ] [untriaged · Tenant isolation] **Compact tombstones that slow scans of
+      the system database.** A tenant can repeat create and delete calls to
+      leave tombstones in the system database. Those tombstones slow metadata
+      scans on the system-DB lease holder for all tenants. They also slow
+      expired-session reaper scans. The LSM tree keeps deleted rows as
+      tombstones. Compaction triggers ignore tombstone density. Range scans
+      must skip those tombstones. In a probe test, creating and deleting 80,000
+      API keys increased batch key deletion time from 0.02 ms to 7.4 ms. The
+      slowdown remained after 30 minutes of idle time. `Txn::cost` counts only
+      live entries. The metadata cost test therefore does not measure tombstone
+      scans.
+- [ ] [untriaged · Tenant isolation] **Limit API keys and sessions per user.**
+      A tenant can create unlimited API keys and sessions in the shared system
+      database. SPEC §1 requires a limit for each tenant resource.
+      `MetaCmd::CreateApiKey` and `create_key` in `api/account.rs` do not limit
+      API keys. Each sign-in also adds a session without a limit. Account
+      deletion removes at most `PAGE_MAX` rows per batch. All batches share a
+      10 s request deadline. Deleting an account with many keys or sessions can
+      time out with `outcome_unknown: true`. The user must then retry deletion.
+      We have not measured this timeout with a probe test.

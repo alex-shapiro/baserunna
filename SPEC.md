@@ -1137,6 +1137,16 @@ The client address in a session must parse as an IP address. If a trusted
 proxy sends an entry in `X-Forwarded-For` that is not an IP address, the node
 uses the peer address.
 
+Each metadata command reads and writes a limited set of rows. A multi-row delete
+command removes at most `PAGE_MAX` rows per call. The node repeats the command
+until it removes all target rows. This rule applies to session revocation,
+account deletion, and organization deletion. Two commands use other limits:
+
+- `delete_user` reads every membership of the user. It checks whether the user
+  is the only owner of an organization. A user can join organizations up to the
+  per-user organization limit.
+- `heartbeat` reads all node rows. Only operators change the node count.
+
 Listings of users, sessions, API keys, organizations, members and
 databases are paginated (`limit`, default 100 and at most 1000, and
 `cursor`): they are table queries, whose cursors only resume inside the
@@ -1200,16 +1210,27 @@ recreate a purged database.
   console uses an `HttpOnly`, `SameSite=Lax` cookie (`Secure` when
   `public_url` is https). The API uses `Authorization: Bearer`. Users list
   their sessions and revoke one, or all but the current one.
-- **Account self-service** (signed-in sessions only, not API keys):
-  changing the password confirms the current one (failures count toward
-  the account's sign-in backoff) and ends every other session; the new
-  hash is written only if the stored one is still the one checked, so two
-  concurrent changes cannot both succeed. Deleting an account confirms the
-  password and removes, in one system-DB transaction, the user, their
-  sessions, API keys and memberships, and their databases (whose manifests
-  are then flagged deleted and later purged, as for `DELETE /v1/dbs/{db}`).
-  It is refused for the last enabled administrator and for the only owner
-  of an organization. Administrators disable and re-enable accounts.
+- **Account self-service** requires a signed-in session, not an API key.
+
+  To change a password, the node checks the current password. The node
+  counts failed checks toward the account's sign-in backoff. The node writes
+  the new hash only if the stored hash still matches the checked hash. This
+  check prevents two concurrent changes from succeeding. The node also ends all
+  other sessions for the account.
+
+  To delete an account, the node checks the password. It then removes the
+  user's API keys, memberships, databases, and sessions in that order. Each
+  system-DB transaction deletes at most `PAGE_MAX` rows. The last transaction
+  deletes the user row. The node marks each removed database manifest as
+  deleted. It purges that storage later, as in `DELETE /v1/dbs/{db}`.
+
+  In each transaction, the node rejects deletion if the user is the last enabled
+  administrator or the only owner of an organization. If the user has fewer than
+  `PAGE_MAX` sessions, the caller's session stays valid until the last
+  transaction. If a node stops during deletion, the user can retry with that
+  session.
+
+  Administrators disable and re-enable accounts.
 - **Mailed links** (when the node has a mailer, §12): sign-up and
   `POST /v1/me/verify-email` mail a link that verifies the address;
   `POST /v1/auth/password-reset` mails a link that sets a new password,
@@ -1246,24 +1267,30 @@ recreate a purged database.
   `BASERUNNA_TRUSTED_PROXY_HOPS` proxies the entry that many places from
   the end of `X-Forwarded-For` (entries further left are the client's to
   forge).
-- **Organizations** hold databases that several users share. Members have
-  one role each:
+- **Organizations** hold databases that several users share. Each member has
+  a role:
 
-  | role     | read data | write data and schemas | create and delete databases | manage members         | delete the organization |
-  | -------- | --------- | ---------------------- | --------------------------- | ---------------------- | ----------------------- |
-  | `reader` | yes       |                        |                             |                        |                         |
-  | `writer` | yes       | yes                    |                             |                        |                         |
-  | `admin`  | yes       | yes                    | yes                         | readers through admins |                         |
-  | `owner`  | yes       | yes                    | yes                         | everyone               | yes                     |
+  - `reader`: reads data.
+  - `writer`: reads and writes data and schemas.
+  - `admin`: has `writer` access, creates and deletes databases, and manages
+    `reader`, `writer`, and `admin` members.
+  - `owner`: has all access, manages all members, and deletes the organization.
 
-  An organization always keeps an owner: the last one cannot leave or be
-  demoted. Members are added by the email of an existing account, and
-  leave by removing themselves. An organization is deleted only once it has
-  no databases, so no database outlives its owner. Organization names are
-  1-39 characters of `[a-z0-9_-]`, starting with a letter or digit; its
-  databases are addressed as
-  `org.name`. To anyone outside an organization, it and its databases do
-  not exist (404).
+  An organization always has at least one owner. The node rejects any request
+  to remove or demote the last owner. An `admin` or `owner` adds an existing
+  account as a member by email address. Any member except the last owner can
+  leave.
+
+  An owner can delete an organization only after removing all its databases.
+  This rule prevents orphan databases. The node deletes members in transactions
+  of at most `PAGE_MAX` rows each. Each intermediate transaction keeps the
+  caller's membership and at least one owner. The last transaction deletes the
+  remaining members and the organization row.
+
+  An organization name has 1 to 39 characters from `[a-z0-9_-]`. It starts with
+  a letter or digit. Clients address an organization's database as `org.name`.
+  For a caller without access to an organization, the node returns `404` for
+  that organization and its databases.
 
 - **Authorization**: each request on a database resolves the caller's role
   there: owner of their own databases, their membership role in an

@@ -226,7 +226,7 @@ pub const REAP_INTERVAL_MS: u64 = 60_000;
 
 const REAPER_KEY: &str = "reaper";
 
-const META_BATCH: usize = 500;
+pub(crate) const META_BATCH: usize = 500;
 
 tokio::task_local! {
     static REQUEST_DEADLINE: Deadline;
@@ -1243,9 +1243,10 @@ impl Node {
         Ok(hash == current)
     }
 
-    async fn delete_api_keys(&self, user_id: &str) -> Result<()> {
+    /// Deletes organization `org_id` and all its memberships.
+    pub async fn delete_org(&self, principal: &Principal, org_id: &str) -> Result<()> {
         loop {
-            let cmd = MetaCmd::DeleteApiKeys { user_id: user_id.to_string(), limit: META_BATCH };
+            let cmd = MetaCmd::DeleteOrg { org_id: org_id.to_string(), actor: principal.user.id.clone() };
             if !self.run_meta_as::<Batch>(cmd).await?.more {
                 return Ok(());
             }
@@ -1257,24 +1258,21 @@ impl Node {
         p.require_session()?;
         let user = self.user_strong(&p.user.id).await?;
         self.reauthenticate(&user, password).await?;
-        let dbs = loop {
-            match self.run_meta_as(MetaCmd::DeleteUser { user_id: user.id.clone() }).await? {
-                UserDeletion::Deleted { dbs } => break dbs,
-                UserDeletion::TooManyCredentials => {
-                    self.revoke_sessions(&user.id, None).await?;
-                    self.delete_api_keys(&user.id).await?;
+        loop {
+            let deletion: UserDeletion = self.run_meta_as(MetaCmd::DeleteUser { user_id: user.id.clone() }).await?;
+            // Mark each database manifest as deleted so cached handles stop serving it.
+            for id in deletion.deleted_db_ids {
+                let db = self.engine.db(&id);
+                if db.open(false).await.is_ok()
+                    && let Err(e) = db.mark_deleted().await
+                {
+                    baserunna_util::warn!("flagging database {id} of a deleted account: {e}");
                 }
+                self.engine.forget(&id);
             }
-        };
-        // Mark each database manifest deleted so nodes with cached handles stop serving it immediately.
-        for id in dbs {
-            let db = self.engine.db(&id);
-            if db.open(false).await.is_ok()
-                && let Err(e) = db.mark_deleted().await
-            {
-                baserunna_util::warn!("flagging database {id} of a deleted account: {e}");
+            if !deletion.more {
+                break;
             }
-            self.engine.forget(&id);
         }
         self.forget_user(&user.id);
         Ok(())
